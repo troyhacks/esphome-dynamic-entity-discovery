@@ -285,7 +285,7 @@ void DynamicEntityDiscovery::create_ui_from_room_cards_() {
   lv_obj_set_style_pad_all(this->main_container_, 0, 0);  // No padding
   lv_obj_set_style_border_width(this->main_container_, 0, 0);  // No border
   lv_obj_set_style_border_color(this->main_container_, lv_color_hex(0x111827), 0);  // Hide border
-  lv_obj_set_scroll_snap(this->main_container_, LV_SCROLL_SNAP_VER);  // Snap to row when scrolling
+  lv_obj_set_scroll_snap_y(this->main_container_, LV_SCROLL_SNAP_START);  // Snap to row when scrolling
 
   for (const auto& room : room_cards_) {
     create_room_card_(this->main_container_, room);
