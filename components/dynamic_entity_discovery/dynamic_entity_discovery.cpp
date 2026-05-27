@@ -285,6 +285,7 @@ void DynamicEntityDiscovery::create_ui_from_room_cards_() {
   lv_obj_set_style_pad_all(this->main_container_, 0, 0);  // No padding
   lv_obj_set_style_border_width(this->main_container_, 0, 0);  // No border
   lv_obj_set_style_border_color(this->main_container_, lv_color_hex(0x111827), 0);  // Hide border
+  lv_obj_set_scroll_snap(this->main_container_, LV_SCROLL_SNAP_VER);  // Snap to row when scrolling
 
   for (const auto& room : room_cards_) {
     create_room_card_(this->main_container_, room);
@@ -392,6 +393,7 @@ void DynamicEntityDiscovery::show_entity_detail_(int room_index) {
 
   // Hide main container
   if (this->main_container_) {
+    lv_obj_scroll_to_y(this->main_container_, 0, LV_ANIM_OFF);  // Reset scroll to top
     lv_obj_add_flag(this->main_container_, LV_OBJ_FLAG_HIDDEN);
   }
 
@@ -464,6 +466,7 @@ void DynamicEntityDiscovery::show_room_grid_() {
 
   // Show main container
   if (this->main_container_) {
+    lv_obj_scroll_to_y(this->main_container_, 0, LV_ANIM_OFF);  // Reset scroll to top
     lv_obj_remove_flag(this->main_container_, LV_OBJ_FLAG_HIDDEN);
   }
 
