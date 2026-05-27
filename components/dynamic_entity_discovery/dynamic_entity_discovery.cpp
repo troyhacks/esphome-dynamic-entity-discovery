@@ -309,28 +309,7 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_remove_flag(card, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);  // Skip draw notifications
 
-  // Room name label - clickable area using transparent button
-  lv_obj_t* label_btn = lv_button_create(card);
-  lv_obj_set_size(label_btn, 180, 40);  // 180px wide for touch target
-  lv_obj_align(label_btn, LV_ALIGN_CENTER, 0, 0);  // Centered in card
-  lv_obj_set_style_bg_opa(label_btn, LV_OPA_TRANSP, 0);  // Invisible background
-  lv_obj_set_style_border_width(label_btn, 0, 0);  // No border
-  lv_obj_set_style_radius(label_btn, 6, 0);
-  lv_obj_set_style_pad_all(label_btn, 5, 0);  // Ensure touch padding
-  // Ensure button is clickable (should be by default on button, but force it)
-  lv_obj_add_flag(label_btn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_user_data(label_btn, (void*)(intptr_t)room.grid_index);
-  lv_obj_add_event_cb(label_btn, [](lv_event_t* event) {
-    int room_index = (int)(intptr_t)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(event));
-    s_instance->show_entity_detail_(room_index);
-  }, LV_EVENT_CLICKED, nullptr);
-
-  lv_obj_t* label = lv_label_create(label_btn);
-  lv_label_set_text(label, room.area.name.c_str());
-  lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_center(label);
-
-  // Arc for brightness
+  // Arc for brightness - CREATE FIRST so it's below label button in z-order
   lv_obj_t* arc = lv_arc_create(card);
   lv_obj_set_size(arc, 240, 240);
   lv_obj_align(arc, LV_ALIGN_CENTER, 0, 15);
@@ -373,6 +352,27 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
     int room_index = (int)(intptr_t)lv_obj_get_user_data(btn);
     ESP_LOGI(TAG, "Button clicked: room=%d", room_index);
   }, LV_EVENT_CLICKED, nullptr);
+
+  // Room name label - clickable area using transparent button
+  // CREATE LAST so it's on TOP in z-order and receives touches
+  lv_obj_t* label_btn = lv_button_create(card);
+  lv_obj_set_size(label_btn, 180, 40);  // 180px wide for touch target
+  lv_obj_align(label_btn, LV_ALIGN_CENTER, 0, 0);  // Centered in card
+  lv_obj_set_style_bg_opa(label_btn, LV_OPA_TRANSP, 0);  // Invisible background
+  lv_obj_set_style_border_width(label_btn, 0, 0);  // No border
+  lv_obj_set_style_radius(label_btn, 6, 0);
+  lv_obj_set_style_pad_all(label_btn, 5, 0);  // Ensure touch padding
+  lv_obj_add_flag(label_btn, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_user_data(label_btn, (void*)(intptr_t)room.grid_index);
+  lv_obj_add_event_cb(label_btn, [](lv_event_t* event) {
+    int room_index = (int)(intptr_t)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(event));
+    s_instance->show_entity_detail_(room_index);
+  }, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t* label = lv_label_create(label_btn);
+  lv_label_set_text(label, room.area.name.c_str());
+  lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_center(label);
 
   ESP_LOGI(TAG, "  Created room card: %s", room.area.name.c_str());
 }
