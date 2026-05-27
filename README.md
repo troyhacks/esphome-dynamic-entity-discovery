@@ -26,7 +26,8 @@ Add to your ESPHome YAML:
 external_components:
   - source:
       type: git
-      url: https://github.com/YOURGITHUBUSER/esphome-dynamic-entity-discovery
+      url: https://github.com/troyhacks/esphome-dynamic-entity-discovery
+      ref: master
     components: [dynamic_entity_discovery]
 ```
 
