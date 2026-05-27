@@ -374,6 +374,8 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
   lv_obj_center(label);
 
+  lv_obj_move_foreground(label_btn);
+
   ESP_LOGI(TAG, "  Created room card: %s", room.area.name.c_str());
 }
 
