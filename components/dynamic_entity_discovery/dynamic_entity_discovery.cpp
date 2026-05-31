@@ -317,8 +317,8 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   lv_arc_set_min_value(arc, 0);
   lv_arc_set_max_value(arc, 100);
   lv_arc_set_value(arc, 50);
-  lv_arc_set_start_angle(arc, 135);
-  lv_arc_set_end_angle(arc, 405);  // 135 + 270
+  lv_arc_set_bg_start_angle(arc, 135);
+  lv_arc_set_bg_end_angle(arc, 405);  // 135 + 270
   lv_obj_set_style_arc_color(arc, lv_color_hex(0x404040), LV_PART_MAIN);
   lv_obj_set_style_arc_width(arc, 20, LV_PART_MAIN);
   lv_obj_set_style_arc_color(arc, lv_color_hex(room.color), LV_PART_INDICATOR);
@@ -512,8 +512,8 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
     lv_arc_set_min_value(arc, 0);
     lv_arc_set_max_value(arc, 100);
     lv_arc_set_value(arc, 75);  // Default to 75%
-    lv_arc_set_start_angle(arc, 135);
-    lv_arc_set_end_angle(arc, 405);
+    lv_arc_set_bg_start_angle(arc, 135);
+    lv_arc_set_bg_end_angle(arc, 405);
     lv_obj_set_style_arc_color(arc, lv_color_hex(0x404040), LV_PART_MAIN);
     lv_obj_set_style_arc_width(arc, 6, LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc, lv_color_hex(color), LV_PART_INDICATOR);
