@@ -311,13 +311,14 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   lv_obj_remove_flag(card, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);  // Skip draw notifications
 
   // Arc for brightness - CREATE FIRST so it's below label button in z-order
-  lv_obj_t* arc = lv_arc_create(card);
+  lv_obj_t* arc = lv_obj_create(card);
   lv_obj_set_size(arc, 240, 240);
   lv_obj_align(arc, LV_ALIGN_CENTER, 0, 15);
-  lv_arc_set_range(arc, 0, 100);
+  lv_arc_set_min_value(arc, 0);
+  lv_arc_set_max_value(arc, 100);
   lv_arc_set_value(arc, 50);
-  lv_arc_set_rotation(arc, 135);
-  lv_arc_set_bg_angles(arc, 0, 270);
+  lv_arc_set_start_angle(arc, 135);
+  lv_arc_set_end_angle(arc, 405);  // 135 + 270
   lv_obj_set_style_arc_color(arc, lv_color_hex(0x404040), LV_PART_MAIN);
   lv_obj_set_style_arc_width(arc, 20, LV_PART_MAIN);
   lv_obj_set_style_arc_color(arc, lv_color_hex(room.color), LV_PART_INDICATOR);
@@ -334,7 +335,7 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   }, LV_EVENT_VALUE_CHANGED, nullptr);
 
   // ON/OFF button
-  lv_obj_t* btn = lv_button_create(card);
+  lv_obj_t* btn = lv_obj_create(card);
   lv_obj_set_size(btn, 120, 35);
   lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -10);
   lv_obj_set_style_radius(btn, 6, 0);
@@ -356,7 +357,7 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
 
   // Room name label - clickable area using transparent button
   // CREATE LAST so it's on TOP in z-order and receives touches
-  lv_obj_t* label_btn = lv_button_create(card);
+  lv_obj_t* label_btn = lv_obj_create(card);
   lv_obj_set_size(label_btn, 180, 40);  // 180px wide for touch target
   lv_obj_align(label_btn, LV_ALIGN_CENTER, 0, 0);  // Centered in card
   lv_obj_set_style_bg_opa(label_btn, LV_OPA_TRANSP, 0);  // Invisible background
@@ -412,7 +413,7 @@ void DynamicEntityDiscovery::show_entity_detail_(int room_index) {
   lv_obj_set_style_border_width(this->detail_container_, 0, 0);  // No border
 
   // Back button
-  lv_obj_t* back_btn = lv_button_create(this->detail_container_);
+  lv_obj_t* back_btn = lv_obj_create(this->detail_container_);
   lv_obj_set_pos(back_btn, 10, 10);
   lv_obj_set_size(back_btn, 100, 40);
   lv_obj_set_style_radius(back_btn, 6, 0);
@@ -505,12 +506,14 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
 
   if (entity.domain == "light" && entity.has_brightness) {
     // Brightness arc for lights
-    lv_obj_t* arc = lv_arc_create(control);
+    lv_obj_t* arc = lv_obj_create(control);
     lv_obj_set_size(arc, 50, 50);
     lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -100, 0);
-    lv_arc_set_range(arc, 0, 100);
+    lv_arc_set_min_value(arc, 0);
+    lv_arc_set_max_value(arc, 100);
     lv_arc_set_value(arc, 75);  // Default to 75%
-    lv_arc_set_bg_angles(arc, 135, 405);
+    lv_arc_set_start_angle(arc, 135);
+    lv_arc_set_end_angle(arc, 405);
     lv_obj_set_style_arc_color(arc, lv_color_hex(0x404040), LV_PART_MAIN);
     lv_obj_set_style_arc_width(arc, 6, LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc, lv_color_hex(color), LV_PART_INDICATOR);
@@ -532,7 +535,7 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
     }, LV_EVENT_VALUE_CHANGED, nullptr);
   } else if (entity.domain == "switch") {
     // Switch has toggle button
-    lv_obj_t* toggle_btn = lv_button_create(control);
+    lv_obj_t* toggle_btn = lv_obj_create(control);
     lv_obj_set_size(toggle_btn, 100, 40);
     lv_obj_align(toggle_btn, LV_ALIGN_RIGHT_MID, -15, 0);
     lv_obj_set_style_radius(toggle_btn, 6, 0);
