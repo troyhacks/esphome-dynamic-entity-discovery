@@ -311,7 +311,7 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   lv_obj_remove_flag(card, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);  // Skip draw notifications
 
   // Arc for brightness - CREATE FIRST so it's below label button in z-order
-  lv_obj_t* arc = lv_obj_create(card);
+  lv_obj_t* arc = lv_arc_create(card);
   lv_obj_set_size(arc, 240, 240);
   lv_obj_align(arc, LV_ALIGN_CENTER, 0, 15);
   lv_arc_set_min_value(arc, 0);
@@ -506,7 +506,7 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
 
   if (entity.domain == "light" && entity.has_brightness) {
     // Brightness arc for lights
-    lv_obj_t* arc = lv_obj_create(control);
+    lv_obj_t* arc = lv_arc_create(control);
     lv_obj_set_size(arc, 50, 50);
     lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -100, 0);
     lv_arc_set_min_value(arc, 0);
