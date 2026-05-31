@@ -323,8 +323,6 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   lv_obj_set_style_arc_width(arc, 20, LV_PART_MAIN);
   lv_obj_set_style_arc_color(arc, lv_color_hex(room.color), LV_PART_INDICATOR);
   lv_obj_set_style_arc_width(arc, 20, LV_PART_INDICATOR);
-  lv_obj_set_style_radius(arc, 9999, LV_PART_KNOB);
-  lv_obj_set_style_pad_all(arc, 10, LV_PART_KNOB);
   lv_obj_set_user_data(arc, (void*)(intptr_t)room.grid_index);
 
   lv_obj_add_event_cb(arc, [](lv_event_t* event) {
@@ -522,14 +520,22 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
 
     // Brightness percentage label
     lv_obj_t* pct_label = lv_label_create(control);
-    lv_label_set_text(pct_label, "75%");
+    lv_label_set_text_fmt(pct_label, "%d%%", 75);
     lv_obj_set_style_text_color(pct_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(pct_label, LV_ALIGN_RIGHT_MID, -30, 0);
+
+    // Store both arc user_data and label in a combined pointer for the callback
+    // Encode as: high bits = entity_index, low bits = label pointer
+    uintptr_t combined = ((uintptr_t)entity_index << 16) | ((uintptr_t)pct_label & 0xFFFF);
+    lv_obj_set_user_data(arc, (void*)combined);
 
     lv_obj_add_event_cb(arc, [](lv_event_t* event) {
       lv_obj_t* arc = (lv_obj_t*)lv_event_get_target(event);
       int value = lv_arc_get_value(arc);
-      int entity_idx = (int)(intptr_t)lv_obj_get_user_data(arc);
+      uintptr_t combined = (uintptr_t)lv_obj_get_user_data(arc);
+      int entity_idx = (int)(combined >> 16);
+      lv_obj_t* pct_label = (lv_obj_t*)(combined & 0xFFFF);
+      lv_label_set_text_fmt(pct_label, "%d%%", value);
       ESP_LOGI(TAG, "Entity brightness changed: index=%d, value=%d%%", entity_idx, value);
       // TODO: Call HA API to set brightness
     }, LV_EVENT_VALUE_CHANGED, nullptr);
@@ -540,11 +546,19 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
     lv_obj_align(toggle_btn, LV_ALIGN_RIGHT_MID, -15, 0);
     lv_obj_set_style_radius(toggle_btn, 6, 0);
     lv_obj_set_style_bg_color(toggle_btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_user_data(toggle_btn, (void*)(intptr_t)entity_index);
 
     lv_obj_t* toggle_label = lv_label_create(toggle_btn);
     lv_label_set_text(toggle_label, "Toggle");
     lv_obj_set_style_text_color(toggle_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(toggle_label);
+
+    lv_obj_add_event_cb(toggle_btn, [](lv_event_t* event) {
+      lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
+      int entity_idx = (int)(intptr_t)lv_obj_get_user_data(btn);
+      ESP_LOGI(TAG, "Switch toggled: entity_idx=%d", entity_idx);
+      // TODO: Call HA API to toggle switch
+    }, LV_EVENT_CLICKED, nullptr);
   } else {
     // Read-only entities (sensor, binary_sensor, climate, cover, etc.) - just show domain text aligned right
     // Nothing to do - domain label already shows the type
