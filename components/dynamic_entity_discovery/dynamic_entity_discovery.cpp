@@ -73,6 +73,14 @@ void DynamicEntityDiscovery::setup() {
            this->grid_gap_x_, this->grid_gap_y_);
   ESP_LOGI(TAG, "  http_request configured: %s", this->http_request_ ? "YES" : "NO");
 
+  // Paint the LVGL screen dark immediately to avoid a white flash at boot
+  // (frame buffer is uninitialized white until something draws to it).
+  lv_obj_t* screen = lv_scr_act();
+  if (screen != nullptr) {
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+  }
+
   ESP_LOGI(TAG, "Note: Use trigger_discovery() after boot to create UI");
 }
 
