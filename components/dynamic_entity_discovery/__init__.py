@@ -35,11 +35,9 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
-    # Force-enable LVGL widgets needed for dynamic UI creation
-    from esphome.components.lvgl.helpers import add_lv_use
-    add_lv_use("ARC")
-    add_lv_use("LABEL")
-    add_lv_use("BUTTON")
+    # NOTE: add_lv_use() is intentionally not called here because it runs
+    # too late to affect lv_conf.h generation. Widgets used by the C++ code
+    # must be declared in the user's YAML under lvgl.widgets:.
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)

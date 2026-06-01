@@ -74,11 +74,11 @@ class DynamicEntityDiscovery : public Component {
   std::vector<std::string> exclude_entities_;
   int grid_cols_{3};
   int grid_rows_{2};
-  int grid_card_width_{310};
+  int grid_card_width_{330};
   int grid_card_height_{250};
-  int grid_gap_x_{5};
+  int grid_gap_x_{7};
   int grid_gap_y_{15};
-  int start_x_{5};
+  int start_x_{10};
   int start_y_{12};
 
   std::vector<Area> discovered_areas_;

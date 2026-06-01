@@ -3,9 +3,42 @@
 #include "esphome/components/json/json_util.h"
 #include <lvgl.h>
 #include "esphome/components/lvgl/lvgl_proxy.h"
+#include "esp_heap_caps.h"
 
 namespace esphome {
 namespace dynamic_entity_discovery {
+
+// ArduinoJson 7.x: Custom PSRAM allocator. The default JsonDocument uses
+// internal-RAM malloc, which is too small for a 220KB+ states response.
+// This puts the JSON DOM in PSRAM where there's plenty of room.
+struct PsramAllocator : ArduinoJson::Allocator {
+  void* allocate(size_t size) override {
+    if (size == 0) return nullptr;
+    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p == nullptr) p = malloc(size);  // fallback to internal
+    return p;
+  }
+  void deallocate(void* p) override { if (p) free(p); }
+  void* reallocate(void* p, size_t new_size) override {
+    if (new_size == 0) {
+      deallocate(p);
+      return nullptr;
+    }
+    void* np = allocate(new_size);
+    if (np && p) {
+      // ArduinoJson 7.x: caller may or may not have copied yet. Be safe and
+      // memcpy a chunk; old buffer is freed after this returns.
+      memcpy(np, p, new_size);
+      deallocate(p);
+    }
+    return np;
+  }
+};
+
+using PsramJsonDocument = ArduinoJson::JsonDocument;
+
+// Module-level static allocator (single instance shared by all parses)
+static PsramAllocator s_psram_allocator;
 
 static const char* TAG = "dynamic_entity_discovery";
 
@@ -64,7 +97,97 @@ void DynamicEntityDiscovery::fetch_areas_() {
 
   std::string url = this->ha_api_url_ + "/api/template";
 
-  std::string body = "{\"template\": \"{% set ns = namespace(rooms=[]) %}{% for a in areas() %}{% set ns.rooms = ns.rooms + [{\\\"area_id\\\": a, \\\"name\\\": area_name(a), \\\"entities\\\": area_entities(a)}] %}{% endfor %}{{ ns.rooms | tojson }}\"}";
+  // Build the Jinja template dynamically, applying exclude_areas, include_areas,
+  // domains, and exclude_entities filters on the HA side. This dramatically
+  // reduces the payload that the ESP32 has to parse.
+  //
+  // Template structure:
+  //   {% set ns = namespace(rooms=[]) %}
+  //   {% for a in areas() %}
+  //     {% if (not include_all) and (a not in include_areas) %}{% continue %}{% endif %}
+  //     {% if a in exclude_areas %}{% continue %}{% endif %}
+  //     {% set ents = area_entities(a)
+  //         | select("match", domain_regex)
+  //         | reject("in", exclude_entities_list) | list %}
+  //     {% set ns.rooms = ns.rooms + [{"area_id": a, "name": area_name(a), "entities": ents}] %}
+  //   {% endfor %}
+  //   {{ ns.rooms | tojson }}
+
+  // Build a list of full entity-ID prefixes for the included domains.
+  // We use a regex `match` test on entity_id. The pattern needs an explicit
+  // backslash-dot to avoid matching things like "lightning.*" when "light"
+  // is a domain. We carefully escape the regex for JSON: each backslash
+  // in the regex becomes two backslashes in the JSON body so JSON decoding
+  // yields a single backslash.
+  std::string domain_regex;
+  for (size_t i = 0; i < this->entity_domains_.size(); i++) {
+    if (i > 0) domain_regex += "|";
+    domain_regex += this->entity_domains_[i];
+  }
+  // Build the JSON-safe version of the regex: ^(?:light|switch|...)\.
+  // In the final body string, we need \\. (4 chars in C++ source: \\\\.)
+  // to produce "\\\\" in the C++ runtime, which JSON-decodes to "\\",
+  // which the regex engine then sees as the escape for literal dot.
+  // Wait, simpler: we want the body string to contain "\\\\." so that
+  // JSON decoding gives "\\." and the regex sees "\.". So in C++ source
+  // we need "\\\\\\\\." (8 backslashes + dot) -> runtime is "\\\\." ->
+  // JSON decodes to "\\." -> regex sees "\.". Yes.
+  std::string domain_match_json = "^(?:" + domain_regex + ")\\\\\\\\.";
+
+  // Build include/exclude area lists (HA's "in" test works on string lists).
+  // The whole body is a JSON string, so inner double quotes MUST be escaped
+  // as \\\" so they survive JSON decoding intact.
+  std::string include_areas_list;
+  for (size_t i = 0; i < this->include_areas_.size(); i++) {
+    if (i > 0) include_areas_list += ", ";
+    include_areas_list += "\\\"" + this->include_areas_[i] + "\\\"";
+  }
+  std::string exclude_areas_list;
+  for (size_t i = 0; i < this->exclude_areas_.size(); i++) {
+    if (i > 0) exclude_areas_list += ", ";
+    exclude_areas_list += "\\\"" + this->exclude_areas_[i] + "\\\"";
+  }
+  std::string exclude_entities_list;
+  for (size_t i = 0; i < this->exclude_entities_.size(); i++) {
+    if (i > 0) exclude_entities_list += ", ";
+    exclude_entities_list += "\\\"" + this->exclude_entities_[i] + "\\\"";
+  }
+
+  // Area gating condition
+  std::string area_gate;
+  if (!this->include_all_) {
+    if (this->include_areas_.empty()) {
+      // include_all=false with no include_areas would exclude everything -
+      // safety: include nothing (no areas pass)
+      area_gate = "{% if false %}";
+    } else {
+      area_gate = "{% if a in [" + include_areas_list + "] %}";
+    }
+  } else if (!this->exclude_areas_.empty()) {
+    area_gate = "{% if a not in [" + exclude_areas_list + "] %}";
+  } else {
+    area_gate = "{% if true %}";
+  }
+
+  // Entity filtering: domain select, then exclude_entities reject.
+  // All inner double quotes are escaped with \\\" so the whole template
+  // remains a valid JSON string. The domain_match_json already contains
+  // JSON-escaped backslashes, so we use it as-is.
+  std::string entity_filter = "area_entities(a) | select(\\\"match\\\", \\\"" + domain_match_json + "\\\")";
+  if (!this->exclude_entities_.empty()) {
+    entity_filter += " | reject(\\\"in\\\", [" + exclude_entities_list + "])";
+  }
+  entity_filter += " | list";
+
+  std::string body =
+      "{\"template\": \"{% set ns = namespace(rooms=[]) %}"
+      "{% for a in areas() %}" + area_gate +
+      "{% set ents = " + entity_filter + " %}"
+      "{% set ns.rooms = ns.rooms + [{ \\\"area_id\\\": a, \\\"name\\\": area_name(a), \\\"entities\\\": ents }] %}"
+      "{% endif %}{% endfor %}"
+      "{{ ns.rooms | tojson }}\"}";
+
+  ESP_LOGD(TAG, "Template body length: %d", (int)body.size());
 
   std::vector<http_request::Header> headers = {
       {"Authorization", "Bearer " + this->ha_api_password_},
@@ -102,12 +225,13 @@ void DynamicEntityDiscovery::fetch_areas_() {
     return;
   }
 
-  // Read response body
+  // Read response body - reserve to content_length to avoid reallocations
+  size_t expected = container->content_length;
   std::string response;
-  response.reserve(8192);
-  uint8_t buf[1024];
+  response.reserve(expected > 0 ? expected : 16384);
+  uint8_t buf[512];
   uint32_t last_data_time = millis();
-  const uint32_t timeout = 10000;
+  const uint32_t timeout = 15000;
   int iter_count = 0;
 
   while (container->get_bytes_read() < container->content_length) {
@@ -122,7 +246,6 @@ void DynamicEntityDiscovery::fetch_areas_() {
       break;
     } else {
       iter_count++;
-      // Feed watchdog every iteration when waiting
       if (iter_count % 10 == 0) {
         App.feed_wdt();
       }
@@ -135,10 +258,40 @@ void DynamicEntityDiscovery::fetch_areas_() {
   container->end();
 
   ESP_LOGI(TAG, "Areas response: %d bytes", (int)response.size());
+  // Diagnostic: log first 200 chars (and last 50) to see actual format
+  {
+    std::string head = response.substr(0, std::min<size_t>(200, response.size()));
+    ESP_LOGD(TAG, "  head: %s", head.c_str());
+    if (response.size() > 50) {
+      std::string tail = response.substr(response.size() - 50);
+      ESP_LOGD(TAG, "  tail: %s", tail.c_str());
+    }
+  }
 
-  // Parse JSON
-  JsonDocument doc = json::parse_json(response);
+  // ArduinoJson 7.x: JsonDocument with PSRAM allocator to keep DOM off
+  // the small internal heap. No filter - the filter can drop the top-level
+  // array in some configurations and was previously discarding all data.
+  PsramJsonDocument doc(&s_psram_allocator);
+
+  DeserializationError parse_err = deserializeJson(doc, response);
+  if (parse_err) {
+    ESP_LOGE(TAG, "Failed to parse areas JSON: %s", parse_err.c_str());
+    return;
+  }
+
   JsonArray arr = doc.as<JsonArray>();
+  if (arr.isNull()) {
+    JsonObject obj = doc.as<JsonObject>();
+    if (!obj.isNull()) {
+      ESP_LOGE(TAG, "Areas response is a JSON object, keys:");
+      for (JsonPair kv : obj) {
+        ESP_LOGE(TAG, "  key: %s", kv.key().c_str());
+      }
+    } else {
+      ESP_LOGE(TAG, "Areas response is neither array nor object");
+    }
+    return;
+  }
   for (JsonObject area : arr) {
     const char* area_id = area["area_id"];
     const char* name = area["name"];
@@ -147,12 +300,16 @@ void DynamicEntityDiscovery::fetch_areas_() {
       a.area_id = area_id;
       a.name = name;
 
-      // Parse entity IDs array
+      // Parse entity IDs array - HA's area_entities() returns array of strings
       JsonArray entities = area["entities"].as<JsonArray>();
-      for (JsonObject entity : entities) {
-        const char* entity_id = entity["entity_id"];
-        if (entity_id) {
-          a.entity_ids.push_back(entity_id);
+      for (JsonVariant entity : entities) {
+        if (entity.is<const char*>()) {
+          // String entry: "light.kitchen_main"
+          a.entity_ids.push_back(entity.as<const char*>());
+        } else if (entity.is<JsonObject>()) {
+          // Object entry: {"entity_id": "light.kitchen_main"}
+          const char* entity_id = entity["entity_id"];
+          if (entity_id) a.entity_ids.push_back(entity_id);
         }
       }
 
@@ -208,12 +365,13 @@ void DynamicEntityDiscovery::fetch_entities_() {
     return;
   }
 
-  // Read response body
+  // Read response body - reserve to content_length to avoid reallocations
+  size_t expected = container->content_length;
   std::string response;
-  response.reserve(131072);
-  uint8_t buf[1024];
+  response.reserve(expected > 0 ? expected : 32768);
+  uint8_t buf[512];
   uint32_t last_data_time = millis();
-  const uint32_t timeout = 15000;
+  const uint32_t timeout = 20000;
   int iter_count = 0;
 
   while (container->get_bytes_read() < container->content_length) {
@@ -240,6 +398,40 @@ void DynamicEntityDiscovery::fetch_entities_() {
   container->end();
 
   ESP_LOGI(TAG, "States response: %d bytes", (int)response.size());
+  ESP_LOGD(TAG, "  Heap free=%u largest=%u, PSRAM free=%u largest=%u",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+  // Diagnostic: log first 200 chars to see actual format
+  {
+    std::string head = response.substr(0, std::min<size_t>(200, response.size()));
+    ESP_LOGD(TAG, "  head: %s", head.c_str());
+  }
+
+  // ArduinoJson 7.x: JsonDocument with PSRAM allocator to keep DOM off
+  // the small internal heap.
+  PsramJsonDocument doc(&s_psram_allocator);
+
+  DeserializationError parse_err = deserializeJson(doc, response);
+  if (parse_err) {
+    ESP_LOGW(TAG, "Failed to parse states JSON: %s", parse_err.c_str());
+    return;
+  }
+
+  JsonArray arr = doc.as<JsonArray>();
+  if (arr.isNull()) {
+    JsonObject obj = doc.as<JsonObject>();
+    if (!obj.isNull()) {
+      ESP_LOGW(TAG, "States response is a JSON object, keys:");
+      for (JsonPair kv : obj) {
+        ESP_LOGW(TAG, "  key: %s", kv.key().c_str());
+      }
+    } else {
+      ESP_LOGW(TAG, "States response is neither array nor object");
+    }
+    return;
+  }
 
   // Build a lookup: entity_id -> area_id from discovered_areas_
   // Since we already have entity_ids per area, match against that
@@ -250,9 +442,6 @@ void DynamicEntityDiscovery::fetch_entities_() {
     }
   }
 
-  // Parse JSON
-  JsonDocument doc = json::parse_json(response);
-  JsonArray arr = doc.as<JsonArray>();
   for (JsonObject state : arr) {
     const char* entity_id = state["entity_id"];
     if (!entity_id) continue;
@@ -302,6 +491,11 @@ void DynamicEntityDiscovery::fetch_entities_() {
 
 void DynamicEntityDiscovery::start_discovery_() {
   ESP_LOGI(TAG, "=== Starting Dynamic Entity Discovery ===");
+
+  // Clear previous discovery data to avoid heap growth on retry
+  this->discovered_areas_.clear();
+  this->entities_by_area_.clear();
+  this->room_cards_.clear();
 
   // Fetch real areas and entities from HA
   fetch_areas_();
@@ -658,7 +852,7 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
     lv_obj_set_style_arc_width(arc, 6, LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc, lv_color_hex(color), LV_PART_INDICATOR);
     lv_obj_set_style_arc_width(arc, 6, LV_PART_INDICATOR);
-    lv_obj_set_user_data(arc, (void*)(intptr_t)entity_index);
+    // (user_data is set below to the heap-allocated ArcCallbackData)
 
     // Brightness percentage label
     lv_obj_t* pct_label = lv_label_create(control);
