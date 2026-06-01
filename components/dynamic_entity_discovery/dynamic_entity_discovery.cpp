@@ -1,5 +1,6 @@
 #include "dynamic_entity_discovery.h"
 #include "esphome/core/log.h"
+#include "esphome/components/json/json_util.h"
 #include <lvgl.h>
 #include "esphome/components/lvgl/lvgl_proxy.h"
 
@@ -37,6 +38,7 @@ void DynamicEntityDiscovery::setup() {
            this->grid_cols_, this->grid_rows_,
            this->grid_card_width_, this->grid_card_height_,
            this->grid_gap_x_, this->grid_gap_y_);
+  ESP_LOGI(TAG, "  http_request configured: %s", this->http_request_ ? "YES" : "NO");
 
   ESP_LOGI(TAG, "Note: Use trigger_discovery() after boot to create UI");
 }
@@ -52,130 +54,262 @@ void DynamicEntityDiscovery::trigger_discovery() {
   s_instance->start_discovery_();
 }
 
+void DynamicEntityDiscovery::fetch_areas_() {
+  if (this->http_request_ == nullptr) {
+    ESP_LOGE(TAG, "http_request_ is null - cannot fetch areas");
+    return;
+  }
+
+  ESP_LOGI(TAG, "Fetching areas from HA via template API...");
+
+  std::string url = this->ha_api_url_ + "/api/template";
+
+  std::string body = "{\"template\": \"{% set ns = namespace(rooms=[]) %}{% for a in areas() %}{% set ns.rooms = ns.rooms + [{\\\"area_id\\\": a, \\\"name\\\": area_name(a), \\\"entities\\\": area_entities(a)}] %}{% endfor %}{{ ns.rooms | tojson }}\"}";
+
+  std::vector<http_request::Header> headers = {
+      {"Authorization", "Bearer " + this->ha_api_password_},
+      {"Content-Type", "application/json"},
+  };
+
+  auto container = this->http_request_->post(url, body, headers);
+
+  if (container == nullptr) {
+    ESP_LOGE(TAG, "Failed to get areas: container is null");
+    return;
+  }
+
+  if (container->status_code == 0) {
+    ESP_LOGE(TAG, "Failed to get areas: connection failed");
+    container->end();
+    return;
+  }
+
+  if (container->status_code == 401) {
+    ESP_LOGE(TAG, "HA API auth failed - check your token");
+    container->end();
+    return;
+  }
+
+  if (container->status_code == 404) {
+    ESP_LOGE(TAG, "HA API endpoint not found - check HA version");
+    container->end();
+    return;
+  }
+
+  if (container->status_code != 200) {
+    ESP_LOGW(TAG, "Failed to get areas: HTTP %d", container->status_code);
+    container->end();
+    return;
+  }
+
+  // Read response body
+  std::string response;
+  response.reserve(8192);
+  uint8_t buf[1024];
+  uint32_t last_data_time = millis();
+  const uint32_t timeout = 10000;
+  int iter_count = 0;
+
+  while (container->get_bytes_read() < container->content_length) {
+    App.feed_wdt();
+    yield();
+    int read = container->read(buf, sizeof(buf));
+    if (read > 0) {
+      response.append(reinterpret_cast<char*>(buf), read);
+      last_data_time = millis();
+      iter_count = 0;
+    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
+      break;
+    } else {
+      iter_count++;
+      // Feed watchdog every iteration when waiting
+      if (iter_count % 10 == 0) {
+        App.feed_wdt();
+      }
+    }
+    if (millis() - last_data_time > timeout) {
+      ESP_LOGW(TAG, "Timeout reading areas response");
+      break;
+    }
+  }
+  container->end();
+
+  ESP_LOGI(TAG, "Areas response: %d bytes", (int)response.size());
+
+  // Parse JSON
+  JsonDocument doc = json::parse_json(response);
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonObject area : arr) {
+    const char* area_id = area["area_id"];
+    const char* name = area["name"];
+    if (area_id && name) {
+      Area a;
+      a.area_id = area_id;
+      a.name = name;
+
+      // Parse entity IDs array
+      JsonArray entities = area["entities"].as<JsonArray>();
+      for (JsonObject entity : entities) {
+        const char* entity_id = entity["entity_id"];
+        if (entity_id) {
+          a.entity_ids.push_back(entity_id);
+        }
+      }
+
+      this->discovered_areas_.push_back(a);
+      ESP_LOGI(TAG, "  Found area: %s with %d entities", name, (int)a.entity_ids.size());
+    }
+  }
+}
+
+void DynamicEntityDiscovery::fetch_entities_() {
+  if (this->http_request_ == nullptr) {
+    ESP_LOGE(TAG, "http_request_ is null - cannot fetch entities");
+    return;
+  }
+
+  ESP_LOGI(TAG, "Fetching entity states from HA...");
+
+  std::string url = this->ha_api_url_ + "/api/states";
+
+  std::vector<http_request::Header> headers = {
+      {"Authorization", "Bearer " + this->ha_api_password_},
+      {"Content-Type", "application/json"},
+  };
+
+  auto container = this->http_request_->get(url, headers);
+
+  if (container == nullptr) {
+    ESP_LOGE(TAG, "Failed to get states: container is null");
+    return;
+  }
+
+  if (container->status_code == 0) {
+    ESP_LOGE(TAG, "Failed to get states: connection failed");
+    container->end();
+    return;
+  }
+
+  if (container->status_code == 401) {
+    ESP_LOGE(TAG, "HA API auth failed - check your token");
+    container->end();
+    return;
+  }
+
+  if (container->status_code == 404) {
+    ESP_LOGE(TAG, "HA API endpoint not found - check HA version");
+    container->end();
+    return;
+  }
+
+  if (container->status_code != 200) {
+    ESP_LOGW(TAG, "Failed to get states: HTTP %d", container->status_code);
+    container->end();
+    return;
+  }
+
+  // Read response body
+  std::string response;
+  response.reserve(131072);
+  uint8_t buf[1024];
+  uint32_t last_data_time = millis();
+  const uint32_t timeout = 15000;
+  int iter_count = 0;
+
+  while (container->get_bytes_read() < container->content_length) {
+    App.feed_wdt();
+    yield();
+    int read = container->read(buf, sizeof(buf));
+    if (read > 0) {
+      response.append(reinterpret_cast<char*>(buf), read);
+      last_data_time = millis();
+      iter_count = 0;
+    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
+      break;
+    } else {
+      iter_count++;
+      if (iter_count % 10 == 0) {
+        App.feed_wdt();
+      }
+    }
+    if (millis() - last_data_time > timeout) {
+      ESP_LOGW(TAG, "Timeout reading states response");
+      break;
+    }
+  }
+  container->end();
+
+  ESP_LOGI(TAG, "States response: %d bytes", (int)response.size());
+
+  // Build a lookup: entity_id -> area_id from discovered_areas_
+  // Since we already have entity_ids per area, match against that
+  std::map<std::string, std::string> entity_to_area;  // entity_id -> area_id
+  for (const auto& area : this->discovered_areas_) {
+    for (const auto& eid : area.entity_ids) {
+      entity_to_area[eid] = area.area_id;
+    }
+  }
+
+  // Parse JSON
+  JsonDocument doc = json::parse_json(response);
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonObject state : arr) {
+    const char* entity_id = state["entity_id"];
+    if (!entity_id) continue;
+
+    // Check if this entity belongs to one of our areas
+    auto it = entity_to_area.find(entity_id);
+    if (it == entity_to_area.end()) continue;  // Not in any discovered area
+
+    std::string area_id = it->second;
+
+    // Check if excluded
+    if (this->is_entity_excluded_(entity_id)) continue;
+
+    // Extract domain from entity_id (e.g., "light.living_room" -> "light")
+    std::string eid(entity_id);
+    size_t dot = eid.find('.');
+    if (dot == std::string::npos) continue;
+    std::string domain = eid.substr(0, dot);
+
+    // Check if domain is included
+    if (!this->is_domain_included_(domain)) continue;
+
+    Entity entity;
+    entity.entity_id = entity_id;
+    entity.domain = domain;
+    entity.area_id = area_id;
+
+    // Get attributes
+    JsonObject attributes = state["attributes"];
+
+    // Get friendly name from attributes, or derive from entity_id
+    if (!attributes["friendly_name"].isNull()) {
+      entity.name = std::string(attributes["friendly_name"].as<const char*>());
+    } else {
+      entity.name = eid.substr(dot + 1);
+    }
+
+    // Check if entity has brightness (lights with brightness support)
+    if (domain == "light" && !attributes["brightness"].isNull()) {
+      entity.has_brightness = true;
+    }
+
+    this->entities_by_area_[area_id].push_back(entity);
+  }
+  ESP_LOGI(TAG, "  Parsed %d entities into areas", (int)this->entities_by_area_.size());
+}
+
 void DynamicEntityDiscovery::start_discovery_() {
   ESP_LOGI(TAG, "=== Starting Dynamic Entity Discovery ===");
 
-  // Simulate discovery with 6 areas
-  ESP_LOGI(TAG, "Simulating discovery with placeholder areas...");
+  // Fetch real areas and entities from HA
+  fetch_areas_();
+  fetch_entities_();
 
-  discovered_areas_.push_back({"living_room", "Living Room"});
-  discovered_areas_.push_back({"kitchen", "Kitchen"});
-  discovered_areas_.push_back({"bedroom", "Bedroom"});
-  discovered_areas_.push_back({"bathroom", "Bathroom"});
-  discovered_areas_.push_back({"office", "Office"});
-  discovered_areas_.push_back({"garage", "Garage"});
-  discovered_areas_.push_back({"dining_room", "Dining Room"});
-  discovered_areas_.push_back({"hallway", "Hallway"});
-
-  // Add multiple entities to each area for testing scrolling
-  for (const auto& area : discovered_areas_) {
-    // Main light with brightness
-    Entity light1;
-    light1.entity_id = area.area_id + "_main_light";
-    light1.name = area.name + " Main Light";
-    light1.domain = "light";
-    light1.area_id = area.area_id;
-    light1.has_brightness = true;
-    entities_by_area_[area.area_id].push_back(light1);
-
-    // Ceiling fan / dimmer light
-    Entity light2;
-    light2.entity_id = area.area_id + "_ceiling_light";
-    light2.name = area.name + " Ceiling Light";
-    light2.domain = "light";
-    light2.area_id = area.area_id;
-    light2.has_brightness = true;
-    entities_by_area_[area.area_id].push_back(light2);
-
-    // Switch entity
-    Entity sw;
-    sw.entity_id = area.area_id + "_wall_switch";
-    sw.name = area.name + " Wall Switch";
-    sw.domain = "switch";
-    sw.area_id = area.area_id;
-    sw.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(sw);
-
-    // Temperature sensor
-    Entity sensor;
-    sensor.entity_id = area.area_id + "_temp_sensor";
-    sensor.name = area.name + " Temperature";
-    sensor.domain = "sensor";
-    sensor.area_id = area.area_id;
-    sensor.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(sensor);
-
-    // Humidity sensor
-    Entity humid;
-    humid.entity_id = area.area_id + "_humidity_sensor";
-    humid.name = area.name + " Humidity";
-    humid.domain = "sensor";
-    humid.area_id = area.area_id;
-    humid.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(humid);
-
-    // Motion detector
-    Entity motion;
-    motion.entity_id = area.area_id + "_motion";
-    motion.name = area.name + " Motion";
-    motion.domain = "binary_sensor";
-    motion.area_id = area.area_id;
-    motion.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(motion);
-
-    // Lamp light
-    Entity light3;
-    light3.entity_id = area.area_id + "_lamp";
-    light3.name = area.name + " Lamp";
-    light3.domain = "light";
-    light3.area_id = area.area_id;
-    light3.has_brightness = true;
-    entities_by_area_[area.area_id].push_back(light3);
-
-    // Smart outlet/switch
-    Entity outlet;
-    outlet.entity_id = area.area_id + "_outlet";
-    outlet.name = area.name + " Outlet";
-    outlet.domain = "switch";
-    outlet.area_id = area.area_id;
-    outlet.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(outlet);
-
-    // Power meter
-    Entity power;
-    power.entity_id = area.area_id + "_power";
-    power.name = area.name + " Power";
-    power.domain = "sensor";
-    power.area_id = area.area_id;
-    power.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(power);
-
-    // Cover/blind
-    Entity cover;
-    cover.entity_id = area.area_id + "_cover";
-    cover.name = area.name + " Blind";
-    cover.domain = "cover";
-    cover.area_id = area.area_id;
-    cover.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(cover);
-
-    // AC/Climate
-    Entity climate;
-    climate.entity_id = area.area_id + "_ac";
-    climate.name = area.name + " AC";
-    climate.domain = "climate";
-    climate.area_id = area.area_id;
-    climate.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(climate);
-
-    // Door sensor
-    Entity door;
-    door.entity_id = area.area_id + "_door";
-    door.name = area.name + " Door";
-    door.domain = "binary_sensor";
-    door.area_id = area.area_id;
-    door.has_brightness = false;
-    entities_by_area_[area.area_id].push_back(door);
+  if (discovered_areas_.empty()) {
+    ESP_LOGW(TAG, "No areas discovered from HA - check API token and connectivity");
+    return;
   }
 
   filter_and_build_room_cards_();

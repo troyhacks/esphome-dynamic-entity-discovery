@@ -5,6 +5,7 @@
 #include <map>
 #include "esphome/core/component.h"
 #include "esphome/components/lvgl/lvgl_proxy.h"
+#include "esphome/components/http_request/http_request.h"
 
 namespace esphome {
 namespace dynamic_entity_discovery {
@@ -13,6 +14,7 @@ namespace dynamic_entity_discovery {
 struct Area {
   std::string area_id;
   std::string name;
+  std::vector<std::string> entity_ids;  // Entity IDs in this area
 };
 
 // Entity structure from HA
@@ -46,6 +48,7 @@ class DynamicEntityDiscovery : public Component {
 
   void set_ha_api_url(const std::string& url) { this->ha_api_url_ = url; }
   void set_ha_api_password(const std::string& password) { this->ha_api_password_ = password; }
+  void set_http_request(http_request::HttpRequestComponent* http) { this->http_request_ = http; }
   void set_include_all(bool include_all) { this->include_all_ = include_all; }
   void set_include_areas(const std::vector<std::string>& areas) { this->include_areas_ = areas; }
   void set_exclude_areas(const std::vector<std::string>& areas) { this->exclude_areas_ = areas; }
@@ -63,6 +66,7 @@ class DynamicEntityDiscovery : public Component {
  protected:
   std::string ha_api_url_;
   std::string ha_api_password_;
+  http_request::HttpRequestComponent* http_request_{nullptr};
   bool include_all_{true};
   std::vector<std::string> include_areas_;
   std::vector<std::string> exclude_areas_;
@@ -90,6 +94,7 @@ class DynamicEntityDiscovery : public Component {
   static const int MAX_ROOM_COLORS_ = 8;
 
   void fetch_areas_();
+  void fetch_entities_();
   void fetch_entities_for_area_(const Area& area);
   void filter_and_build_room_cards_();
   bool is_area_excluded_(const std::string& area_name) const;

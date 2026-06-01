@@ -1,8 +1,9 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
+from esphome.components import http_request
 
-DEPENDENCIES = ["lvgl"]
+DEPENDENCIES = ["lvgl", "http_request"]
 
 dynamic_entity_discovery_ns = cg.esphome_ns.namespace("dynamic_entity_discovery")
 
@@ -15,6 +16,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(DynamicEntityDiscovery),
         cv.Required("ha_api_url"): cv.url,
         cv.Required("ha_api_password"): cv.string,
+        cv.Optional("http_request_ref"): cv.use_id(http_request.HttpRequestComponent),
         cv.Optional("include_all", default=True): cv.boolean,
         cv.Optional("include_areas", default=[]): cv.ensure_list(cv.string),
         cv.Optional("exclude_areas", default=[]): cv.ensure_list(cv.string),
@@ -41,6 +43,11 @@ async def to_code(config):
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
+
+    # Get the http_request component by its ID
+    if "http_request_ref" in config:
+        http_request_var = await cg.get_variable(config["http_request_ref"])
+        cg.add(var.set_http_request(http_request_var))
 
     cg.add(var.set_ha_api_url(config["ha_api_url"]))
     cg.add(var.set_ha_api_password(config["ha_api_password"]))
