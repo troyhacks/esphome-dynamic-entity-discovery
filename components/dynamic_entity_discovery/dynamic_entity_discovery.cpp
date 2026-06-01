@@ -22,6 +22,12 @@ const uint32_t DynamicEntityDiscovery::ROOM_COLORS_[] = {
 // Static pointer to component instance for use in C callbacks
 static DynamicEntityDiscovery* s_instance = nullptr;
 
+// Callback data for arc value changes - allocated on heap, freed on LV_EVENT_DELETE
+struct ArcCallbackData {
+    int entity_idx;
+    lv_obj_t* label;
+};
+
 void DynamicEntityDiscovery::setup() {
   ESP_LOGI(TAG, "Dynamic Entity Discovery starting...");
   s_instance = this;
@@ -340,6 +346,7 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   lv_obj_set_style_border_width(btn, 2, 0);
   lv_obj_set_style_border_color(btn, lv_color_hex(room.color), 0);
   lv_obj_set_style_bg_color(btn, lv_color_hex(0x222222), 0);
+  lv_obj_set_scrollbar_mode(btn, LV_SCROLLBAR_MODE_OFF);
 
   lv_obj_t* btn_label = lv_label_create(btn);
   lv_label_set_text(btn_label, "ON/OFF");
@@ -356,6 +363,7 @@ void DynamicEntityDiscovery::create_room_card_(void* parent, const RoomCard& roo
   // Room name label - clickable area using transparent button
   // CREATE LAST so it's on TOP in z-order and receives touches
   lv_obj_t* label_btn = lv_obj_create(card);
+  lv_obj_remove_style_all(label_btn);  // Start with clean slate to avoid default button styles
   lv_obj_set_size(label_btn, 180, 40);  // 180px wide for touch target
   lv_obj_align(label_btn, LV_ALIGN_CENTER, 0, 0);  // Centered in card
   lv_obj_set_style_bg_opa(label_btn, LV_OPA_TRANSP, 0);  // Invisible background
@@ -524,21 +532,25 @@ void DynamicEntityDiscovery::create_entity_control_(void* parent, const Entity& 
     lv_obj_set_style_text_color(pct_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(pct_label, LV_ALIGN_RIGHT_MID, -30, 0);
 
-    // Store both arc user_data and label in a combined pointer for the callback
-    // Encode as: high bits = entity_index, low bits = label pointer
-    uintptr_t combined = ((uintptr_t)entity_index << 16) | ((uintptr_t)pct_label & 0xFFFF);
-    lv_obj_set_user_data(arc, (void*)combined);
+    // Allocate callback data struct - freed in LV_EVENT_DELETE handler
+    ArcCallbackData* cb_data = new ArcCallbackData{entity_index, pct_label};
+    lv_obj_set_user_data(arc, cb_data);
 
     lv_obj_add_event_cb(arc, [](lv_event_t* event) {
       lv_obj_t* arc = (lv_obj_t*)lv_event_get_target(event);
       int value = lv_arc_get_value(arc);
-      uintptr_t combined = (uintptr_t)lv_obj_get_user_data(arc);
-      int entity_idx = (int)(combined >> 16);
-      lv_obj_t* pct_label = (lv_obj_t*)(combined & 0xFFFF);
-      lv_label_set_text_fmt(pct_label, "%d%%", value);
-      ESP_LOGI(TAG, "Entity brightness changed: index=%d, value=%d%%", entity_idx, value);
+      ArcCallbackData* data = (ArcCallbackData*)lv_obj_get_user_data(arc);
+      lv_label_set_text_fmt(data->label, "%d%%", value);
+      ESP_LOGI(TAG, "Entity brightness changed: index=%d, value=%d%%", data->entity_idx, value);
       // TODO: Call HA API to set brightness
     }, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    // Free callback data when arc is destroyed to prevent memory leak
+    lv_obj_add_event_cb(arc, [](lv_event_t* event) {
+      lv_obj_t* target = (lv_obj_t*)lv_event_get_target(event);
+      ArcCallbackData* data = (ArcCallbackData*)lv_obj_get_user_data(target);
+      delete data;
+    }, LV_EVENT_DELETE, nullptr);
   } else if (entity.domain == "switch") {
     // Switch has toggle button
     lv_obj_t* toggle_btn = lv_obj_create(control);
