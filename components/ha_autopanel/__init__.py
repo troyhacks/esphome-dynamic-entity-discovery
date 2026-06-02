@@ -1,35 +1,47 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
-from esphome.components import http_request
+from esphome.components import http_request, wifi, web_server_base
+from esphome.components.esp32 import include_builtin_idf_component
 
-DEPENDENCIES = ["lvgl", "http_request"]
+DEPENDENCIES = ["lvgl", "http_request", "api", "wifi", "web_server_base"]
 
-dynamic_entity_discovery_ns = cg.esphome_ns.namespace("dynamic_entity_discovery")
+ha_autopanel_ns = cg.esphome_ns.namespace("ha_autopanel")
 
-DynamicEntityDiscovery = dynamic_entity_discovery_ns.class_(
-    "DynamicEntityDiscovery", cg.Component
+HaAutoPanel = ha_autopanel_ns.class_(
+    "HaAutoPanel", cg.Component
 )
 
 CONFIG_SCHEMA = cv.Schema(
     {
-        cv.GenerateID(): cv.declare_id(DynamicEntityDiscovery),
+        cv.GenerateID(): cv.declare_id(HaAutoPanel),
         cv.Required("ha_api_url"): cv.url,
         cv.Required("ha_api_password"): cv.string,
         cv.Optional("http_request_ref"): cv.use_id(http_request.HttpRequestComponent),
         cv.Optional("include_all", default=True): cv.boolean,
+        # All filtering options default to empty so the user doesn't have
+        # to hardcode them in YAML. In the no-code vision, these are
+        # configured via the on-device web UI (LittleFS-backed). For now
+        # if a user wants pre-configured filters they can still set them
+        # in YAML.
         cv.Optional("include_areas", default=[]): cv.ensure_list(cv.string),
         cv.Optional("exclude_areas", default=[]): cv.ensure_list(cv.string),
-        cv.Optional("domains", default=["light"]): cv.ensure_list(cv.string),
+        cv.Optional("domains", default=[]): cv.ensure_list(cv.string),
         cv.Optional("exclude_entities", default=[]): cv.ensure_list(cv.string),
-        cv.Optional("grid_cols", default=3): cv.int_range(min=1, max=6),
-        cv.Optional("grid_rows", default=2): cv.int_range(min=1, max=4),
-        cv.Optional("grid_card_width", default=330): cv.int_range(min=100, max=500),
-        cv.Optional("grid_card_height", default=250): cv.int_range(min=100, max=500),
-        cv.Optional("grid_gap_x", default=7): cv.int_range(min=0, max=50),
-        cv.Optional("grid_gap_y", default=15): cv.int_range(min=0, max=50),
+        # Auto-fit layout: cards are square (width == height). The number of
+        # cards per row is computed from the screen width and card_width.
+        # Override screen_width/screen_height for non-1024x600 panels
+        # (e.g. a square dial board).
+        cv.Optional("card_width", default=250): cv.int_range(min=100, max=500),
+        cv.Optional("card_gap", default=12): cv.int_range(min=0, max=50),
+        cv.Optional("screen_width", default=1024): cv.int_range(min=200, max=4096),
+        cv.Optional("screen_height", default=600): cv.int_range(min=200, max=4096),
         cv.Optional("start_x", default=10): cv.int_range(min=0, max=200),
         cv.Optional("start_y", default=12): cv.int_range(min=0, max=200),
+        # Default brightness percentage when the ON/OFF button is tapped on
+        # a room that has no recorded previous brightness. Used as the
+        # bounce-back value.
+        cv.Optional("default_on_pct", default=30): cv.int_range(min=1, max=100),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -39,6 +51,20 @@ async def to_code(config):
     # too late to affect lv_conf.h generation. Widgets used by the C++ code
     # must be declared in the user's YAML under lvgl.widgets:.
 
+    # Enable the action-response defines so we can build HomeassistantActionRequest
+    # with a call_id and surface the response back to C++ for the auth probe.
+    # The api component only sets these if the user has a YAML automation with
+    # homeassistant.action on_success/on_error. We need them at the proto
+    # level regardless.
+    cg.add_define("USE_API_HOMEASSISTANT_ACTION_RESPONSES")
+    cg.add_define("USE_API_HOMEASSISTANT_ACTION_RESPONSES_ERRORS")
+    cg.add_define("USE_API_HOMEASSISTANT_ACTION_RESPONSES_JSON")
+
+    # Re-enable the IDF native esp_littlefs component (ESPHome excludes
+    # the Arduino joltwallet one by default to keep build times down).
+    # The 'storage' partition in partitions.csv is mounted at /storage.
+    include_builtin_idf_component("espressif__esp_littlefs")
+
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
@@ -47,6 +73,10 @@ async def to_code(config):
         http_request_var = await cg.get_variable(config["http_request_ref"])
         cg.add(var.set_http_request(http_request_var))
 
+    # The wifi component is accessed directly via wifi::global_wifi_component
+    # in C++ - no Python-side reference needed. The component has a hard
+    # dependency on 'wifi' which guarantees the global is populated.
+
     cg.add(var.set_ha_api_url(config["ha_api_url"]))
     cg.add(var.set_ha_api_password(config["ha_api_password"]))
     cg.add(var.set_include_all(config["include_all"]))
@@ -54,11 +84,10 @@ async def to_code(config):
     cg.add(var.set_exclude_areas(config["exclude_areas"]))
     cg.add(var.set_entity_domains(config["domains"]))
     cg.add(var.set_exclude_entities(config["exclude_entities"]))
-    cg.add(var.set_grid_cols(config["grid_cols"]))
-    cg.add(var.set_grid_rows(config["grid_rows"]))
-    cg.add(var.set_grid_card_width(config["grid_card_width"]))
-    cg.add(var.set_grid_card_height(config["grid_card_height"]))
-    cg.add(var.set_grid_gap_x(config["grid_gap_x"]))
-    cg.add(var.set_grid_gap_y(config["grid_gap_y"]))
+    cg.add(var.set_card_width(config["card_width"]))
+    cg.add(var.set_card_gap(config["card_gap"]))
+    cg.add(var.set_screen_width(config["screen_width"]))
+    cg.add(var.set_screen_height(config["screen_height"]))
     cg.add(var.set_start_x(config["start_x"]))
     cg.add(var.set_start_y(config["start_y"]))
+    cg.add(var.set_default_on_pct(config["default_on_pct"]))
