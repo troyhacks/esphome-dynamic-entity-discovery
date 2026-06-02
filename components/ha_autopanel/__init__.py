@@ -2,7 +2,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
 from esphome.components import http_request, wifi, web_server_base
-from esphome.components.esp32 import include_builtin_idf_component
+from esphome.components.esp32 import add_idf_component, include_builtin_idf_component
 
 DEPENDENCIES = ["lvgl", "http_request", "api", "wifi", "web_server_base"]
 
@@ -60,10 +60,17 @@ async def to_code(config):
     cg.add_define("USE_API_HOMEASSISTANT_ACTION_RESPONSES_ERRORS")
     cg.add_define("USE_API_HOMEASSISTANT_ACTION_RESPONSES_JSON")
 
-    # Re-enable the IDF native esp_littlefs component (ESPHome excludes
-    # the Arduino joltwallet one by default to keep build times down).
-    # The 'storage' partition in partitions.csv is mounted at /storage.
-    include_builtin_idf_component("espressif__esp_littlefs")
+    # Re-enable the IDF managed joltwallet/littlefs component so we
+    # can mount the 'storage' partition (declared in partitions.csv)
+    # at /storage. ESPHome excludes joltwallet__littlefs (Arduino) by
+    # default to keep build times down; this is the IDF managed variant
+    # which is what we want for the esp-idf framework. The component
+    # is fetched from its GitHub repo so the include path is updated.
+    include_builtin_idf_component("joltwallet__littlefs")
+    add_idf_component(
+        name="joltwallet/littlefs",
+        repo="https://github.com/joltwallet/esp_littlefs.git",
+    )
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)

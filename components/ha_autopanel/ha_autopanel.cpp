@@ -92,7 +92,51 @@ void HaAutoPanel::setup() {
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
   }
 
+  // Brand splash — full-screen black with red centered "HA AutoPanel v1.0".
+  // Created before anything else so the user always sees this the moment
+  // the panel comes up, and so any panel-side display-default artifacts
+  // (brief test pattern, uninitialized frame buffer) are covered. It is
+  // hidden by hide_splash_() the first time we leave the BOOTING state.
+  this->splash_container_ = lv_obj_create(screen);
+  if (this->splash_container_ != nullptr) {
+    lv_obj_set_pos(this->splash_container_, 0, 0);
+    lv_obj_set_size(this->splash_container_, this->screen_width_, this->screen_height_);
+    lv_obj_set_style_bg_color(this->splash_container_, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(this->splash_container_, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(this->splash_container_, 0, 0);
+    lv_obj_set_style_pad_all(this->splash_container_, 0, 0);
+    lv_obj_remove_flag(this->splash_container_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(this->splash_container_, LV_OBJ_FLAG_CLICKABLE);
+
+    this->splash_label_ = lv_label_create(this->splash_container_);
+    if (this->splash_label_ != nullptr) {
+      lv_label_set_text(this->splash_label_, "HA AutoPanel v1.0");
+      // Pure red (0xFF0000) per the spec. Default font is fine here —
+      // it's larger and bolder than the title-bar label, which is what we
+      // want for a centered splash. If you want a specific face/size, set
+      // it via lv_obj_set_style_text_font() referencing the lvgl font id.
+      lv_obj_set_style_text_color(this->splash_label_, lv_color_hex(0xFF0000), 0);
+      lv_obj_set_style_text_align(this->splash_label_, LV_TEXT_ALIGN_CENTER, 0);
+      lv_obj_center(this->splash_label_);
+    }
+  }
+
   ESP_LOGI(TAG, "Note: Use trigger_discovery() after boot to create UI");
+
+  // Log our own IP so the user can see it in the boot logs (the wifi
+  // component doesn't log this by default).
+  if (wifi::global_wifi_component != nullptr) {
+    if (wifi::global_wifi_component->is_connected()) {
+      auto ips = wifi::global_wifi_component->get_ip_addresses();
+      for (const auto &ip : ips) {
+        if (ip.is_set()) {
+          ESP_LOGI(TAG, "  IP: %s", ip.str().c_str());
+        }
+      }
+    } else {
+      ESP_LOGW(TAG, "  WiFi not connected yet (will retry)");
+    }
+  }
 
   // Start in BOOTING state. show_status_screen_ is deferred until trigger_discovery()
   // is called, since at this point the screen size and the layout may not be
@@ -182,7 +226,15 @@ void HaAutoPanel::fetch_areas_() {
   // JSON decoding gives "\\." and the regex sees "\.". So in C++ source
   // we need "\\\\\\\\." (8 backslashes + dot) -> runtime is "\\\\." ->
   // JSON decodes to "\\." -> regex sees "\.". Yes.
-  std::string domain_match_json = "^(?:" + domain_regex + ")\\\\\\\\.";
+  // When the user has not specified any domains, the regex would be
+  // "^(?:)\." which never matches anything. Use ".*" instead so
+  // the template returns ALL entity_ids in each area.
+  std::string domain_match_json;
+  if (this->entity_domains_.empty()) {
+    domain_match_json = ".*";
+  } else {
+    domain_match_json = "^(?:" + domain_regex + ")\\\\.";
+  }
 
   // Build include/exclude area lists (HA's "in" test works on string lists).
   // The whole body is a JSON string, so inner double quotes MUST be escaped
@@ -366,6 +418,29 @@ void HaAutoPanel::fetch_areas_() {
 
       this->discovered_areas_.push_back(a);
       ESP_LOGI(TAG, "  Found area: %s with %d entities", name, (int)a.entity_ids.size());
+
+      // We skip the heavy /api/states bulk fetch to avoid a 227KB JSON
+      // parse that crashes the panel. Instead, populate entities_by_area_
+      // with minimal Entity stubs derived from the template's entity_ids
+      // list. State and brightness are populated lazily by the
+      // api.on_state subscription (see subscribe_to_all_entities_).
+      std::vector<Entity> &bucket = this->entities_by_area_[a.area_id];
+      bucket.reserve(a.entity_ids.size());
+      for (const auto &eid : a.entity_ids) {
+        Entity e;
+        e.entity_id = eid;
+        // Derive name and domain from the entity_id
+        size_t dot = eid.find('.');
+        if (dot != std::string::npos) {
+          e.domain = eid.substr(0, dot);
+          e.name = eid.substr(dot + 1);
+          e.area_id = a.area_id;
+        }
+        // We don't know if it's a light with brightness yet; the
+        // subscription callback updates has_brightness and brightness
+        // when HA pushes the initial state.
+        bucket.push_back(std::move(e));
+      }
     }
   }
 }
@@ -461,8 +536,9 @@ void HaAutoPanel::fetch_entities_() {
     ESP_LOGD(TAG, "  head: %s", head.c_str());
   }
 
-  // ArduinoJson 7.x: JsonDocument with PSRAM allocator to keep DOM off
-  // the small internal heap.
+  // ArduinoJson 7.x: parse the states response. Use the PSRAM-backed
+  // allocator so the ~250KB JSON document lives in PSRAM. The default
+  // internal heap is too small and would abort().
   PsramJsonDocument doc(&s_psram_allocator);
 
   DeserializationError parse_err = deserializeJson(doc, response);
@@ -579,11 +655,12 @@ void HaAutoPanel::start_discovery_() {
     ESP_LOGW(TAG, "Aborting discovery: auth failed during area fetch");
     return;
   }
-  fetch_entities_();
-  if (this->state_ == PanelState::AUTH_FAILED) {
-    ESP_LOGW(TAG, "Aborting discovery: auth failed during entity fetch");
-    return;
-  }
+  // fetch_entities_() is disabled - parsing the 220KB+ states response
+  // exceeds the available internal heap on the Crowpanel. Entity state
+  // and brightness are populated lazily via the api.on_state subscription
+  // (subscribe_to_all_entities_), which gives us per-entity deltas
+  // without a single big allocation.
+  ESP_LOGI(TAG, "Skipping bulk /api/states fetch; relying on state subscriptions");
 
   if (discovered_areas_.empty()) {
     ESP_LOGW(TAG, "No areas discovered from HA - check API token and connectivity");
@@ -652,6 +729,8 @@ bool HaAutoPanel::is_entity_excluded_(const std::string& entity_id) const {
 }
 
 bool HaAutoPanel::is_domain_included_(const std::string& domain) const {
+  // An empty filter list means "no filter" (show every domain).
+  if (this->entity_domains_.empty()) return true;
   for (const auto& d : this->entity_domains_) {
     if (domain == d) return true;
   }
@@ -696,6 +775,23 @@ void HaAutoPanel::filter_and_build_room_cards_() {
 void HaAutoPanel::create_ui_from_room_cards_() {
   ESP_LOGI(TAG, "Creating dynamic UI for %d room cards", (int)room_cards_.size());
 
+  // Force the active screen's background to dark BEFORE any other widget
+  // exists. LVGL 9's default theme paints the screen with a light/off-white
+  // background; if a paint cycle sneaks in before the main_container_ and
+  // its dark bg cover the screen, the user sees a brief white flash in the
+  // upper-left (the only area not yet covered by anything). The
+  // main_container_ is 1024x600 at (0, 0), so once it paints the screen bg
+  // is irrelevant, but the first paint of that container races with this
+  // setup. Setting the screen bg to dark closes the race at the source.
+  {
+    lv_obj_t* screen = lv_scr_act();
+    if (screen != nullptr) {
+      lv_obj_set_style_bg_color(screen, lv_color_hex(0x111827), 0);
+      lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+      lv_obj_invalidate(screen);
+    }
+  }
+
   // Clean up any previous main container and its widget references.
   // On a re-discovery (e.g. after a config change) the old widgets would
   // otherwise persist under the new render.
@@ -739,6 +835,11 @@ void HaAutoPanel::create_ui_from_room_cards_() {
   // blank area. We size the container tightly so the last card is always
   // at the bottom of the scrollable area.
 
+  // Fixed title bar at the top of the page (child of the screen, not
+  // of the scrolling main_container_, so it stays put while the room
+  // grid scrolls under it). 36px tall.
+  this->create_title_bar_(screen);
+
   for (const auto& room : room_cards_) {
     create_room_card_(this->main_container_, room);
   }
@@ -764,6 +865,85 @@ void HaAutoPanel::create_ui_from_room_cards_() {
 
   ESP_LOGI(TAG, "UI creation complete: %d cards in %d rows, page height=%d (screen=%d, last card bottom=%d)",
            (int) room_cards_.size(), num_rows, total_height, this->screen_height_, actual_bottom);
+}
+
+void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
+  // Fixed title bar at the top of the page (a child of the screen so it
+  // sits on top of every page). 36px tall. Holds: HA connection
+  // status dot + label, and an Edit button that toggles customization
+  // mode (long-press rooms to hide/reorder).
+  this->title_bar_ = lv_obj_create(parent);
+  lv_obj_set_size(this->title_bar_, this->screen_width_, 36);
+  lv_obj_set_pos(this->title_bar_, 0, 0);
+  lv_obj_set_style_bg_color(this->title_bar_, lv_color_hex(0x1f2937), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(this->title_bar_, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(this->title_bar_, 0, 0);
+  lv_obj_set_style_pad_all(this->title_bar_, 0, 0);
+  lv_obj_remove_flag(this->title_bar_, LV_OBJ_FLAG_SCROLLABLE);
+  // Don't block clicks on the room grid underneath
+  lv_obj_remove_flag(this->title_bar_, LV_OBJ_FLAG_CLICKABLE);
+
+  // HA connection status indicator (green dot / red dot / grey / amber)
+  this->title_status_dot_ = lv_obj_create(this->title_bar_);
+  lv_obj_set_size(this->title_status_dot_, 12, 12);
+  lv_obj_set_pos(this->title_status_dot_, 12, 12);
+  lv_obj_set_style_radius(this->title_status_dot_, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(this->title_status_dot_, lv_color_hex(0x6b7280), LV_PART_MAIN);
+  lv_obj_set_style_border_width(this->title_status_dot_, 0, 0);
+  lv_obj_remove_flag(this->title_status_dot_, LV_OBJ_FLAG_CLICKABLE);
+
+  // Status text ("HA: 192.168.2.74" or "HA: offline" etc.)
+  this->title_status_label_ = lv_label_create(this->title_bar_);
+  lv_label_set_text(this->title_status_label_, "HA: ...");
+  lv_obj_set_style_text_color(this->title_status_label_, lv_color_hex(0x9ca3af), 0);
+  lv_obj_set_pos(this->title_status_label_, 32, 11);
+
+  // Edit button (top-right) - toggles customization mode
+  this->title_edit_btn_ = lv_obj_create(this->title_bar_);
+  lv_obj_set_size(this->title_edit_btn_, 90, 28);
+  lv_obj_set_pos(this->title_edit_btn_, this->screen_width_ - 102, 4);
+  lv_obj_set_style_bg_color(this->title_edit_btn_, lv_color_hex(0x374151), 0);
+  lv_obj_set_style_radius(this->title_edit_btn_, 6, 0);
+  lv_obj_set_style_border_width(this->title_edit_btn_, 0, 0);
+  lv_obj_add_flag(this->title_edit_btn_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* edit_label = lv_label_create(this->title_edit_btn_);
+  lv_label_set_text(edit_label, "Edit");
+  lv_obj_set_style_text_color(edit_label, lv_color_hex(0xfacc15), 0);
+  lv_obj_center(edit_label);
+  lv_obj_add_event_cb(this->title_edit_btn_, [](lv_event_t* event) {
+    if (s_instance == nullptr) return;
+    s_instance->edit_mode_ = !s_instance->edit_mode_;
+    ESP_LOGI(TAG, "Edit mode %s", s_instance->edit_mode_ ? "ON" : "OFF");
+    // Re-render so the UI reflects the new state. We re-use the same
+    // refresh path used for hide/reorder.
+    s_instance->refresh_room_cards_();
+  }, LV_EVENT_CLICKED, nullptr);
+
+  // Back button (top-left) - on the room grid it's a no-op; on the
+  // entity detail page it pops back to the grid.
+  this->title_back_btn_ = lv_obj_create(this->title_bar_);
+  lv_obj_set_size(this->title_back_btn_, 70, 28);
+  lv_obj_set_pos(this->title_back_btn_, 32, 4);
+  lv_obj_set_style_bg_color(this->title_back_btn_, lv_color_hex(0x374151), 0);
+  lv_obj_set_style_radius(this->title_back_btn_, 6, 0);
+  lv_obj_set_style_border_width(this->title_back_btn_, 0, 0);
+  lv_obj_add_flag(this->title_back_btn_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* back_label = lv_label_create(this->title_back_btn_);
+  lv_label_set_text(back_label, "< Back");
+  lv_obj_set_style_text_color(back_label, lv_color_hex(0xfacc15), 0);
+  lv_obj_center(back_label);
+  // Hidden by default; show_entity_detail_ makes it visible
+  lv_obj_add_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(this->title_back_btn_, [](lv_event_t* event) {
+    if (s_instance == nullptr) return;
+    s_instance->show_room_grid_();
+  }, LV_EVENT_CLICKED, nullptr);
+
+  // Ensure the title bar is rendered on top of any future children
+  lv_obj_move_foreground(this->title_bar_);
+
+  // Update the status indicator based on current panel state
+  this->update_title_bar_();
 }
 
 void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
@@ -803,9 +983,23 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // The arc is square and scaled to fit the card (card_width - 20).
   int arc_size = this->arc_size_();
   lv_obj_t* arc = lv_arc_create(card);
-  // Hide during construction so the first paint cycle doesn't show the
-  // arc with its default (white) color before our styles take effect.
-  // We unhide it once all the colors/widths are set below.
+  // Belt-and-suspenders fix for the "small white arc flashes top-left on
+  // boot" bug. LVGL 9's default arc theme paints both the track (MAIN) and
+  // the indicator (INDICATOR) in white. If a paint cycle sneaks in between
+  // lv_arc_create() and our final color set, the user sees a small white
+  // arc — roughly the indicator's color leaking through. The first card's
+  // arc lives in the upper-left of the visible area, which matches the
+  // reported position. Defense: (1) pre-set BOTH colors to the card bg so
+  // any leaked paint blends with the card, and (2) set BOTH opacities to
+  // fully transparent so even a forced paint produces nothing. The real
+  // colors and opacities are restored at the very end of the construction,
+  // after invalidate() forces a repaint with the current styles.
+  lv_obj_set_style_arc_color(arc, lv_color_hex(0x1a1a2e), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(arc, lv_color_hex(0x1a1a2e), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_opa(arc, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_arc_opa(arc, LV_OPA_TRANSP, LV_PART_INDICATOR);
+  // Also hide the obj itself, in case LVGL's paint path doesn't honor the
+  // opa=0 fallback (e.g. if the knob widget ignores the parent style).
   lv_obj_add_flag(arc, LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_size(arc, arc_size, arc_size);  // square
   lv_obj_align(arc, LV_ALIGN_CENTER, 0, -10);  // shift up a bit to make room for button
@@ -817,13 +1011,23 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // Arc width scales with the card size (about 8% of card_width) so the
   // arc looks proportional on both small and large cards.
   int arc_width = std::max(8, this->card_width_ / 12);
+  // Now that sizing/value/angles are set, apply the FINAL styles. The arc
+  // is still hidden and fully transparent at this point — no paint has
+  // been able to leak anything.
   lv_obj_set_style_arc_color(arc, lv_color_hex(0x404040), LV_PART_MAIN);
-  lv_obj_set_style_arc_width(arc, arc_width, LV_PART_MAIN);
   lv_obj_set_style_arc_color(arc, lv_color_hex(room.color), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(arc, arc_width, LV_PART_MAIN);
   lv_obj_set_style_arc_width(arc, arc_width, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_opa(arc, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_arc_opa(arc, LV_OPA_COVER, LV_PART_INDICATOR);
   // Force a layout pass so styles take effect before the arc is shown
   lv_obj_update_layout(arc);
-  // Now safe to make visible - styles are applied
+  // Explicitly mark dirty so the next LVGL tick repaints with the current
+  // (correct) styles before the arc becomes visible. update_layout() only
+  // marks the layout dirty; it doesn't schedule a paint. invalidate()
+  // forces one. This closes the race between unhide and the next paint.
+  lv_obj_invalidate(arc);
+  // Now safe to make visible - styles are applied AND opacity is restored
   lv_obj_remove_flag(arc, LV_OBJ_FLAG_HIDDEN);
 
   // Heap-allocated control data - the user_data is a raw pointer that stays
@@ -840,8 +1044,16 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   lv_obj_add_event_cb(arc, [](lv_event_t* event) {
     lv_obj_t* arc = (lv_obj_t*)lv_event_get_target(event);
     RoomControlData* data = (RoomControlData*)lv_obj_get_user_data(arc);
-    if (s_instance == nullptr || data == nullptr) return;
+    if (s_instance == nullptr) {
+      ESP_LOGW(TAG, "room arc release: s_instance null");
+      return;
+    }
+    if (data == nullptr) {
+      ESP_LOGW(TAG, "room arc release: data null");
+      return;
+    }
     int value = lv_arc_get_value(arc);
+    ESP_LOGI(TAG, "room arc release: area=%s value=%d", data->area_id.c_str(), value);
     if (value <= 0) {
       s_instance->call_ha_service_("light.turn_off", "area_id", data->area_id, -1);
       // Optimistic: mark lights off so the button color flips immediately
@@ -1020,36 +1232,72 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
 
   lv_obj_t* screen = lv_scr_act();
   this->detail_container_ = lv_obj_create(screen);
-  lv_obj_set_pos(this->detail_container_, 0, 0);
-  lv_obj_set_size(this->detail_container_, 1024, 600);
+  // Sit *below* the title bar instead of overlapping it. The title bar is a
+  // child of the screen at y=0, height 36. Putting the detail container at
+  // y=36 keeps it from covering the status dot/label, the Back button, and
+  // the (later-added) room name label. Earlier this was at y=0, which left
+  // the title bar invisible because the detail container was created after
+  // the title bar and therefore sat on top of it in z-order.
+  lv_obj_set_pos(this->detail_container_, 0, 36);
+  lv_obj_set_size(this->detail_container_, this->screen_width_, this->screen_height_ - 36);
+
+  // Show the back button (hidden on the grid page) and re-create the
+  // title bar with the back button visible.
+  if (this->title_back_btn_ != nullptr) {
+    lv_obj_remove_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_edit_btn_ != nullptr) {
+    // Replace the Edit button with a Done button on the detail page
+    lv_obj_t* edit_label = lv_obj_get_child(this->title_edit_btn_, 0);
+    if (edit_label != nullptr) {
+      lv_label_set_text(edit_label, "Done");
+    }
+  }
+  // Defense in depth: make sure the title bar is the topmost child of the
+  // screen, even after this new detail container was added underneath.
+  if (this->title_bar_ != nullptr) {
+    lv_obj_move_foreground(this->title_bar_);
+  }
+  // Update the title bar (the status dot/label stay the same, but the
+  // back button visibility changed and we may want to show the room name
+  // in the title).
   lv_obj_set_style_bg_color(this->detail_container_, lv_color_hex(0x111827), 0);
   lv_obj_set_scrollbar_mode(this->detail_container_, LV_SCROLLBAR_MODE_OFF);  // Clean, no scrollbar
   lv_obj_set_style_pad_all(this->detail_container_, 0, 0);  // No padding
   lv_obj_set_style_border_width(this->detail_container_, 0, 0);  // No border
 
-  // Back button
-  lv_obj_t* back_btn = lv_obj_create(this->detail_container_);
-  lv_obj_set_pos(back_btn, 10, 10);
-  lv_obj_set_size(back_btn, 100, 40);
-  lv_obj_set_style_radius(back_btn, 6, 0);
-  lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+  // The room name (centered in the title bar area). Set the bar above
+  // the detail body which starts at y=36.
+  if (this->title_status_label_ != nullptr) {
+    // Move status to make room for the room title in the middle
+    lv_obj_set_pos(this->title_status_label_, 110, 11);
+  }
 
-  lv_obj_t* back_label = lv_label_create(back_btn);
-  lv_label_set_text(back_label, "< Back");
-  lv_obj_set_style_text_color(back_label, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_center(back_label);
-  lv_obj_add_event_cb(back_btn, [](lv_event_t* event) {
-    s_instance->show_room_grid_();
-  }, LV_EVENT_CLICKED, nullptr);
+  // The back button is in the title bar (top-left). Here we just add
+  // the room title and the entity list. The entity list starts below
+  // the title bar (y=36).
 
-  // Room title - to the right of back button
-  lv_obj_t* title = lv_label_create(this->detail_container_);
-  lv_label_set_text(title, room.area.name.c_str());
-  lv_obj_set_style_text_color(title, lv_color_hex(room.color), 0);
-  lv_obj_set_pos(title, 130, 15);
+  // Room title - shown in the title bar (we move the status label out
+  // of the way and put the room name in the center).
+  if (this->title_bar_ != nullptr) {
+    if (this->title_room_label_ == nullptr) {
+      this->title_room_label_ = lv_label_create(this->title_bar_);
+      lv_obj_set_style_text_color(this->title_room_label_, lv_color_hex(0xFFFFFF), 0);
+    }
+    lv_label_set_text(this->title_room_label_, room.area.name.c_str());
+    // Center horizontally in the title bar. y=8 puts the text roughly centered
+    // vertically inside the 36px-tall bar.
+    lv_obj_set_pos(this->title_room_label_,
+                   (this->screen_width_ - (int)lv_obj_get_self_width(this->title_room_label_)) / 2,
+                   8);
+    // Re-center on next layout pass in case the width changed (long room names)
+    lv_obj_update_layout(this->title_room_label_);
+    lv_obj_set_x(this->title_room_label_,
+                 (this->screen_width_ - (int)lv_obj_get_self_width(this->title_room_label_)) / 2);
+  }
 
-  // Entity list - start below back button and title
-  int y_offset = 65;
+  // Entity list - start below title bar
+  int y_offset = 50;
   for (size_t i = 0; i < room.entities.size(); i++) {
     create_entity_control_(this->detail_container_, room.entities[i], (int)i, y_offset, room.color);
     y_offset += 80;
@@ -1061,6 +1309,11 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
     lv_obj_set_style_height(this->detail_container_, total_content_height, LV_PART_MAIN);
     ESP_LOGI(TAG, "Expanded detail container to %d px for %d entities", total_content_height, (int)room.entities.size());
   }
+
+  // Make sure the detail page opens scrolled to the top. The container is
+  // newly created so it should already be at 0, but be explicit in case LVGL
+  // is mid-tick and the first paint of the long content pulls the scroll.
+  lv_obj_scroll_to_y(this->detail_container_, 0, LV_ANIM_OFF);
 
   if (room.entities.empty()) {
     lv_obj_t* no_entities = lv_label_create(this->detail_container_);
@@ -1084,6 +1337,28 @@ void HaAutoPanel::show_room_grid_() {
   if (this->main_container_) {
     lv_obj_scroll_to_y(this->main_container_, 0, LV_ANIM_OFF);  // Reset scroll to top
     lv_obj_remove_flag(this->main_container_, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // Restore the title bar to the grid-page state. show_entity_detail_ set
+  // the back button visible and renamed "Edit" -> "Done"; both need to
+  // revert so the grid page is identical to the first boot.
+  if (this->title_back_btn_ != nullptr) {
+    lv_obj_add_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_edit_btn_ != nullptr) {
+    lv_obj_t* edit_label = lv_obj_get_child(this->title_edit_btn_, 0);
+    if (edit_label != nullptr) {
+      lv_label_set_text(edit_label, "Edit");
+    }
+  }
+  if (this->title_room_label_ != nullptr) {
+    lv_obj_add_flag(this->title_room_label_, LV_OBJ_FLAG_HIDDEN);
+  }
+  // Put the status label back where it lives on the grid page (top-left
+  // status area) — show_entity_detail_ shifted it right to make room
+  // for the room name.
+  if (this->title_status_label_ != nullptr) {
+    lv_obj_set_pos(this->title_status_label_, 32, 11);
   }
 
   this->current_room_index_ = -1;
@@ -1467,6 +1742,15 @@ void HaAutoPanel::set_panel_state_(PanelState new_state) {
   if (this->state_ == new_state) return;
   this->state_ = new_state;
   ESP_LOGI(TAG, "Panel state -> %d", (int) new_state);
+  this->update_title_bar_();
+
+  // Drop the boot splash the first time we leave BOOTING. The status screen
+  // (or main grid, if we jump straight to READY) takes over the full display
+  // from this point on. We hide the splash BEFORE showing the next thing so
+  // there's no frame where the user sees the unstyled screen underneath.
+  if (new_state != PanelState::BOOTING && this->splash_container_ != nullptr) {
+    lv_obj_add_flag(this->splash_container_, LV_OBJ_FLAG_HIDDEN);
+  }
 
   // Toggle the main room-grid container's visibility based on the new state.
   // When we're showing a status screen (anything not READY), hide the room
@@ -1522,30 +1806,31 @@ void HaAutoPanel::set_panel_state_(PanelState new_state) {
 }
 
 std::string HaAutoPanel::build_setup_message_() {
-  // Two cases:
-  //  1. Device is connected to the user's WiFi (STA mode). The user can
-  //     reach the panel by IP at http://X.X.X.X/autopanel.
-  //  2. Device is in AP fallback mode (no WiFi configured or station
-  //     failed). The user must connect to the device's AP, then browse
-  //     to its default address.
+  // We prefer the actual IP over the .local hostname because most
+  // Windows machines don't have Bonjour/mDNS installed, so the
+  // .local hostname doesn't resolve from the host.
   wifi::WiFiComponent* wifi = wifi::global_wifi_component;
   if (wifi == nullptr) {
     return std::string("No WiFi component bound; cannot determine address.");
   }
   std::string msg;
   if (wifi->is_connected()) {
-    const char* use_addr = wifi->get_use_address();
-    if (use_addr != nullptr && use_addr[0] != '\0') {
-      msg = std::string("Open http://") + use_addr + "/autopanel in a browser to configure.";
+    // First try the use_address (often a friendly name); then fall
+    // back to the first IP.
+    auto ips = wifi->get_ip_addresses();
+    std::string url;
+    if (!ips.empty() && ips[0].is_set()) {
+      url = std::string("http://") + ips[0].str() + "/autopanel";
     } else {
-      // use_address not set: show the first IP
-      auto ips = wifi->get_ip_addresses();
-      if (!ips.empty() && ips[0].is_set()) {
-        msg = std::string("Open http://") + ips[0].str() + "/autopanel in a browser to configure.";
+      const char* use_addr = wifi->get_use_address();
+      if (use_addr != nullptr && use_addr[0] != '\0') {
+        url = std::string("http://") + use_addr + "/autopanel";
       } else {
         msg = std::string("WiFi connected but no IP address yet. Please wait.");
+        return msg;
       }
     }
+    msg = std::string("Open ") + url + " in a browser to configure.";
   } else if (wifi->has_ap() && wifi->is_ap_active()) {
     // AP fallback mode: tell the user the SSID/password to connect to
     auto ap = wifi->get_ap();
@@ -1803,12 +2088,10 @@ void HaAutoPanel::loop() {
 bool HaAutoPanel::mount_storage_() {
   // Mount the 'storage' partition at /storage using esp_littlefs.
   // The partition must be declared in partitions.csv as subtype=littlefs.
-  // ESP-IDF's esp_littlefs driver is the IDF-native one (not joltwallet).
   esp_vfs_littlefs_conf_t conf = {};
   conf.base_path = "/storage";
   conf.partition_label = "storage";
   conf.format_if_mount_failed = true;  // first boot will format
-  conf.dont_mount_by_default = false;
   esp_err_t err = esp_vfs_littlefs_register(&conf);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "esp_vfs_littlefs_register failed: %s", esp_err_to_name(err));
@@ -1907,14 +2190,14 @@ void HaAutoPanel::register_web_handler_() {
     return;
   }
 
-  // Register GET /autopanel and POST /autopanel/save
+  // Register GET /autopanel, POST /autopanel/save, POST /autopanel/reset
   class AutoPanelHandler : public AsyncWebHandler {
    public:
     AutoPanelHandler(HaAutoPanel *parent) : parent_(parent) {}
     bool canHandle(AsyncWebServerRequest *request) const override {
       char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
       std::string url(request->url_to(url_buf).str());
-      return url == "/autopanel" || url == "/autopanel/save" || url == "/autopanel/api/areas";
+      return url == "/autopanel" || url == "/autopanel/save" || url == "/autopanel/reset";
     }
     void handleRequest(AsyncWebServerRequest *request) override {
       char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
@@ -1930,6 +2213,12 @@ void HaAutoPanel::register_web_handler_() {
       } else if (url == "/autopanel/save") {
         if (request->method() == HTTP_POST) {
           parent_->handle_setup_post_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/reset") {
+        if (request->method() == HTTP_POST) {
+          parent_->handle_setup_reset_(request);
         } else {
           request->send(405, "text/plain", "Method not allowed");
         }
@@ -1974,7 +2263,22 @@ void HaAutoPanel::handle_setup_get_(AsyncWebServerRequest *request) {
   body += "' placeholder='paste token from HA profile page'>";
   body += "<br><button type='submit'>Save &amp; restart</button>";
   body += "</form>";
-  body += "<div class='note'>Settings are saved to /storage/autopanel.cfg on the device. "
+
+  // Reset form (separate, so users can fall back to the YAML defaults)
+  body += "<form method='POST' action='/autopanel/reset' style='margin-top:12px'>";
+  body += "<button type='submit' style='background:#374151;color:#eee'>Reset to YAML defaults</button>";
+  body += "</form>";
+
+  // Show this device's IP prominently (the .local hostname only
+  // works if the user's machine has Bonjour/mDNS installed, which is
+  // unreliable).
+  body += "<div class='note'><b>Access URL:</b> http://";
+  // We don't know our own IP from the AsyncWebServerRequest; the
+  // SETUP_REQUIRED screen on the panel itself shows the IP. Web
+  // form user can find the device by scanning the network with
+  // python send_cmd.py web find
+  body += "<i>(see panel screen for the device's IP)</i>/autopanel";
+  body += "<br><br>Settings are saved to /storage/autopanel.cfg on the device. "
           "The device restarts after save. The YAML-supplied values are used as a fallback. "
           "In HA, allow this device to perform Home Assistant actions under "
           "Devices &gt; ESPHome &gt; configure.</div>";
@@ -2027,6 +2331,103 @@ void HaAutoPanel::handle_setup_post_(AsyncWebServerRequest *request) {
   set_timeout(2000, []() {
     App.safe_reboot();
   });
+}
+
+void HaAutoPanel::handle_setup_reset_(AsyncWebServerRequest *request) {
+  // Delete the saved config file so the device falls back to the YAML
+  // values on next boot. Useful when the user wants to "start over".
+  ESP_LOGI(TAG, "Reset: deleting %s", this->config_path_.c_str());
+  int rc = unlink(this->config_path_.c_str());
+  std::string body;
+  body += "<!doctype html><html><body style='font-family:sans-serif;background:#111827;color:#fff;padding:24px'>";
+  if (rc == 0) {
+    body += "<h1>Reset</h1><p>Saved config deleted. Device restarting in 2 seconds. The YAML values will be used.</p>";
+  } else {
+    body += "<h1>Reset</h1><p>No saved config to delete (or delete failed). Device restarting in 2 seconds.</p>";
+  }
+  body += "</body></html>";
+  AsyncWebServerResponse *resp = request->beginResponse(200, "text/html", body.c_str());
+  request->send(resp);
+  set_timeout(2000, []() {
+    App.safe_reboot();
+  });
+}
+
+// --- Title bar ---
+
+void HaAutoPanel::update_title_bar_() {
+  if (this->title_status_label_ == nullptr || this->title_status_dot_ == nullptr) {
+    return;  // not created yet (still booting)
+  }
+  // Pick a status indicator color + label based on panel state + HA
+  // connection. HA is "connected" if the API server has at least one
+  // active client connection.
+  uint32_t dot_color = 0x6b7280;  // grey = unknown
+  const char* label = "HA: ...";
+  if (api::global_api_server != nullptr) {
+    // The is_connected() method on APIServer is private; use the
+    // presence of a client as a proxy. We check the number of clients.
+    // The simpler check: state == READY means we got past auth probe.
+    if (this->state_ == PanelState::READY) {
+      dot_color = 0x10b981;  // green
+      char buf[80];
+      wifi::WiFiComponent* wifi = wifi::global_wifi_component;
+      if (wifi != nullptr && wifi->is_connected()) {
+        auto ips = wifi->get_ip_addresses();
+        if (!ips.empty() && ips[0].is_set()) {
+          snprintf(buf, sizeof(buf), "HA: %s", ips[0].str().c_str());
+        } else {
+          snprintf(buf, sizeof(buf), "HA: connected");
+        }
+      } else {
+        snprintf(buf, sizeof(buf), "HA: connected");
+      }
+      lv_label_set_text(this->title_status_label_, buf);
+    } else if (this->state_ == PanelState::AUTH_FAILED) {
+      dot_color = 0xef4444;  // red
+      lv_label_set_text(this->title_status_label_, "HA: auth failed");
+    } else if (this->state_ == PanelState::NOT_AUTHORIZED) {
+      dot_color = 0xf59e0b;  // amber
+      lv_label_set_text(this->title_status_label_, "HA: not authorized");
+    } else if (this->state_ == PanelState::CONNECTING) {
+      dot_color = 0x3b82f6;  // blue
+      lv_label_set_text(this->title_status_label_, "HA: connecting...");
+    } else {
+      dot_color = 0x6b7280;  // grey
+      lv_label_set_text(this->title_status_label_, "HA: setup required");
+    }
+  } else {
+    lv_label_set_text(this->title_status_label_, "HA: offline");
+  }
+  lv_obj_set_style_bg_color(this->title_status_dot_, lv_color_hex(dot_color), LV_PART_MAIN);
+}
+
+void HaAutoPanel::refresh_room_cards_() {
+  // Tear down the current room cards and rebuild from room_cards_ with
+  // the current edit_mode. The entities_by_area_ and room data are
+  // unchanged; this just rebuilds the LVGL widget tree.
+  if (this->main_container_ == nullptr) return;
+  // Delete all room card children. We walk the children list and delete
+  // anything that's not the title bar.
+  uint32_t child_count = lv_obj_get_child_cnt(this->main_container_);
+  // Iterate in reverse because deleting shifts indices
+  for (int i = (int) child_count - 1; i >= 0; i--) {
+    lv_obj_t* child = lv_obj_get_child(this->main_container_, i);
+    if (child != this->title_bar_) {
+      lv_obj_del(child);
+    }
+  }
+  // Clear live widget refs (they reference the deleted widgets)
+  this->room_arc_widgets_.clear();
+  this->room_btn_widgets_.clear();
+  this->room_label_btn_widgets_.clear();
+  // Recreate the room cards
+  for (const auto& room : room_cards_) {
+    this->create_room_card_(this->main_container_, room);
+  }
+  // Update the title bar so the room count / status reflects the new view
+  this->update_title_bar_();
+  ESP_LOGI(TAG, "Room cards refreshed (edit_mode=%d)", (int) this->edit_mode_);
 }
 
 }  // namespace ha_autopanel

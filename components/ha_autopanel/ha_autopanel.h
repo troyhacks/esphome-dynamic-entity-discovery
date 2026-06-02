@@ -66,6 +66,10 @@ struct ControlRecord {
 
 // Persisted config struct (NVS). Char arrays, not std::string, so the
 // type is trivially_copyable (required by global_preferences).
+// Note: hidden_rooms / hidden_entities / room_order / entity_order
+// are stored separately as a JSON blob (CustomizationConfig) on
+// LittleFS, NOT in this struct, because the size would blow past
+// the NVS blob limit (508 bytes).
 struct StoredConfig {
   char api_url[128];
   char api_token[256];
@@ -73,6 +77,17 @@ struct StoredConfig {
   uint8_t reserved[7];  // pad to 4-byte alignment for NVS
 };
 static_assert(sizeof(StoredConfig) <= 512, "StoredConfig must fit in a single NVS blob");
+
+// User customizations persisted as JSON on LittleFS at
+// /storage/customizations.cfg. Plain key-value fields, not NVS.
+struct CustomizationConfig {
+  std::set<std::string> hidden_rooms;
+  std::set<std::string> hidden_entities;
+  std::vector<std::string> room_order;
+  // entity_order is per-area, keyed by area_id
+  std::map<std::string, std::vector<std::string>> entity_order;
+  bool loaded{false};
+};
 
 // Panel-level state machine. Drives the home screen. The room grid only
 // renders when state is READY.
@@ -168,10 +183,32 @@ class HaAutoPanel : public Component {
 
   // Panel state machine
   PanelState state_{PanelState::BOOTING};
-  lv_obj_t* status_container_{nullptr};  // Holds the BOOTING / SETUP_REQUIRED / etc. screens
+  // Boot splash — full-screen black with red centered "HA AutoPanel v1.0".
+  // Shown immediately at the start of setup() so the user never sees a
+  // bare/white display, then hidden as soon as the status screen or room
+  // grid takes over. Doubles as branding and as a cover for the brief
+  // display-default artifacts the panel can show before LVGL takes over.
+  lv_obj_t* splash_container_{nullptr};
+  lv_obj_t* splash_label_{nullptr};
+  // Holds the BOOTING / SETUP_REQUIRED / etc. screens
+  lv_obj_t* status_container_{nullptr};
   lv_obj_t* status_title_{nullptr};
   lv_obj_t* status_message_{nullptr};
   lv_obj_t* status_retry_btn_{nullptr};
+
+  // Top title bar (HA status + Edit button) on the main grid page.
+  // Always visible, room cards scroll under it.
+  lv_obj_t* title_bar_{nullptr};
+  lv_obj_t* title_status_dot_{nullptr};
+  lv_obj_t* title_status_label_{nullptr};
+  lv_obj_t* title_edit_btn_{nullptr};
+  lv_obj_t* title_back_btn_{nullptr};  // shown only on the entity detail page
+  lv_obj_t* title_room_label_{nullptr};  // room name in the center of the title bar (detail page only)
+  // Edit mode flag: when true, room cards show a hide checkbox; long
+  // press starts a drag. False = normal display.
+  bool edit_mode_{false};
+  // Number of rooms currently visible (for the status line)
+  int visible_room_count_{0};
 
   // Authorization probe state
   bool auth_probe_pending_{false};
@@ -183,11 +220,20 @@ class HaAutoPanel : public Component {
   bool config_loaded_{false};
   std::string config_path_{"/storage/autopanel.cfg"};
 
+  // User customizations (LittleFS at /storage/customizations.cfg).
+  // Separate from the API token config because it's larger and more
+  // frequently changed.
+  CustomizationConfig customizations_;
+  std::string customizations_path_{"/storage/customizations.cfg"};
+
   // Web UI handler
   bool web_handler_registered_{false};
   void register_web_handler_();
   void handle_setup_get_(class AsyncWebServerRequest *request);
   void handle_setup_post_(class AsyncWebServerRequest *request);
+  void handle_setup_reset_(class AsyncWebServerRequest *request);
+  void handle_customizations_get_(class AsyncWebServerRequest *request);
+  void handle_customizations_post_(class AsyncWebServerRequest *request);
 
   // LittleFS helpers
   bool mount_storage_();
@@ -195,6 +241,16 @@ class HaAutoPanel : public Component {
   bool write_config_file_(const std::string &body);
   void apply_config_file_(const std::string &body);
   void apply_runtime_config_();
+  bool read_customizations_file_();
+  bool write_customizations_file_();
+  void apply_customizations_file_(const std::string &body);
+  // Returns true if the named room/entity is hidden in the user config
+  bool is_room_hidden_(const std::string &room_name) const;
+  bool is_entity_hidden_(const std::string &entity_id) const;
+  // Returns the custom display order for a room/area, or an empty
+  // vector if none is set (callers should fall back to alphabetical
+  // or HA's order).
+  const std::vector<std::string> *get_entity_order_(const std::string &area_id) const;
 
   static const uint32_t ROOM_COLORS_[];
   static const int MAX_ROOM_COLORS_ = 8;
@@ -249,6 +305,18 @@ class HaAutoPanel : public Component {
   // SETUP_REQUIRED screen. Picks the right info based on whether WiFi is
   // connected (use use_address) or in AP fallback (use AP SSID/password).
   std::string build_setup_message_();
+
+  // Update the title bar status indicator (called on every state change
+  // and on api.on_client_connected / disconnected).
+  void update_title_bar_();
+  // Create the top title bar (HA status + Edit button + optional back
+  // button) as a child of the given parent (the screen). Called from
+  // both create_ui_from_room_cards_ and show_entity_detail_ so it's
+  // visible on every page.
+  void create_title_bar_(lv_obj_t *parent);
+  // Re-render the room grid (called when edit_mode toggles, when
+  // customizations change, or when a room is hidden/shown).
+  void refresh_room_cards_();
 
   // Boot: mount LittleFS, read config, decide what state to start in.
   void boot_from_storage_();
