@@ -328,13 +328,14 @@ class HaAutoPanel : public Component {
   // (square cards). cards_per_row is computed from screen_width and
   // card_gap. main_container_ height is computed from card count.
   int card_width_{250};
-  // v1.22f: card_height is now separate from card_width so the
-  // card can be tall enough to hold the arc + the ON/OFF button
-  // below it. The arc is centered in the upper portion; the
-  // button sits ~10px below the arc bottom, still inside the
-  // card. 60px extra height gives 36px button + 10px arc-button
-  // gap + 14px top/bottom margin.
-  int card_height_{310};
+  // v1.22g: card is back to square (was 310 in v1.22f). The
+  // arc lives in the upper portion (top gap=12px), the room
+  // name sits inside the arc's lower opening, and the ON/OFF
+  // button is pinned to the bottom of the card. Square 250x250
+  // is what the user said looks "very good" in the reference
+  // screenshot - we just needed to lift the arc a tiny bit
+  // off the top edge.
+  int card_height_{250};
   int card_gap_{12};
   int screen_width_{1024};
   int screen_height_{600};
@@ -740,7 +741,14 @@ class HaAutoPanel : public Component {
   int compute_cards_per_row_() const;
   int get_card_x_(int col) const;
   int get_card_y_(int row) const;
-  int arc_size_() const { return this->card_width_ - 20; }  // square, ~10px margin
+  // v1.22i: was card_width_ - 20 (230 for 250px card), which
+  // made the arc bottom edge reach the card bottom. The user
+  // wanted the ON/OFF button to fit inside the arc's bottom
+  // opening, not be clipped by it. 70px gap (card_width_ - 70
+  // = 180 for 250px card) leaves room for a 32px button + 8px
+  // top gap + 10px bottom gap below the arc, all inside the
+  // card.
+  int arc_size_() const { return this->card_width_ - 70; }  // square, leaves room for button below
   uint32_t get_room_color_(int index) const;
 
   // v1.22e: data-driven button/label sizing. The previous code

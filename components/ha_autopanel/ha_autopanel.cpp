@@ -59,7 +59,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22f"
+#define FIRMWARE_VERSION "v1.22k"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -1964,12 +1964,16 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // opa=0 fallback (e.g. if the knob widget ignores the parent style).
   lv_obj_add_flag(arc, LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_size(arc, arc_size, arc_size);  // square
-  // v1.22e: was LV_ALIGN_CENTER, 0, -10 (shifted up 10px to make
-  // room for the ON/OFF button). The user said the arc looked
-  // "too high" in the card - the 10px shift was visible.
-  // Centered now; the ON/OFF button below sits inside the
-  // card just under the arc (see its LV_ALIGN_*-10 offset).
-  lv_obj_align(arc, LV_ALIGN_CENTER, 0, 0);
+  // v1.22k: arc is in the UPPER portion of the card
+  // (LV_ALIGN_TOP_MID with a 12px top margin). The reference
+  // shows the arc occupying roughly the top 60% of the card,
+  // with the room name at the vertical center BELOW the
+  // arc (so the text doesn't sit on the gray track at the
+  // bottom of the arc). The arc is 170px tall (arc_size_
+  // formula below) so its bottom edge is at y=182, well
+  // above the card center (y=125). The 270° arc's
+  // bottom opening is then entirely in the upper half.
+  lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 12);
   lv_arc_set_min_value(arc, 0);
   lv_arc_set_max_value(arc, 100);
   lv_arc_set_value(arc, initial_pct);  // From computed state, not hardcoded 50
@@ -2056,35 +2060,32 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
     delete data;
   }, LV_EVENT_DELETE, nullptr);
 
-  // ON/OFF button. v1.14: bumped from 110x28 (clamped to
-  // card_width/8 = ~32) to 140x36 to give the label more
-  // breathing room and to match the new state-badge sizing on
-  // the detail page. 140px fits "ON/OFF" at 14pt with a few
-  // px of padding; 36px is a comfortable touch target. The
-  // button is also centered horizontally (was LV_ALIGN_BOTTOM_MID
-  // with x=0; same alignment, but the new size means it's
-  // visually more present).
+  // ON/OFF button. v1.22i: 110x32. Placed INSIDE the arc's
+  // bottom opening.
   //
-  // v1.22e: was LV_ALIGN_BOTTOM_MID, 0, -8 (pinned 8px above
-  // the card's bottom edge). The user wanted the button to
-  // sit "just below the arc, inside the card, slightly down"
-  // - i.e. visually paired with the arc, not glued to the
-  // card's bottom. With the arc now centered in the card
-  // (v1.22e), the arc's bottom edge is at card_center + arc/2.
-  // We place the button 10px below that, so it reads as part
-  // of the same composition instead of floating at the bottom.
-  // 8px is too close to the card edge and looks disconnected.
+  // v1.22j: positioned with LV_ALIGN_BOTTOM_MID + a y
+  // offset of -8px (8px above the card's bottom edge) -
+  // centering relative to the card, NOT raw pixel coords.
+  // The v1.22i version used lv_obj_set_pos() with hand-
+  // computed coordinates; per the user's design principle,
+  // always anchor to a centering command and only use pixel
+  // offsets for fine adjustments against the centering.
   lv_obj_t* btn = lv_obj_create(card);
-  int btn_w = 140;
-  int btn_h = std::max(36, this->card_width_ / 7);
-  lv_obj_set_size(btn, btn_w, btn_h);
-  // Arc is square at arc_size_(); its bottom is at
-  // card_center + arc_size/2. Add 10px gap so the button sits
-  // just below the arc with a small visual breath. We compute
-  // the absolute y from the card height so the alignment
-  // doesn't depend on where the arc is.
-  int btn_y = (this->card_width_ / 2) + (this->arc_size_() / 2) + 10;
-  lv_obj_set_pos(btn, (this->card_width_ - btn_w) / 2, btn_y);
+  int btn_w = 110;
+  int btn_h = 32;
+  lv_obj_set_width(btn, btn_w);
+  lv_obj_set_height(btn, btn_h);
+  // BOTTOM_MID centers horizontally and pins to the
+  // bottom edge. The y=-8 offset lifts the button 8px
+  // above the bottom edge (matches the reference's small
+  // bottom margin). The button's own height (32px) makes
+  // its top at card_height - 32 - 8 = 210 in a 250-tall
+  // card, which is 20px below the arc's bottom edge
+  // (arc_size_=180, so arc bottom = 90 + 180 = 180 in
+  // arc-center y=125). The 30px gap is wider than the
+  // reference (which had the button snug in the opening)
+  // but it keeps the button visually clear of the arc.
+  lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
   // Disable all internal scrolling on the button. By default lv_obj_create()
   // makes a scrollable object, which means dragging on the button can
   // scroll its contents (the label) around. We want the button to be a
@@ -2167,9 +2168,12 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // CREATE LAST so it's on TOP in z-order and receives touches
   lv_obj_t* label_btn = lv_obj_create(card);
   lv_obj_remove_style_all(label_btn);  // Start with clean slate to avoid default button styles
-  // Match the arc's position and width so the label is centered relative
-  // to the arc, not to the card. Pass the arc as the align base so the
-  // label center lands on the arc center.
+  // v1.22k: label_btn is the width of the arc, centered on
+  // the arc (LV_ALIGN_CENTER via align_to with the arc as
+  // the base). The room name label inside is auto-centered
+  // by lv_obj_center() (see below). The arc is 270° so the
+  // label sits in the lower half of the bounding box
+  // (the arc's bottom opening) - matching the reference.
   lv_obj_set_size(label_btn, arc_size, 32);
   lv_obj_align_to(label_btn, arc, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_bg_opa(label_btn, LV_OPA_TRANSP, 0);  // Invisible background
@@ -2250,6 +2254,16 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   }
   lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
   lv_obj_set_width(label, arc_size - 10);
+  // v1.22k: text was visually left-aligned inside the
+  // label_btn (the default for lv_label). The user said
+  // "v-centered but not h-centered" - the widget was
+  // centered in its parent (lv_obj_center) but the text
+  // inside was left-aligned. Set text-align via the style
+  // API (this LVGL build doesn't have lv_label_set_text_align).
+  // (lv_obj_center positions the LABEL; the style positions
+  // the TEXT inside. Both are needed for true center-of-card
+  // alignment.)
+  lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(label);
   // Move label_btn to the top of the z-order so touches on the
   // text (not the arc underneath) register as the room name click
