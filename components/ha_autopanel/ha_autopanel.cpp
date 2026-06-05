@@ -58,7 +58,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.20-dev"
+#define FIRMWARE_VERSION "v1.22a"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -2189,7 +2189,7 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   // name in the center are the only top-bar elements.
   // (The Sort button is hidden on the detail page by
   // show_entity_detail_() / show_room_grid_() below.)
-  }
+
   // Defense in depth: make sure the title bar is the topmost child of the
   // screen, even after this new detail container was added underneath.
   if (this->title_bar_ != nullptr) {
@@ -4054,38 +4054,28 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
   // (32 MB on Crowpanel) has plenty of room. Fall back to internal
   // heap if PSRAM is somehow unavailable (e.g. someone runs this
   // build on a board without PSRAM).
-  const size_t rgb_size = (size_t)width * (size_t)height * 3u;
+  //
+  // v1.22a: bypassed in favor of feeding the encoder the raw
+  // RGB565 data via JPEG_ENCODE_IN_FORMAT_RGB565. The encoder on
+  // P4 appears to apply a non-standard R/B reorder to the
+  // RGB888 path (the dark-teal #111827 background renders as
+  // brown in the JPG even though the BMP/PNG paths render it
+  // correctly), and a manual R/B swap "fixed" the background but
+  // rotated the room-card arc colors. The RGB565 path uses the
+  // encoder's native pixel format (the LVGL draw buffer IS
+  // RGB565) and avoids the byte-order ambiguity entirely. The
+  // draw buffer's data_size should equal width*height*2 (validated
+  // by handle_screenshot_).
+  const size_t rgb_size = (size_t)width * (size_t)height * 2u;
   uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM);
   if (rgb == nullptr) {
     rgb = (uint8_t*)malloc(rgb_size);
   }
   if (rgb == nullptr) {
-    request->send(500, "text/plain", "OOM allocating RGB888 buffer");
+    request->send(500, "text/plain", "OOM allocating RGB565 buffer");
     return;
   }
-
-  // RGB565 -> RGB888. The display buffer is RGB565 in
-  // little-endian byte order on this target (LV_COLOR_DEPTH=16).
-  // We pack three output bytes per pixel: R, G, B. Alpha is not
-  // used by JPEG. The draw buffer's data_size should equal
-  // width*height*2 - we trust that (validated by handle_screenshot_).
-  const uint16_t* src = (const uint16_t*)draw_buf->data;
-  uint8_t* dst = rgb;
-  const size_t npix = (size_t)width * (size_t)height;
-  for (size_t i = 0; i < npix; i++) {
-    uint16_t px = src[i];
-    // Expand 5/6/5 to 8/8/8 by replicating the MSBs into the LSBs.
-    // (px >> 8) is endian-dependent; the BMP path's RGB565 layout
-    // tells us the high byte is R-low5|G-high3 and low byte is
-    // G-low2|B-low5, so R is bits 11-15, G is 5-10, B is 0-4.
-    uint8_t r5 = (px >> 11) & 0x1F;
-    uint8_t g6 = (px >> 5)  & 0x3F;
-    uint8_t b5 =  px        & 0x1F;
-    dst[0] = (uint8_t)((r5 << 3) | (r5 >> 2));  // 5 -> 8 bits
-    dst[1] = (uint8_t)((g6 << 2) | (g6 >> 4));  // 6 -> 8 bits
-    dst[2] = (uint8_t)((b5 << 3) | (b5 >> 2));  // 5 -> 8 bits
-    dst += 3;
-  }
+  memcpy(rgb, draw_buf->data, rgb_size);
 
   // JPEG output buffer. The ESP-IDF JPEG driver requires the output
   // buffer to be allocated via jpeg_alloc_encoder_mem() (not a plain
@@ -4127,13 +4117,21 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
   jpeg_encode_cfg_t cfg = {};
   cfg.width = (uint32_t)width;
   cfg.height = (uint32_t)height;
-  // Driver-level input format enum. There's also a HAL-level
-  // JPEG_ENC_SRC_RGB888 that has the same numeric value
-  // (COLOR_TYPE_ID(COLOR_SPACE_RGB, COLOR_PIXEL_RGB888)) but is
-  // a different typedef - using it here triggers a C++ narrowing
-  // error. The driver enum (jpeg_enc_input_format_t) is what
-  // jpeg_encode_cfg_t::src_type expects.
-  cfg.src_type = JPEG_ENCODE_IN_FORMAT_RGB888;
+  // Driver-level input format enum. The driver enum
+  // (jpeg_enc_input_format_t) is what jpeg_encode_cfg_t::src_type
+  // expects; the HAL-level JPEG_ENC_SRC_RGB888 has the same numeric
+  // value but a different typedef and triggers a C++ narrowing error
+  // when used here.
+  //
+  // v1.22a: feed the encoder the raw RGB565 data via
+  // JPEG_ENCODE_IN_FORMAT_RGB565. The RGB888 path on P4 produces
+  // colors that don't match the source framebuffer (background
+  // #111827 dark-teal renders as brown in the JPG even though
+  // BMP/PNG render it correctly; manual R/B swap fixes the
+  // background but rotates the arc colors). The RGB565 path
+  // sidesteps the byte-order ambiguity by handing the encoder
+  // the same 16-bit pixel format the LVGL draw buffer is in.
+  cfg.src_type = JPEG_ENCODE_IN_FORMAT_RGB565;
   cfg.sub_sample = JPEG_DOWN_SAMPLING_YUV422;  // 4:2:2 - good for UI
   cfg.image_quality = 80;
 

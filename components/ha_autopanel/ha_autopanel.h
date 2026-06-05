@@ -498,7 +498,8 @@ class HaAutoPanel : public Component {
   // recommended way to reorder and hide rooms (replaces the
   // older "Show hidden (N)" button + hidden_panel_ + drag-to-reorder
   // gesture paths, which the user found jumpy and didn't save).
-  lv_obj_t* title_sort_btn_{nullptr};
+  // (title_sort_btn_ is declared earlier in the title-bar widget block
+  //  at line ~407. Keep that one and only that one.)
   // Full-screen sort & hide overlay. Created lazily on the first tap
   // of title_sort_btn_, rebuilt every show so live state is current.
   // Lives as a child of the screen. Same lazy-create / rebuild-on-show
