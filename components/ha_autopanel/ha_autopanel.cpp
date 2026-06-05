@@ -497,6 +497,11 @@ void HaAutoPanel::fetch_entities_() {
     return;
   }
 
+  // v1.12: reset the per-area dedup set so this fetch pass starts
+  // fresh. Each area's bucket is cleared exactly once, on the
+  // first entity we see for it. See seen_areas_during_bulk_fetch_.
+  this->seen_areas_during_bulk_fetch_.clear();
+
   ESP_LOGI(TAG, "Fetching entity states from HA...");
 
   std::string url = this->ha_api_url_ + "/api/states";
@@ -538,10 +543,32 @@ void HaAutoPanel::fetch_entities_() {
     return;
   }
 
-  // Read response body - reserve to content_length to avoid reallocations
+  // Read response body. v1.12: was std::string (internal heap); the
+  // 220KB+ /api/states response OOM'd the S3 (no PSRAM, ~384KB
+  // internal heap). Now we use heap_caps_malloc_prefer to put the
+  // buffer in PSRAM on P4 / Crowpanel and fall back to internal
+  // on S3 if the PSRAM allocation fails. We also bail with a
+  // clear "no PSRAM, response too large" message if the largest
+  // free internal block is smaller than expected - the old code
+  // would have crashed with no log at all.
   size_t expected = container->content_length;
-  std::string response;
-  response.reserve(expected > 0 ? expected : 32768);
+  if (expected == 0) expected = 32768;
+  // PSRAM first, then internal heap. heap_caps_malloc_prefer
+  // returns either; on P4 (32MB PSRAM) the PSRAM path always
+  // succeeds and the body lands off-heap. On S3 (no PSRAM) it
+  // falls back to malloc().
+  char* response = (char*)heap_caps_malloc_prefer(
+      expected + 1,                             // +1 for NUL
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,      // try first
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);  // fallback
+  if (response == nullptr) {
+    ESP_LOGE(TAG, "OOM allocating %u-byte response buffer "
+                  "(PSRAM+INT both full) - skipping bulk fetch",
+                  (unsigned)(expected + 1));
+    container->end();
+    return;
+  }
+  size_t response_len = 0;
   uint8_t buf[512];
   uint32_t last_data_time = millis();
   const uint32_t timeout = 20000;
@@ -552,7 +579,27 @@ void HaAutoPanel::fetch_entities_() {
     yield();
     int read = container->read(buf, sizeof(buf));
     if (read > 0) {
-      response.append(reinterpret_cast<char*>(buf), read);
+      // Grow the buffer if the server sent more than Content-Length
+      // (rare but possible with chunked transfer or a wrong
+      // Content-Length header). Double, then add 1 for NUL.
+      if (response_len + (size_t)read + 1 > expected + 1) {
+        size_t new_size = (expected + read + 1) * 2;
+        char* grown = (char*)heap_caps_malloc_prefer(
+            new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (grown == nullptr) {
+          ESP_LOGE(TAG, "OOM growing response buffer to %u bytes", (unsigned)new_size);
+          heap_caps_free(response);
+          container->end();
+          return;
+        }
+        memcpy(grown, response, response_len);
+        heap_caps_free(response);
+        response = grown;
+        expected = new_size - 1;
+      }
+      memcpy(response + response_len, buf, read);
+      response_len += read;
       last_data_time = millis();
       iter_count = 0;
     } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
@@ -569,8 +616,9 @@ void HaAutoPanel::fetch_entities_() {
     }
   }
   container->end();
+  response[response_len] = '\0';  // NUL-terminate for deserializeJson
 
-  ESP_LOGI(TAG, "States response: %d bytes", (int)response.size());
+  ESP_LOGI(TAG, "States response: %d bytes", (int)response_len);
   ESP_LOGD(TAG, "  Heap free=%u largest=%u, PSRAM free=%u largest=%u",
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
@@ -590,6 +638,7 @@ void HaAutoPanel::fetch_entities_() {
   DeserializationError parse_err = deserializeJson(doc, response);
   if (parse_err) {
     ESP_LOGW(TAG, "Failed to parse states JSON: %s", parse_err.c_str());
+    heap_caps_free(response);
     return;
   }
 
@@ -604,8 +653,17 @@ void HaAutoPanel::fetch_entities_() {
     } else {
       ESP_LOGW(TAG, "States response is neither array nor object");
     }
+    heap_caps_free(response);
     return;
   }
+  // v1.12: the PSRAM response buffer is no longer needed once the
+  // DOM is built. Free it now so the 220KB+ chunk goes back to
+  // the heap before we start allocating the per-area entity
+  // vectors (which can each be 20-100KB on a busy install).
+  // PsramJsonDocument's DOM lives in its own PSRAM-backed pool, so
+  // freeing this buffer doesn't affect the still-needed DOM.
+  heap_caps_free(response);
+  response = nullptr;
 
   // Build a lookup: entity_id -> area_id from discovered_areas_
   // Since we already have entity_ids per area, match against that
@@ -625,6 +683,21 @@ void HaAutoPanel::fetch_entities_() {
     if (it == entity_to_area.end()) continue;  // Not in any discovered area
 
     std::string area_id = it->second;
+
+    // v1.12: the state subscription (subscribe_to_all_entities_)
+    // also pushes entities on every state change. If we ran the
+    // bulk fetch first (now safe in PSRAM), the subscription's
+    // push would create a duplicate. Clear the bucket the first
+    // time we touch a given area so only the friendly_name-bearing
+    // entities remain. (If you skip the bulk fetch by going
+    // through the subscription-only path, the bucket is already
+    // empty since fetch_areas_via_template_ doesn't push to
+    // entities_by_area_ - it uses entities_by_area_ for the
+    // template-driven stub records. So clearing here is safe in
+    // both paths.)
+    if (this->seen_areas_during_bulk_fetch_.insert(area_id).second) {
+      this->entities_by_area_[area_id].clear();
+    }
 
     // Check if excluded
     if (this->is_entity_excluded_(entity_id)) continue;
@@ -896,12 +969,19 @@ void HaAutoPanel::start_discovery_() {
     ESP_LOGW(TAG, "Aborting discovery: auth failed during area fetch");
     return;
   }
-  // fetch_entities_() is disabled - parsing the 220KB+ states response
-  // exceeds the available internal heap on the Crowpanel. Entity state
-  // and brightness are populated lazily via the api.on_state subscription
-  // (subscribe_to_all_entities_), which gives us per-entity deltas
-  // without a single big allocation.
-  ESP_LOGI(TAG, "Skipping bulk /api/states fetch; relying on state subscriptions");
+  // v1.12: re-enable the bulk /api/states fetch. Previously disabled
+  // because the 220KB+ JSON response OOM'd the S3 (no PSRAM, 384KB
+  // internal heap). Now fetch_entities_() uses heap_caps_malloc_prefer
+  // to put the response body in PSRAM, falling back to internal heap
+  // if PSRAM is unavailable. On P4 (32MB PSRAM) the response lives
+  // off-heap. On S3, the heap_caps_malloc_prefer falls back to
+  // malloc() and we'd OOM again; fetch_entities_() bails with a
+  // clear ESP_LOGE in that case. The state subscription still runs
+  // as a fallback (per-entity deltas for state changes), so even
+  // an S3 that hits the bail-out still gets a working panel - just
+  // without friendly_name for entities whose state hasn't changed
+  // since boot.
+  fetch_entities_();
 
   if (discovered_areas_.empty()) {
     ESP_LOGW(TAG, "No areas discovered from HA - check API token and connectivity");

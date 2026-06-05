@@ -504,6 +504,13 @@ class HaAutoPanel : public Component {
   // frequently changed.
   CustomizationConfig customizations_;
   std::string customizations_path_{"/storage/customizations.cfg"};
+  // v1.12: tracks which areas fetch_entities_() has already populated
+  // during a single bulk-fetch pass, so the bucket is cleared
+  // exactly once per area. The state-subscription push in
+  // on_entity_state_changed_() would otherwise append a duplicate
+  // copy of every entity. Reset at the start of each fetch pass
+  // (top of fetch_entities_()).
+  std::set<std::string> seen_areas_during_bulk_fetch_;
 
   // Web UI handler
   bool web_handler_registered_{false};
