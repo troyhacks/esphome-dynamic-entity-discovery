@@ -566,6 +566,20 @@ class HaAutoPanel : public Component {
   void handle_test_scroll_(class AsyncWebServerRequest *request);
   void handle_test_cmd_(class AsyncWebServerRequest *request);
   void handle_test_state_(class AsyncWebServerRequest *request);
+  // v1.17: toggle a title-bar banner that says "AUTO-TEST" so the
+  // human (or any other user) can see at a glance that an automated
+  // test harness is driving the panel. The test harness calls
+  // /autopanel/test/banner?on=1 at the start of a run and
+  // ?on=0 at the end. While the banner is on, the test harness
+  // is in control - tapping the screen will fire the test's
+  // commands (or be lost in a layout pass), and the user should
+  // not interact with the panel.
+  void handle_test_banner_(class AsyncWebServerRequest *request);
+  // True while the test harness has set the AUTO-TEST banner. The
+  // title bar shows the banner label; off, the label is hidden.
+  bool test_banner_active_{false};
+  // The actual label widget. Created in create_title_bar_().
+  lv_obj_t* title_test_banner_{nullptr};
 
   // LittleFS helpers
   bool mount_storage_();

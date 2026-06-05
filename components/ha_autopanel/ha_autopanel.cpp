@@ -1489,6 +1489,40 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // "406 Brock Ave" centered + "Sort" right + status indicators
   // left.
 
+  // v1.17: AUTO-TEST banner. A small bright-orange pill in the
+  // bottom-right corner of the title bar that appears when the
+  // test harness flips test_banner_active_ on via
+  // /autopanel/test/banner?on=1. Hides itself on ?on=0 and
+  // whenever the panel reboots (test_banner_active_ starts
+  // false). This is the "do not touch the panel" indicator for
+  // the user - it shows that the bft.py / run_tests.py harness
+  // is driving the panel and any touch will be intercepted by
+  // the test commands. Position: bottom-right of the title bar,
+  // just past the Sort button. The label is small (3-4 chars
+  // "TEST") so the bar still looks balanced.
+  this->title_test_banner_ = lv_label_create(this->title_bar_);
+  lv_label_set_text(this->title_test_banner_, "TEST");
+  lv_obj_set_style_text_color(this->title_test_banner_, lv_color_hex(0x111827), 0);
+  lv_obj_set_style_bg_color(this->title_test_banner_, lv_color_hex(0xfacc15), 0);
+  lv_obj_set_style_bg_opa(this->title_test_banner_, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(this->title_test_banner_, 4, 0);
+  lv_obj_set_style_pad_left(this->title_test_banner_, 6, 0);
+  lv_obj_set_style_pad_right(this->title_test_banner_, 6, 0);
+  lv_obj_set_style_pad_top(this->title_test_banner_, 2, 0);
+  lv_obj_set_style_pad_bottom(this->title_test_banner_, 2, 0);
+  // Bottom-right corner. The title_right_cluster_ ends at the
+  // screen's right edge (x=1024). 4px margin from the right.
+  // The label is 36px wide ("TEST" + padding) so it sits at
+  // x=1024-4-36 = 984.
+  lv_obj_align(this->title_test_banner_, LV_ALIGN_TOP_RIGHT, -4, 38);
+  lv_obj_add_flag(this->title_test_banner_, LV_OBJ_FLAG_HIDDEN);
+  // The title bar is only 36px tall. Aligning to TOP_RIGHT with
+  // y=38 puts the banner just below the title bar (overlapping
+  // the room grid / detail page by 2px). That's intentional - the
+  // banner is a corner badge, not part of the title bar.
+  // (If the user wants it INSIDE the title bar instead, change
+  // y=38 to y=2; the label will fit in the 36px bar.)
+
   // Back button (top-left) - on the room grid it's a no-op; on the
   // entity detail page it pops back to the grid.
   this->title_back_btn_ = lv_obj_create(this->title_bar_);
@@ -1868,6 +1902,16 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   // the title bar and therefore sat on top of it in z-order.
   lv_obj_set_pos(this->detail_container_, 0, 36);
   lv_obj_set_size(this->detail_container_, this->screen_width_, this->screen_height_ - 36);
+
+  // v1.16: hide the Sort button on the detail page. The Sort panel
+  // is for reordering and show/hiding ROOMS - both actions don't
+  // make sense when you're already inside a single room. Showing
+  // the button and letting the user open a panel that does
+  // nothing useful is a confusing UX. (We still show the back
+  // button + the room name in the center; Sort is grid-only.)
+  if (this->title_sort_btn_ != nullptr) {
+    lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
 
   // Show the back button (hidden on the grid page) and re-create the
   // title bar with the back button visible.
@@ -3881,7 +3925,8 @@ void HaAutoPanel::register_web_handler_() {
           || url == "/autopanel/test/click"
           || url == "/autopanel/test/scroll"
           || url == "/autopanel/test/cmd"
-          || url == "/autopanel/test/state";
+          || url == "/autopanel/test/state"
+          || url == "/autopanel/test/banner";
     }
     void handleRequest(AsyncWebServerRequest *request) override {
       char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
@@ -3965,6 +4010,12 @@ void HaAutoPanel::register_web_handler_() {
           parent_->handle_test_state_(request);
         } else {
           request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/banner") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else {
+          parent_->handle_test_banner_(request);
         }
       } else {
         request->send(404, "text/plain", "Not found");
@@ -4099,6 +4150,12 @@ void HaAutoPanel::handle_test_state_(AsyncWebServerRequest *request) {
   body += std::string("panel_state=") + panel_state_name_(this->state_) + "\n";
   body += std::string("room_count=") + std::to_string(this->room_cards_.size()) + "\n";
   body += std::string("current_room_index=") + std::to_string(this->current_room_index_) + "\n";
+  // v1.17: echo the banner state. The test harness uses this as a
+  // sanity check after toggling the banner - "I just set on=1
+  // and the state endpoint reports banner=1, so the round trip
+  // works." If the panel reboots (or the user pokes the on-param)
+  // the value resets to 0.
+  body += std::string("test_banner=") + (this->test_banner_active_ ? "1" : "0") + "\n";
   // v1.11: edit_mode= and in_edit_session= were removed (no Edit
   // button anymore). The Sort panel is the only entry point for
   // room customization, so the test harness has no need to query
@@ -4125,6 +4182,34 @@ void HaAutoPanel::handle_test_state_(AsyncWebServerRequest *request) {
   // std::string temporary lives long enough for the underlying
   // httpd_resp_send to copy it out.
   request->send(200, "text/plain", body.c_str());
+}
+
+void HaAutoPanel::handle_test_banner_(AsyncWebServerRequest *request) {
+  // GET or POST /autopanel/test/banner?on=1 -> show AUTO-TEST pill
+  // GET or POST /autopanel/test/banner?on=0 -> hide it
+  // The banner is independent of /autopanel/test/state so the
+  // harness can keep the panel in a known state machine (e.g.
+  // SETUP_REQUIRED) for visual inspection without losing the
+  // "do not touch" indicator.
+  bool desired = this->test_banner_active_;
+  if (request->hasParam("on")) {
+    std::string v = request->getParam("on")->value();
+    if (!v.empty()) {
+      desired = (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y');
+    }
+  }
+  this->test_banner_active_ = desired;
+  if (this->title_test_banner_ != nullptr) {
+    if (desired) {
+      lv_obj_remove_flag(this->title_test_banner_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(this->title_test_banner_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  ESP_LOGI(TAG, "[test] banner %s", desired ? "ON" : "OFF");
+  char body[32];
+  snprintf(body, sizeof(body), "banner %s\n", desired ? "on" : "off");
+  request->send(200, "text/plain", body);
 }
 
 void HaAutoPanel::handle_setup_get_(AsyncWebServerRequest *request) {
