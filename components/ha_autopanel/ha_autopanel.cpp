@@ -50,6 +50,17 @@ static PsramAllocator s_psram_allocator;
 
 static const char* TAG = "ha_autopanel";
 
+// v1.20: firmware version baked into the binary. The string is
+// also reported by /autopanel/test/state so the test harness
+// can sanity-check that the device is running the build the test
+// was written against. Update this constant in lockstep with
+// the v1.X commit; the __DATE__ / __TIME__ macros give each
+// build a unique fingerprint even between two builds of the
+// same source.
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "v1.20-dev"
+#endif
+
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
     0xFFFF00,  // Yellow - Living Room
     0x00FFFF,  // Cyan - Kitchen
@@ -78,6 +89,20 @@ struct RoomControlData {
 void HaAutoPanel::setup() {
   ESP_LOGI(TAG, "Dynamic Entity Discovery starting...");
   s_instance = this;
+
+  // v1.20: build the firmware_version_ string from the baked-in
+  // constants. The format is "v1.20-dev 2026-06-05 12:34:56" -
+  // version + date + time. We log it on every boot so the device
+  // log shows which build is running, and also surface it via
+  // /autopanel/test/state and a small title-bar label so the
+  // test harness and the user can both see it.
+  {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "%s built %s %s",
+             FIRMWARE_VERSION, __DATE__, __TIME__);
+    this->firmware_version_ = buf;
+    ESP_LOGI(TAG, "[version] %s", this->firmware_version_.c_str());
+  }
 
   // Crash / boot tracking. The boot counter is persisted in NVS so
   // we can spot devices that are silently rebooting in the field.
@@ -626,8 +651,8 @@ void HaAutoPanel::fetch_entities_() {
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
   // Diagnostic: log first 200 chars to see actual format
   {
-    std::string head = response.substr(0, std::min<size_t>(200, response.size()));
-    ESP_LOGD(TAG, "  head: %s", head.c_str());
+    size_t head_len = std::min<size_t>(200, response_len);
+    ESP_LOGD(TAG, "  head: %.*s", (int)head_len, response);
   }
 
   // ArduinoJson 7.x: parse the states response. Use the PSRAM-backed
@@ -1458,7 +1483,7 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_remove_flag(this->title_sort_btn_, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t* sort_label = lv_label_create(this->title_sort_btn_);
-  lv_label_set_text(sort_label, "Sort");
+  lv_label_set_text(sort_label, "Edit");
   lv_label_set_long_mode(sort_label, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(sort_label, lv_color_hex(0x9ca3af), 0);
   lv_obj_set_style_text_align(sort_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -1522,6 +1547,125 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // banner is a corner badge, not part of the title bar.
   // (If the user wants it INSIDE the title bar instead, change
   // y=38 to y=2; the label will fit in the 36px bar.)
+
+  // v1.19: Save and Cancel buttons in the title bar. They live
+  // in the right cluster with the Edit button. Both are HIDDEN
+  // by default and show_sort_panel_() un-hides them while
+  // hide_sort_panel_() re-hides them. Putting them in the title
+  // bar (rather than at the bottom of the sort panel) means
+  // the user always knows where the apply/discard actions are,
+  // even if the room list is long enough that the panel
+  // bottom is scrolled off-screen.
+  //
+  // Position: the right cluster is a flex row. Save is just
+  // left of the Edit button, Cancel is to the left of Save.
+  // When all three are visible: [Cancel] [Save] [Edit].
+  // The cluster's flex layout auto-positions them; we just
+  // create the widgets and the row handles the spacing.
+  //
+  // Save is YELLOW (primary action) with dark text - matches
+  // the existing accent color. Cancel is RED (destructive
+  // discard) with white text. Edit is the cool gray of the
+  // existing chrome.
+  this->title_save_btn_ = lv_obj_create(this->title_right_cluster_);
+  lv_obj_set_size(this->title_save_btn_, 60, 28);
+  lv_obj_set_style_bg_color(this->title_save_btn_, lv_color_hex(0xfacc15), 0);
+  lv_obj_set_style_radius(this->title_save_btn_, 6, 0);
+  lv_obj_set_style_border_width(this->title_save_btn_, 0, 0);
+  lv_obj_add_flag(this->title_save_btn_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_remove_flag(this->title_save_btn_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* save_label = lv_label_create(this->title_save_btn_);
+  lv_label_set_text(save_label, "Save");
+  lv_label_set_long_mode(save_label, LV_LABEL_LONG_CLIP);
+  lv_obj_set_style_text_color(save_label, lv_color_hex(0x111827), 0);
+  lv_obj_set_style_text_align(save_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(save_label, LV_ALIGN_CENTER, 0, -1);
+  lv_obj_add_event_cb(this->title_save_btn_, [](lv_event_t* event) {
+    if (s_instance == nullptr) return;
+    ESP_LOGI(TAG, "[edit] Save tapped - applying changes");
+    s_instance->apply_sort_panel_();
+    s_instance->hide_sort_panel_();
+  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_flag(this->title_save_btn_, LV_OBJ_FLAG_HIDDEN);
+
+  this->title_cancel_btn_ = lv_obj_create(this->title_right_cluster_);
+  lv_obj_set_size(this->title_cancel_btn_, 70, 28);
+  lv_obj_set_style_bg_color(this->title_cancel_btn_, lv_color_hex(0xef4444), 0);
+  lv_obj_set_style_radius(this->title_cancel_btn_, 6, 0);
+  lv_obj_set_style_border_width(this->title_cancel_btn_, 0, 0);
+  lv_obj_add_flag(this->title_cancel_btn_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_remove_flag(this->title_cancel_btn_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* cancel_label = lv_label_create(this->title_cancel_btn_);
+  lv_label_set_text(cancel_label, "Cancel");
+  lv_label_set_long_mode(cancel_label, LV_LABEL_LONG_CLIP);
+  lv_obj_set_style_text_color(cancel_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_align(cancel_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(cancel_label, LV_ALIGN_CENTER, 0, -1);
+  lv_obj_add_event_cb(this->title_cancel_btn_, [](lv_event_t* event) {
+    if (s_instance == nullptr) return;
+    ESP_LOGI(TAG, "[edit] Cancel tapped - discarding changes");
+    s_instance->hide_sort_panel_();
+  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_flag(this->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
+
+  // v1.21: Reboot button. Only created when agent_debug_ is true
+  // (so production builds don't expose a soft-reboot path to the
+  // user). The Crowpanel is now battery-powered and the case
+  // makes the physical reset button hard to reach, so the
+  // user needs a panel-side way to soft-reboot during testing
+  // and recovery. The button is RED, sits in the right cluster
+  // to the LEFT of Cancel (Cancel and Save and Edit and Reboot
+  // are all in the right cluster when visible). The tap handler
+  // is a direct App.reboot() - we don't bother with a
+  // confirm-tap pattern because agent_debug builds are not
+  // user-facing (only the test harness / developer should be
+  // hitting Reboot).
+  if (this->agent_debug_) {
+    this->title_reboot_btn_ = lv_obj_create(this->title_right_cluster_);
+    lv_obj_set_size(this->title_reboot_btn_, 70, 28);
+    lv_obj_set_style_bg_color(this->title_reboot_btn_, lv_color_hex(0xdc2626), 0);  // red
+    lv_obj_set_style_radius(this->title_reboot_btn_, 6, 0);
+    lv_obj_set_style_border_width(this->title_reboot_btn_, 0, 0);
+    lv_obj_add_flag(this->title_reboot_btn_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(this->title_reboot_btn_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* reboot_label = lv_label_create(this->title_reboot_btn_);
+    lv_label_set_text(reboot_label, "Reboot");
+    lv_label_set_long_mode(reboot_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_color(reboot_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_align(reboot_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(reboot_label, LV_ALIGN_CENTER, 0, -1);
+    lv_obj_add_event_cb(this->title_reboot_btn_, [](lv_event_t* event) {
+      if (s_instance == nullptr) return;
+      ESP_LOGW(TAG, "[reboot] agent_debug tapped Reboot - calling App.reboot()");
+      // App.reboot() is the ESPHome helper that performs a clean
+      // software reset. The device restarts within ~2s; the
+      // bft.py log session detects the disconnect + reconnect.
+      App.reboot();
+    }, LV_EVENT_CLICKED, nullptr);
+    ESP_LOGI(TAG, "[agent_debug] Reboot button enabled in title bar");
+  } else {
+    this->title_reboot_btn_ = nullptr;
+  }
+
+  // v1.20: version label at the bottom-left of the title bar
+  // area. Hidden by default; flip agent_debug's /autopanel/test/state
+  // and the harness can ask the user to "show me the version" by
+  // tapping a hidden hot spot, OR we can just enable it for the
+  // build with the right config. For now it's hidden - the harness
+  // gets the version via the test/state endpoint and a log line
+  // is printed on every boot, so the test result captures the
+  // build identity.
+  this->title_version_label_ = lv_label_create(this->title_bar_);
+  lv_label_set_text(this->title_version_label_, this->firmware_version_.c_str());
+  lv_obj_set_style_text_color(this->title_version_label_, lv_color_hex(0x6b7280), 0);
+  lv_obj_set_style_text_font(this->title_version_label_, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_align(this->title_version_label_, LV_TEXT_ALIGN_LEFT, 0);
+  // Bottom-left, just inside the title bar. y=2 keeps it inside
+  // the 36px-tall bar with a couple of pixels of margin.
+  lv_obj_set_pos(this->title_version_label_, 4, 20);
+  lv_obj_set_width(this->title_version_label_, 250);
+  lv_label_set_long_mode(this->title_version_label_, LV_LABEL_LONG_CLIP);
+  lv_obj_add_flag(this->title_version_label_, LV_OBJ_FLAG_HIDDEN);
 
   // Back button (top-left) - on the room grid it's a no-op; on the
   // entity detail page it pops back to the grid.
@@ -4159,6 +4303,11 @@ void HaAutoPanel::handle_test_state_(AsyncWebServerRequest *request) {
   body += std::string("panel_state=") + panel_state_name_(this->state_) + "\n";
   body += std::string("room_count=") + std::to_string(this->room_cards_.size()) + "\n";
   body += std::string("current_room_index=") + std::to_string(this->current_room_index_) + "\n";
+  // v1.20: build identity. The test harness can refuse to run
+  // if version is older than expected, and the user can
+  // grep the device log for "[version]" to confirm which
+  // commit is on the panel.
+  body += std::string("version=") + this->firmware_version_ + "\n";
   // v1.17: echo the banner state. The test harness uses this as a
   // sanity check after toggling the banner - "I just set on=1
   // and the state endpoint reports banner=1, so the round trip
@@ -4565,6 +4714,24 @@ void HaAutoPanel::show_sort_panel_() {
   }
   this->build_sort_panel_content_();
   lv_obj_remove_flag(this->sort_panel_, LV_OBJ_FLAG_HIDDEN);
+  // v1.19: un-hide the title-bar Save + Cancel buttons so the
+  // user has consistent apply/discard controls regardless of
+  // where they are in the room list. The Edit button stays
+  // visible too (so the user can also re-tap it to close the
+  // panel as a third path out).
+  if (this->title_save_btn_ != nullptr) {
+    lv_obj_remove_flag(this->title_save_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_cancel_btn_ != nullptr) {
+    lv_obj_remove_flag(this->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  // v1.20: also show the version label while the user is in
+  // a "what am I running?" frame of mind. The label lives
+  // bottom-left of the title bar; small text (14pt gray), so
+  // it's not visually noisy but the user can read it on demand.
+  if (this->title_version_label_ != nullptr) {
+    lv_obj_remove_flag(this->title_version_label_, LV_OBJ_FLAG_HIDDEN);
+  }
   ESP_LOGI(TAG, "[sort] panel shown (%d rooms, %d hidden)",
            (int)this->sort_local_order_.size(),
            (int)this->sort_local_hidden_.size());
@@ -4573,6 +4740,17 @@ void HaAutoPanel::show_sort_panel_() {
 void HaAutoPanel::hide_sort_panel_() {
   if (this->sort_panel_ == nullptr) return;
   lv_obj_add_flag(this->sort_panel_, LV_OBJ_FLAG_HIDDEN);
+  // v1.19: re-hide the Save + Cancel buttons (they only make
+  // sense when the panel is open).
+  if (this->title_save_btn_ != nullptr) {
+    lv_obj_add_flag(this->title_save_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_cancel_btn_ != nullptr) {
+    lv_obj_add_flag(this->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_version_label_ != nullptr) {
+    lv_obj_add_flag(this->title_version_label_, LV_OBJ_FLAG_HIDDEN);
+  }
   // Clear local state so a re-show re-seeds from customizations_.
   this->sort_local_order_.clear();
   this->sort_local_hidden_.clear();

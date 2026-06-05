@@ -396,13 +396,46 @@ class HaAutoPanel : public Component {
   lv_obj_t* title_right_cluster_{nullptr};
   lv_obj_t* title_status_dot_{nullptr};
   lv_obj_t* title_status_label_{nullptr};
-  // title_edit_btn_ and title_cancel_btn_ were removed in v1.11
-  // (Edit-mode redundancy cleanup). The Sort panel now handles
-  // both show/hide and reorder; there is no separate inline
-  // Edit mode with X badges on each room card. See the
-  // v1.11 commit message for the full rationale.
+  // title_sort_btn_ (relabeled "Edit" in v1.19) is the only
+  // always-visible right-cluster button. It opens the
+  // sort_panel_ which handles both reorder and show/hide.
+  // title_save_btn_ + title_cancel_btn_ were added in v1.19
+  // and are HIDDEN by default. They show only when the
+  // sort_panel_ is open, so the user can apply or discard
+  // their changes via the title bar (previously these floated
+  // at the bottom of the panel).
+  lv_obj_t* title_sort_btn_{nullptr};  // label "Edit", always visible on the grid
+  lv_obj_t* title_save_btn_{nullptr};  // hidden; shown on Edit page
+  lv_obj_t* title_cancel_btn_{nullptr};  // hidden; shown on Edit page
   lv_obj_t* title_back_btn_{nullptr};  // shown only on the entity detail page
   lv_obj_t* title_room_label_{nullptr};  // room name in the center of the title bar (detail page only)
+  // v1.20: version label at the bottom-left of the title bar.
+  // Shows the build version (git short hash + build time) so
+  // we can verify which build is loaded. Default hidden; the
+  // test harness's /autopanel/test/state endpoint reports
+  // the same value as 'version=' so the harness can confirm
+  // the firmware matches the expected build without flashing.
+  lv_obj_t* title_version_label_{nullptr};
+  // v1.21: Reboot button in the title bar. Only created when
+  // agent_debug_ is true (so production builds don't have a
+  // way for a user to trigger a soft reset). The Crowpanel
+  // is now battery-powered and the case makes the physical
+  // reset button hard to reach, so a soft-reboot path on the
+  // panel itself is needed for in-field recovery. The button
+  // is RED (destructive) and is hidden by default; show it
+  // alongside the AUTO-TEST banner when the harness enables
+  // agent_debug, OR keep it visible in the title bar all the
+  // time when agent_debug is on (so the user can reboot without
+  // first turning on the test harness). We default to the
+  // second behavior - always visible in agent_debug builds.
+  lv_obj_t* title_reboot_btn_{nullptr};
+  // The version string baked into the build. Set in the .cpp
+  // from #define FIRMWARE_VERSION + the __DATE__ / __TIME__
+  // macros so every build has a unique fingerprint. The test
+  // harness reads this via /autopanel/test/state so a test
+  // suite can refuse to run if the device's firmware is older
+  // than what the test was written against.
+  std::string firmware_version_{};
   // HA zone.home friendly_name, fetched at runtime and shown in the
   // center of the title bar on the main grid page. Hidden on the
   // detail page (where title_room_label_ takes that spot) and during
