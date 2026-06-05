@@ -1389,143 +1389,15 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // it from the normal grid view too. The user pointed this out
   // during v1.5 review.
 
-  // Edit button (top-right). Right cluster child. Always visible.
-  // Toggles edit_mode_; label flips between "Edit" and "Done".
-  this->title_edit_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_edit_btn_, 80, 28);
-  lv_obj_set_style_bg_color(this->title_edit_btn_, lv_color_hex(0x374151), 0);
-  lv_obj_set_style_radius(this->title_edit_btn_, 6, 0);
-  lv_obj_set_style_border_width(this->title_edit_btn_, 0, 0);
-  lv_obj_add_flag(this->title_edit_btn_, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_remove_flag(this->title_edit_btn_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_t* edit_label = lv_label_create(this->title_edit_btn_);
-  lv_label_set_text(edit_label, "Edit");
-  // Force long-mode to clip (rather than wrap or scroll) so the
-  // label keeps a predictable single-line size for centering.
-  lv_label_set_long_mode(edit_label, LV_LABEL_LONG_CLIP);
-  // Dimmer color (was 0xfacc15 bright yellow accent) - the user
-  // wanted the title bar less distracting. Now matches the cool
-  // gray of the status text (0x9ca3af) so the Edit button reads
-  // as secondary chrome rather than primary call-to-action. The
-  // button background (#374151) still provides enough visual
-  // prominence that the user can find and tap it.
-  lv_obj_set_style_text_color(edit_label, lv_color_hex(0x9ca3af), 0);
-  lv_obj_set_style_text_align(edit_label, LV_TEXT_ALIGN_CENTER, 0);
-  // Nudge up by 1px — the default font's bounding box puts the visible
-  // glyphs slightly below the label's geometric center, so a -1 Y
-  // offset compensates and the text reads as visually centered.
-  lv_obj_align(edit_label, LV_ALIGN_CENTER, 0, -1);
-  lv_obj_add_event_cb(this->title_edit_btn_, [](lv_event_t* event) {
-    if (s_instance == nullptr) return;
-    s_instance->edit_mode_ = !s_instance->edit_mode_;
-    ESP_LOGI(TAG, "Edit mode %s", s_instance->edit_mode_ ? "ON" : "OFF");
-    // Swap the button label between "Edit" and "Done" - matches the pattern
-    // already used in show_entity_detail_() (which sets "Done" on the
-    // detail page and "Edit" again when returning to the grid).
-    if (s_instance->title_edit_btn_ != nullptr) {
-      lv_obj_t* edit_label = lv_obj_get_child(s_instance->title_edit_btn_, 0);
-      if (edit_label != nullptr) {
-        lv_label_set_text(edit_label, s_instance->edit_mode_ ? "Done" : "Edit");
-      }
-    }
-    // Exiting edit mode: close the debug panel if it's open, so the
-    // user doesn't end up on a debug surface that no longer has
-    // anything to do with their current state. Entering edit mode
-    // also closes it (we want a fresh show, not a stale view).
-    s_instance->hide_debug_panel_();
-    s_instance->update_debug_btn_visibility_();
-    // Starting a new edit session: snapshot the current customizations
-    // so Cancel can restore them. The default copy assignment does a
-    // deep copy of the std::set / std::vector / std::map members.
-    if (s_instance->edit_mode_) {
-      s_instance->edit_baseline_ = s_instance->customizations_;
-      s_instance->in_edit_session_ = true;
-      if (s_instance->title_cancel_btn_ != nullptr) {
-        lv_obj_remove_flag(s_instance->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
-      }
-      // Show the "Sort" button - opens the popup sort+hide panel.
-      if (s_instance->title_sort_btn_ != nullptr) {
-        lv_obj_remove_flag(s_instance->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
-      }
-      ESP_LOGI(TAG, "Edit session started: baseline snapshot saved "
-                    "(hidden_rooms=%d, room_order=%d)",
-               (int)s_instance->edit_baseline_.hidden_rooms.size(),
-               (int)s_instance->edit_baseline_.room_order.size());
-    } else {
-      // Exiting via Done: persist any pending customizations to be safe
-      // (the badge callback already persists on hide, but a user could
-      // tap Done without hiding anything - we still want a clean write),
-      // then close the session and hide Cancel.
-      s_instance->write_customizations_file_();
-      s_instance->in_edit_session_ = false;
-      if (s_instance->title_cancel_btn_ != nullptr) {
-        lv_obj_add_flag(s_instance->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
-      }
-      // Hide the Sort button and close the sort panel if it's open
-      // - edit mode is over, no place to sort from.
-      if (s_instance->title_sort_btn_ != nullptr) {
-        lv_obj_add_flag(s_instance->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
-      }
-      s_instance->hide_sort_panel_();
-    }
-    // Re-render so the UI reflects the new state. We re-use the same
-    // refresh path used for hide/reorder. create_room_card_() checks
-    // this->edit_mode_ itself, so the new cards will (or won't) get the
-    // X badges automatically.
-    s_instance->refresh_room_cards_();
-  }, LV_EVENT_CLICKED, nullptr);
-
-  // Cancel button. Right cluster child. Visible only in edit mode.
-  // Tapping it restores customizations_ to the baseline snapshot
-  // taken at session start AND re-persists /storage/customizations.cfg.
-  // Now lives in title_right_cluster_ (the flex row), so the flex
-  // layout puts it right between Sort and Done automatically.
-  this->title_cancel_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_cancel_btn_, 80, 28);
-  lv_obj_set_style_bg_color(this->title_cancel_btn_, lv_color_hex(0xef4444), 0);
-  lv_obj_set_style_radius(this->title_cancel_btn_, 6, 0);
-  lv_obj_set_style_border_width(this->title_cancel_btn_, 0, 0);
-  lv_obj_add_flag(this->title_cancel_btn_, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_remove_flag(this->title_cancel_btn_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_t* cancel_label = lv_label_create(this->title_cancel_btn_);
-  lv_label_set_text(cancel_label, "Cancel");
-  lv_label_set_long_mode(cancel_label, LV_LABEL_LONG_CLIP);
-  lv_obj_set_style_text_color(cancel_label, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_text_align(cancel_label, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(cancel_label, LV_ALIGN_CENTER, 0, -1);
-  lv_obj_add_flag(this->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_event_cb(this->title_cancel_btn_, [](lv_event_t* event) {
-    if (s_instance == nullptr) return;
-    ESP_LOGI(TAG, "Cancel tapped: reverting edit session");
-    // 1. Close the session.
-    s_instance->in_edit_session_ = false;
-    // 2. Deep-copy the baseline back into customizations_. This restores
-    //    hidden_rooms, hidden_entities, room_order, and entity_order to
-    //    the values they had at session entry.
-    s_instance->customizations_ = s_instance->edit_baseline_;
-    // 3. Re-persist the reverted state to /storage/customizations.cfg
-    //    so a reboot / remount sees the same state as the in-memory copy.
-    s_instance->write_customizations_file_();
-    // 4. Drop out of edit mode so the cards lose their X badges and
-    //    yellow borders.
-    s_instance->edit_mode_ = false;
-    // 5. Hide the Cancel button.
-    if (s_instance->title_cancel_btn_ != nullptr) {
-      lv_obj_add_flag(s_instance->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
-    }
-    // 6. Reset the Edit button label back to "Edit" (it would have
-    //    read "Done" because edit_mode_ was true when Cancel was tapped).
-    if (s_instance->title_edit_btn_ != nullptr) {
-      lv_obj_t* edit_label = lv_obj_get_child(s_instance->title_edit_btn_, 0);
-      if (edit_label != nullptr) {
-        lv_label_set_text(edit_label, "Edit");
-      }
-    }
-    // 7. Re-render the grid. Because customizations_ is now back to the
-    //    baseline, refresh_room_cards_() will restore the original set
-    //    of visible rooms and the original order.
-    s_instance->refresh_room_cards_();
-  }, LV_EVENT_CLICKED, nullptr);
+  // v1.11: Edit + Cancel buttons were removed. The Sort button
+  // (created above) is the single entry point for room customization
+  // (both reorder and show/hide). The X badges that used to appear
+  // on each room card in edit mode are also gone - the Sort
+  // panel's per-row hide toggle is the only hide path now. The
+  // title bar's right cluster is now: [... Sort] only (no Edit
+  // between Sort and Done), so the layout reads as
+  // "406 Brock Ave" centered + "Sort" right + status indicators
+  // left.
 
   // Back button (top-left) - on the room grid it's a no-op; on the
   // entity detail page it pops back to the grid.
@@ -1578,15 +1450,12 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // map is cleared in refresh_room_cards_() to match.
   lv_obj_set_style_bg_color(card, lv_color_hex(0x1a1a2e), 0);
   lv_obj_set_style_radius(card, 12, 0);
-  // Subtle yellow border in edit mode to signal the card is editable.
-  // Restored to no-border when edit_mode_ is false. The border sits under
-  // the badge/label_btn so the user sees a clean glow around the whole card.
-  if (this->edit_mode_) {
-    lv_obj_set_style_border_width(card, 2, 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(0xfacc15), 0);
-  } else {
-    lv_obj_set_style_border_width(card, 0, 0);
-  }
+  // v1.11: edit-mode yellow border was removed along with the Edit
+  // button. The card is now always borderless. If we ever bring
+  // back an "X marks the spot" affordance, the border is a good
+  // place to put it - but right now the Sort panel is the only
+  // way to hide, and the panel itself is the visual signal.
+  lv_obj_set_style_border_width(card, 0, 0);
   lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
   lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
   // Belt and suspenders: disable every scroll-related flag so the card
@@ -1909,12 +1778,12 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   if (this->title_back_btn_ != nullptr) {
     lv_obj_remove_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
   }
-  if (this->title_edit_btn_ != nullptr) {
-    // Replace the Edit button with a Done button on the detail page
-    lv_obj_t* edit_label = lv_obj_get_child(this->title_edit_btn_, 0);
-    if (edit_label != nullptr) {
-      lv_label_set_text(edit_label, "Done");
-    }
+  // v1.11: the Edit -> Done label swap on the title bar is gone
+  // because title_edit_btn_ was removed. The detail page no longer
+  // has an Edit/Done button at all - back, sort, and the room
+  // name in the center are the only top-bar elements.
+  // (The Sort button is hidden on the detail page by
+  // show_entity_detail_() / show_room_grid_() below.)
   }
   // Defense in depth: make sure the title bar is the topmost child of the
   // screen, even after this new detail container was added underneath.
@@ -2019,13 +1888,9 @@ void HaAutoPanel::show_room_grid_() {
   if (this->title_back_btn_ != nullptr) {
     lv_obj_add_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
   }
-  if (this->title_edit_btn_ != nullptr) {
-    lv_obj_t* edit_label = lv_obj_get_child(this->title_edit_btn_, 0);
-    if (edit_label != nullptr) {
-      lv_label_set_text(edit_label, "Edit");
-    }
-    lv_obj_remove_flag(this->title_edit_btn_, LV_OBJ_FLAG_HIDDEN);
-  }
+  // v1.11: title_edit_btn_ was removed. No label to flip back to
+  // "Edit" on return from the detail page. The title bar on the
+  // grid page is now: [Back hidden] [Home name centered] [Sort].
   if (this->title_room_label_ != nullptr) {
     lv_obj_add_flag(this->title_room_label_, LV_OBJ_FLAG_HIDDEN);
   }
@@ -4036,8 +3901,11 @@ void HaAutoPanel::handle_test_state_(AsyncWebServerRequest *request) {
   body += std::string("panel_state=") + panel_state_name_(this->state_) + "\n";
   body += std::string("room_count=") + std::to_string(this->room_cards_.size()) + "\n";
   body += std::string("current_room_index=") + std::to_string(this->current_room_index_) + "\n";
-  body += std::string("edit_mode=") + (this->edit_mode_ ? "1" : "0") + "\n";
-  body += std::string("in_edit_session=") + (this->in_edit_session_ ? "1" : "0") + "\n";
+  // v1.11: edit_mode= and in_edit_session= were removed (no Edit
+  // button anymore). The Sort panel is the only entry point for
+  // room customization, so the test harness has no need to query
+  // for edit-mode state. If we ever bring back inline editing,
+  // add the lines back here.
   body += std::string("agent_debug=1\n");
   body += std::string("home_name=") + this->home_name_ + "\n";
   body += std::string("ha_api_url=") + this->ha_api_url_ + "\n";
@@ -5054,7 +4922,9 @@ void HaAutoPanel::refresh_room_cards_() {
   }
   // Update the title bar so the room count / status reflects the new view
   this->update_title_bar_();
-  ESP_LOGI(TAG, "Room cards refreshed (edit_mode=%d)", (int) this->edit_mode_);
+  // v1.11: drop the (edit_mode=...) suffix - edit_mode_ was removed
+  // along with the Edit button.
+  ESP_LOGI(TAG, "Room cards refreshed (%d visible)", (int) room_cards_.size());
 }
 
 bool HaAutoPanel::process_command_(char c) {

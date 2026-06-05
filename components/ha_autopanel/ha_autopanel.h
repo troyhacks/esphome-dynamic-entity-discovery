@@ -396,8 +396,11 @@ class HaAutoPanel : public Component {
   lv_obj_t* title_right_cluster_{nullptr};
   lv_obj_t* title_status_dot_{nullptr};
   lv_obj_t* title_status_label_{nullptr};
-  lv_obj_t* title_edit_btn_{nullptr};
-  lv_obj_t* title_cancel_btn_{nullptr};  // shown only while in an edit session
+  // title_edit_btn_ and title_cancel_btn_ were removed in v1.11
+  // (Edit-mode redundancy cleanup). The Sort panel now handles
+  // both show/hide and reorder; there is no separate inline
+  // Edit mode with X badges on each room card. See the
+  // v1.11 commit message for the full rationale.
   lv_obj_t* title_back_btn_{nullptr};  // shown only on the entity detail page
   lv_obj_t* title_room_label_{nullptr};  // room name in the center of the title bar (detail page only)
   // HA zone.home friendly_name, fetched at runtime and shown in the
@@ -412,10 +415,9 @@ class HaAutoPanel : public Component {
   // the right of the home name, just left of the Edit button.
   // Shows "--:--" until NTP sync succeeds.
   lv_obj_t* title_time_label_{nullptr};
-  // "DBG" button in the title bar. Shown when:
-  //   - in_edit_session_ (the user is in the edit UI), OR
-  //   - the panel is in any non-READY state (the user needs to
-  //     diagnose AUTH_FAILED / NOT_AUTHORIZED / SETUP_REQUIRED)
+  // "DBG" button in the title bar. Shown when the panel is in any
+  // non-READY state (the user needs to diagnose AUTH_FAILED /
+  // NOT_AUTHORIZED / SETUP_REQUIRED / CONNECTING).
   // Tapping it opens debug_panel_, the bottom-anchored overlay that
   // shows WiFi / HA / Customizations / Device / Date+Time status and
   // exposes action buttons (re-probe auth, re-run discovery, reset
@@ -457,19 +459,12 @@ class HaAutoPanel : public Component {
   // open. On Apply, this is what we persist to customizations_.
   // hidden_rooms. Cleared on close.
   std::set<std::string> sort_local_hidden_;
-  // Edit mode flag: when true, room cards show a hide checkbox; long
-  // press starts a drag. False = normal display.
-  bool edit_mode_{false};
-  // True while the user is inside an edit session (Edit -> Cancel/Done).
-  // Set on entry to edit mode, cleared on Cancel or Done. Used so the
-  // Cancel button can only appear during a real session, not on every
-  // tap of Edit.
-  bool in_edit_session_{false};
-  // Snapshot of customizations_ taken at the moment the user entered edit
-  // mode. Tapping Cancel restores customizations_ from this baseline AND
-  // re-persists it to /storage/customizations.cfg, reverting any room
-  // hides, reveals, or reorders made during the session.
-  CustomizationConfig edit_baseline_;
+  // v1.11: edit_mode_, in_edit_session_, and edit_baseline_ were
+  // removed. The Sort panel is now the single customization entry
+  // point, so there is no need for a separate "Edit" toggle on the
+  // title bar. The X badge that used to appear on each room card
+  // in edit mode is gone too - the Sort panel's per-row hide
+  // checkbox is the only hide path now.
   // Number of rooms currently visible (for the status line)
   int visible_room_count_{0};
 
@@ -578,9 +573,8 @@ class HaAutoPanel : public Component {
   // per minute, so most calls early-exit without touching LVGL).
   void update_title_time_();
   // Show / hide the debug button in the title bar. Called whenever
-  // edit_mode_ toggles or panel state changes - both can flip the
-  // visibility. No-op if the button hasn't been created yet
-  // (still in setup()).
+  // the panel state changes. No-op if the button hasn't been
+  // created yet (still in setup()).
   void update_debug_btn_visibility_();
   // Show / hide the debug overlay. show_debug_panel_() creates the
   // panel lazily (one-time) and rebuilds content every time it's
@@ -715,8 +709,9 @@ class HaAutoPanel : public Component {
   // both create_ui_from_room_cards_ and show_entity_detail_ so it's
   // visible on every page.
   void create_title_bar_(lv_obj_t *parent);
-  // Re-render the room grid (called when edit_mode toggles, when
-  // customizations change, or when a room is hidden/shown).
+  // Re-render the room grid (called when customizations change,
+  // when a room is hidden/shown via the Sort panel, or after
+  // discovery rebuilds room_cards_).
   void refresh_room_cards_();
   // Update the "Now Playing" banner at the top of the grid. Reads
   // the current entity state fields and shows one tile per media_player
