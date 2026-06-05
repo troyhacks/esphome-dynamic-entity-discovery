@@ -1216,7 +1216,17 @@ void HaAutoPanel::create_ui_from_room_cards_() {
   // grid is a full surface.
   lv_obj_set_style_bg_color(this->main_container_, lv_color_hex(0x0f1620), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(this->main_container_, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_scrollbar_mode(this->main_container_, LV_SCROLLBAR_MODE_OFF);  // Clean, no scrollbar
+  // v1.15: scrollbar mode is now AUTO (was OFF). With 15+ rooms
+  // (Back Room, Back Yard, Back Stairs, Basement Hall, Bathroom,
+  // Closet, Front Porch, Front Room, Garage, Kitchen, Living
+  // Room, Kelly's Room, Spa, Stairs, Troy's Room) at 4 per row
+  // = 4 rows = 1072px tall, the grid overflows the 600px screen
+  // by ~470px. The container IS scrollable (LVGL default), but
+  // with LV_SCROLLBAR_MODE_OFF the user has no visual hint that
+  // more content exists below. AUTO shows a thin scrollbar
+  // during scroll then hides it - the user knows to drag, and
+  // the screen stays clean when idle.
+  lv_obj_set_scrollbar_mode(this->main_container_, LV_SCROLLBAR_MODE_AUTO);
   lv_obj_set_style_pad_all(this->main_container_, 0, 0);  // No padding
   lv_obj_set_style_border_width(this->main_container_, 0, 0);  // No border
   lv_obj_set_style_border_color(this->main_container_, lv_color_hex(0x0f1620), 0);  // Hide border
@@ -1880,7 +1890,13 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   // back button visibility changed and we may want to show the room name
   // in the title).
   lv_obj_set_style_bg_color(this->detail_container_, lv_color_hex(0x111827), 0);
-  lv_obj_set_scrollbar_mode(this->detail_container_, LV_SCROLLBAR_MODE_OFF);  // Clean, no scrollbar
+  // v1.15: scrollbar mode is now AUTO (was OFF). With rooms
+  // like Garage (138 entities) the detail page can be 11000+
+  // px tall - well past the 564px visible area. The user needs
+  // a visual hint that more content exists below the fold. AUTO
+  // shows the scrollbar during scroll then fades it. (See the
+  // matching comment on the main_container_ for the rationale.)
+  lv_obj_set_scrollbar_mode(this->detail_container_, LV_SCROLLBAR_MODE_AUTO);
   lv_obj_set_style_pad_all(this->detail_container_, 0, 0);  // No padding
   lv_obj_set_style_border_width(this->detail_container_, 0, 0);  // No border
 
@@ -4427,7 +4443,12 @@ void HaAutoPanel::show_sort_panel_() {
     // scrolling. Scrollbar is OFF for a cleaner look (the user
     // can scroll with a touch swipe).
     lv_obj_add_flag(this->sort_panel_, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(this->sort_panel_, LV_SCROLLBAR_MODE_OFF);
+    // v1.15: scrollbar mode is now AUTO (was OFF). 15 rooms in
+    // the sort panel at 50-60px per row = 750-900px tall, which
+    // overflows the 600px screen. Without a scrollbar hint the
+    // user might think they can only see what's visible. AUTO
+    // fades in on drag, out on release.
+    lv_obj_set_scrollbar_mode(this->sort_panel_, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_remove_flag(this->sort_panel_, LV_OBJ_FLAG_CLICKABLE);
   }
   // Seed the local state from the current customizations_:
