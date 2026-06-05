@@ -2196,6 +2196,15 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   // label. 70x26 fits a 3-4 char state string (on, off, --, play)
   // at the default font. Anchored at x=300 (just past the 260-px
   // name area) so even worst-case-long names don't crash into it.
+  //
+  // v1.13: state badge is now CLICKABLE for toggle-able entities
+  // (lights, switches, fans). Tapping it calls domain.toggle
+  // (light.toggle, switch.toggle) - a quick way to flip a light
+  // without having to drag the arc to a non-zero value. The
+  // click is gated on the entity's domain; sensors / binary_sensors
+  // have no toggle service, so the badge stays non-clickable for
+  // them (and the tap is absorbed by the row's CLICKABLE flag,
+  // so nothing fires).
   lv_obj_t* state_bg = lv_obj_create(control);
   lv_obj_set_size(state_bg, 70, 26);
   lv_obj_align(state_bg, LV_ALIGN_LEFT_MID, 300, 0);
@@ -2203,7 +2212,6 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   lv_obj_set_style_border_width(state_bg, 0, 0);
   lv_obj_set_style_pad_all(state_bg, 0, 0);
   lv_obj_remove_flag(state_bg, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_remove_flag(state_bg, LV_OBJ_FLAG_CLICKABLE);
   const char* state_text = entity.state.empty() ? "--" : entity.state.c_str();
   uint32_t state_bg_color, state_text_color;
   if (entity.state == "on") {
@@ -2222,6 +2230,71 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   lv_label_set_text(state_label, state_text);
   lv_obj_set_style_text_color(state_label, lv_color_hex(state_text_color), 0);
   lv_obj_center(state_label);
+
+  // Clickable state badge -> toggle. Only attach the click handler
+  // for domains HA has a toggle service for; the rest of the badge
+  // just displays the state with no clickability.
+  bool is_toggleable = (entity.domain == "light"
+                      || entity.domain == "switch"
+                      || entity.domain == "fan"
+                      || entity.domain == "humidifier"
+                      || entity.domain == "vacuum"
+                      || entity.domain == "media_player");
+  if (is_toggleable) {
+    lv_obj_add_flag(state_bg, LV_OBJ_FLAG_CLICKABLE);
+    // Both the domain and entity_id need to travel into the
+    // click closure (so we can call the right service). Pack
+    // them as "domain\0entity_id" in a single heap allocation -
+    // one allocation, one delete in LV_EVENT_DELETE. The NUL
+    // separator is unambiguous because the domain never
+    // contains one.
+    std::string dom(entity.domain.data(), entity.domain.size());
+    std::string eid(entity.entity_id.data(), entity.entity_id.size());
+    std::string* packed = new std::string();
+    packed->reserve(dom.size() + 1 + eid.size());
+    packed->append(dom);
+    packed->push_back('\0');
+    packed->append(eid);
+    lv_obj_set_user_data(state_bg, packed);
+    lv_obj_add_event_cb(state_bg, [](lv_event_t* event) {
+      lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
+      std::string* p = (std::string*)lv_obj_get_user_data(btn);
+      if (s_instance == nullptr || p == nullptr) return;
+      // Split on the NUL separator. The closure is read-only so
+      // this is safe; we just need a non-owning string_view into
+      // the heap buffer.
+      std::string_view packed_view(p->data(), p->size());
+      size_t nul = packed_view.find('\0');
+      if (nul == std::string_view::npos) return;  // malformed
+      std::string_view dom = packed_view.substr(0, nul);
+      std::string_view eid = packed_view.substr(nul + 1);
+      // Build "<domain>.toggle" service name. HA exposes a
+      // .toggle service for every toggleable domain (light,
+      // switch, fan, humidifier, vacuum, media_player, ...).
+      std::string service;
+      service.reserve(dom.size() + 7);
+      service.append(dom);
+      service.append(".toggle");
+      // call_ha_service_ takes std::string for entity_id; copy
+      // the string_view into a temporary std::string. The copy
+      // is cheap (a few dozen bytes for a typical entity_id).
+      s_instance->call_ha_service_(
+          service.c_str(),
+          "entity_id", std::string(eid.data(), eid.size()),
+          -1);
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(state_bg, [](lv_event_t* event) {
+      lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
+      std::string* p = (std::string*)lv_obj_get_user_data(btn);
+      delete p;
+      lv_obj_set_user_data(btn, nullptr);
+    }, LV_EVENT_DELETE, nullptr);
+  } else {
+    // Non-toggleable domain: explicitly NOT clickable. Keep the
+    // no-op click behavior so the row doesn't get accidental
+    // taps.
+    lv_obj_remove_flag(state_bg, LV_OBJ_FLAG_CLICKABLE);
+  }
 
   // Domain (middle). At x=390 (state badge ends at 370, so 20px gap).
   lv_obj_t* domain_label = lv_label_create(control);
