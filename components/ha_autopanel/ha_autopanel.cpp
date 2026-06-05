@@ -2158,28 +2158,54 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   // Row layout: [Name] [State badge] [Domain] [Arc/%] [Hide X]
 
   // Name (left, vcenter). .data() is null-terminated because the
-  // underlying string_view points into a std::string.
+  // underlying string_view points into a std::string. Width-capped
+  // to 260px with LV_LABEL_LONG_CLIP (hard cutoff, no ellipsis)
+  // so long names don't wrap to a second line and overflow the
+  // row. We picked CLIP over DOT because the default font's ellipsis
+  // is a single character that takes a lot of space at 14pt; a hard
+  // clip is fine because the user can tap the entity to see the
+  // detail view where the full name is shown.
   lv_obj_t* name_label = lv_label_create(control);
   lv_label_set_text(name_label, entity.name.data());
   lv_obj_set_style_text_color(name_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_width(name_label, 260);
+  lv_label_set_long_mode(name_label, LV_LABEL_LONG_CLIP);
   lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 15, 0);
 
-  // State badge (color-coded: on=green, off/unknown=gray, else=amber)
-  lv_obj_t* state_label = lv_label_create(control);
+  // State badge - rounded pill so the user can read ON/OFF/-- at a
+  // glance. The background color contrasts with the dark row bg so
+  // the badge stands out from the name and isn't mistaken for a
+  // label. 70x26 fits a 3-4 char state string (on, off, --, play)
+  // at the default font. Anchored at x=300 (just past the 260-px
+  // name area) so even worst-case-long names don't crash into it.
+  lv_obj_t* state_bg = lv_obj_create(control);
+  lv_obj_set_size(state_bg, 70, 26);
+  lv_obj_align(state_bg, LV_ALIGN_LEFT_MID, 300, 0);
+  lv_obj_set_style_radius(state_bg, 4, 0);
+  lv_obj_set_style_border_width(state_bg, 0, 0);
+  lv_obj_set_style_pad_all(state_bg, 0, 0);
+  lv_obj_remove_flag(state_bg, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(state_bg, LV_OBJ_FLAG_CLICKABLE);
   const char* state_text = entity.state.empty() ? "--" : entity.state.c_str();
-  uint32_t state_color;
+  uint32_t state_bg_color, state_text_color;
   if (entity.state == "on") {
-    state_color = 0x22DD55;
+    state_bg_color = 0x22DD55;  // green
+    state_text_color = 0x111827;  // dark
   } else if (entity.state == "off" || entity.state == "unavailable" || entity.state == "unknown") {
-    state_color = 0x888888;
+    state_bg_color = 0x444444;  // dim gray
+    state_text_color = 0xCCCCCC;  // light
   } else {
-    state_color = 0xFFCC44;
+    state_bg_color = 0xCC8800;  // amber
+    state_text_color = 0x111827;  // dark
   }
+  lv_obj_set_style_bg_color(state_bg, lv_color_hex(state_bg_color), 0);
+  lv_obj_set_style_bg_opa(state_bg, LV_OPA_COVER, 0);
+  lv_obj_t* state_label = lv_label_create(state_bg);
   lv_label_set_text(state_label, state_text);
-  lv_obj_set_style_text_color(state_label, lv_color_hex(state_color), 0);
-  lv_obj_align(state_label, LV_ALIGN_LEFT_MID, 250, 0);
+  lv_obj_set_style_text_color(state_label, lv_color_hex(state_text_color), 0);
+  lv_obj_center(state_label);
 
-  // Domain (middle)
+  // Domain (middle). At x=390 (state badge ends at 370, so 20px gap).
   lv_obj_t* domain_label = lv_label_create(control);
   if (entity.domain == "binary_sensor") {
     lv_label_set_text(domain_label, "contact");
@@ -2197,7 +2223,7 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
         : 0;
     lv_obj_t* arc = lv_arc_create(control);
     lv_obj_set_size(arc, 50, 50);
-    lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -150, 0);
+    lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -200, 0);
     lv_arc_set_min_value(arc, 0);
     lv_arc_set_max_value(arc, 100);
     lv_arc_set_value(arc, initial_pct);
