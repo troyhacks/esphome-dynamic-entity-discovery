@@ -1665,11 +1665,17 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
     delete data;
   }, LV_EVENT_DELETE, nullptr);
 
-  // ON/OFF button - small, just wide enough to fit the "ON/OFF" label
-  // (~110px at the default font). Not tied to card_width.
+  // ON/OFF button. v1.14: bumped from 110x28 (clamped to
+  // card_width/8 = ~32) to 140x36 to give the label more
+  // breathing room and to match the new state-badge sizing on
+  // the detail page. 140px fits "ON/OFF" at 14pt with a few
+  // px of padding; 36px is a comfortable touch target. The
+  // button is also centered horizontally (was LV_ALIGN_BOTTOM_MID
+  // with x=0; same alignment, but the new size means it's
+  // visually more present).
   lv_obj_t* btn = lv_obj_create(card);
-  int btn_w = 110;
-  int btn_h = std::max(28, this->card_width_ / 8);
+  int btn_w = 140;
+  int btn_h = std::max(36, this->card_width_ / 7);
   lv_obj_set_size(btn, btn_w, btn_h);
   lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
   // Disable all internal scrolling on the button. By default lv_obj_create()
@@ -2176,26 +2182,30 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   // Row layout: [Name] [State badge] [Domain] [Arc/%] [Hide X]
 
   // Name (left, vcenter). .data() is null-terminated because the
-  // underlying string_view points into a std::string. Width-capped
-  // to 260px with LV_LABEL_LONG_CLIP (hard cutoff, no ellipsis)
-  // so long names don't wrap to a second line and overflow the
-  // row. We picked CLIP over DOT because the default font's ellipsis
-  // is a single character that takes a lot of space at 14pt; a hard
-  // clip is fine because the user can tap the entity to see the
-  // detail view where the full name is shown.
+  // underlying string_view points into a std::string. v1.14: width
+  // bumped from 260 -> 400px and switched to LV_LABEL_LONG_DOT
+  // (ellipsis on overflow) so the friendly_name from v1.12
+  // ("Kitchen Max Display" instead of "kitchen_max_display") has
+  // room to render. With CLIP on the old 260px box, the
+  // friendly_name was truncating to ~22 chars which felt
+  // arbitrary. DOT shows "..." on overflow which is the more
+  // conventional UX.
   lv_obj_t* name_label = lv_label_create(control);
   lv_label_set_text(name_label, entity.name.data());
   lv_obj_set_style_text_color(name_label, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_width(name_label, 260);
-  lv_label_set_long_mode(name_label, LV_LABEL_LONG_CLIP);
+  lv_obj_set_width(name_label, 400);
+  lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
   lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 15, 0);
 
   // State badge - rounded pill so the user can read ON/OFF/-- at a
   // glance. The background color contrasts with the dark row bg so
   // the badge stands out from the name and isn't mistaken for a
-  // label. 70x26 fits a 3-4 char state string (on, off, --, play)
-  // at the default font. Anchored at x=300 (just past the 260-px
-  // name area) so even worst-case-long names don't crash into it.
+  // label. v1.14: bumped from 70x26 to 90x32 so a 14pt font has
+  // room to render "UNAVAILABLE" without the 'L' getting clipped
+  // (the user pointed out that some badges were slightly cut off).
+  // 90px is also big enough to be a comfortable touch target on
+  // a 7" panel (was 70x26 - too small to reliably tap). The arc
+  // and pct_label below shift left to compensate.
   //
   // v1.13: state badge is now CLICKABLE for toggle-able entities
   // (lights, switches, fans). Tapping it calls domain.toggle
@@ -2206,8 +2216,8 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   // them (and the tap is absorbed by the row's CLICKABLE flag,
   // so nothing fires).
   lv_obj_t* state_bg = lv_obj_create(control);
-  lv_obj_set_size(state_bg, 70, 26);
-  lv_obj_align(state_bg, LV_ALIGN_LEFT_MID, 300, 0);
+  lv_obj_set_size(state_bg, 90, 32);
+  lv_obj_align(state_bg, LV_ALIGN_LEFT_MID, 440, 0);
   lv_obj_set_style_radius(state_bg, 4, 0);
   lv_obj_set_style_border_width(state_bg, 0, 0);
   lv_obj_set_style_pad_all(state_bg, 0, 0);
@@ -2306,7 +2316,11 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
     lv_label_set_text(domain_label, entity.domain.data());
   }
   lv_obj_set_style_text_color(domain_label, lv_color_hex(color), 0);
-  lv_obj_align(domain_label, LV_ALIGN_LEFT_MID, 380, 0);
+  // v1.14: shifted from x=380 to x=540 to make room for the
+  // wider state badge (90px vs 70px) and longer name column
+  // (400px vs 260px). The domain label is 50px wide so it
+  // occupies x=540-590.
+  lv_obj_align(domain_label, LV_ALIGN_LEFT_MID, 540, 0);
 
   if (entity.domain == "light" && entity.has_brightness) {
     uint8_t initial_pct = (entity.state == "on" && entity.brightness > 0)
@@ -2314,7 +2328,10 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
         : 0;
     lv_obj_t* arc = lv_arc_create(control);
     lv_obj_set_size(arc, 50, 50);
-    lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -200, 0);
+    // v1.14: shifted from -200 to -250 to make room for the
+    // wider pct_label area. The pct_label moved from -100 to
+    // -150 so the arc + label are still readable as a pair.
+    lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -250, 0);
     lv_arc_set_min_value(arc, 0);
     lv_arc_set_max_value(arc, 100);
     lv_arc_set_value(arc, initial_pct);
@@ -2328,7 +2345,10 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
     lv_obj_t* pct_label = lv_label_create(control);
     lv_label_set_text_fmt(pct_label, "%d%%", initial_pct);
     lv_obj_set_style_text_color(pct_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(pct_label, LV_ALIGN_RIGHT_MID, -100, 0);
+    // v1.14: shifted from -100 to -150 to pair with the new
+    // arc position (-250). Together they form a coherent
+    // (arc)(pct%) group on the right of the row.
+    lv_obj_align(pct_label, LV_ALIGN_RIGHT_MID, -150, 0);
 
     ArcRecord arc_rec;
     arc_rec.entity_id = entity.entity_id;
@@ -2396,8 +2416,17 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   // view.
   lv_obj_t* hide_btn = lv_obj_create(control);
   lv_obj_set_size(hide_btn, 40, 40);
+  // v1.14: bumped the per-entity hide X from 40x40 to 48x48
+  // for two reasons. First, the user said some buttons were
+  // "slightly cut off" - 40px is on the edge of tappable on a
+  // 7" touchscreen (the OS's hitbox rounding eats a couple of
+  // px). Second, the per-entity hide action is destructive
+  // (persists to /storage/customizations.cfg) so the bigger tap
+  // target means fewer accidental hits. Position is unchanged
+  // (-15 from the right edge).
+  lv_obj_set_size(hide_btn, 48, 48);
   lv_obj_align(hide_btn, LV_ALIGN_RIGHT_MID, -15, 0);
-  lv_obj_set_style_radius(hide_btn, 20, 0);
+  lv_obj_set_style_radius(hide_btn, 24, 0);
   lv_obj_set_style_bg_color(hide_btn, lv_color_hex(0x3a1a1a), 0);
   lv_obj_set_style_border_width(hide_btn, 1, 0);
   lv_obj_set_style_border_color(hide_btn, lv_color_hex(0xAA4444), 0);
