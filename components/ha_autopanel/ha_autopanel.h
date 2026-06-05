@@ -328,6 +328,13 @@ class HaAutoPanel : public Component {
   // (square cards). cards_per_row is computed from screen_width and
   // card_gap. main_container_ height is computed from card count.
   int card_width_{250};
+  // v1.22f: card_height is now separate from card_width so the
+  // card can be tall enough to hold the arc + the ON/OFF button
+  // below it. The arc is centered in the upper portion; the
+  // button sits ~10px below the arc bottom, still inside the
+  // card. 60px extra height gives 36px button + 10px arc-button
+  // gap + 14px top/bottom margin.
+  int card_height_{310};
   int card_gap_{12};
   int screen_width_{1024};
   int screen_height_{600};
@@ -735,6 +742,28 @@ class HaAutoPanel : public Component {
   int get_card_y_(int row) const;
   int arc_size_() const { return this->card_width_ - 20; }  // square, ~10px margin
   uint32_t get_room_color_(int index) const;
+
+  // v1.22e: data-driven button/label sizing. The previous code
+  // hand-tuned pixel widths (Reboot=70, Edit=60, time=70) and
+  // they clipped the text as soon as the label or font changed.
+  // lv_txt_get_width() measures the actual rendered width for
+  // a given font + text, so the widget is always the right size
+  // no matter the locale, label wording, or font swap.
+  //
+  // The signature is intentionally minimal: callers pass the
+  // font they're using and horizontal padding (the LVGL default
+  // pad is 0; we add 12-16px to make the touch target bigger
+  // than the text itself). 4px vertical pad keeps the label
+  // from touching the top/bottom edge of the button.
+  static int button_width_for_text_(const char* text, const lv_font_t* font, int pad_x = 14);
+  // v1.22e: if a single-line room name overflows the arc width,
+  // split on the first space to find the longest balanced two-
+  // line split. Returns the original string when it fits on
+  // one line, or "Line1\nLine2" (LVGL escape for newline) when
+  // it doesn't. Output is written to `out` (caller-owned, must
+  // be at least 128 bytes for any reasonable room name).
+  void split_room_name_to_fit_(const char* name, int max_width_px,
+                                const lv_font_t* font, char* out, size_t out_size) const;
 
   // HA service call helper - uses native ESPHome API
   // service:    e.g. "light.turn_on", "light.turn_off", "switch.toggle"

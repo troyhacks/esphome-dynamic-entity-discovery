@@ -6,6 +6,7 @@
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/homeassistant_service.h"
 #include <lvgl.h>
+#include <climits>  // for INT_MAX in split_room_name_to_fit_
 #include "esphome/components/lvgl/lvgl_proxy.h"
 #include "esp_heap_caps.h"
 #include "driver/uart.h"
@@ -58,7 +59,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22d"
+#define FIRMWARE_VERSION "v1.22f"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -179,7 +180,16 @@ void HaAutoPanel::setup() {
 
     this->splash_label_ = lv_label_create(this->splash_container_);
     if (this->splash_label_ != nullptr) {
-      lv_label_set_text(this->splash_label_, "HA AutoPanel v1.0");
+      // v1.22e: was hardcoded "HA AutoPanel v1.0" - the user
+      // pointed out the boot splash should show the actual
+      // firmware version, not a stale literal. We use the
+      // FIRMWARE_VERSION macro so the splash always matches
+      // what the build was compiled with. Format:
+      //   "HA AutoPanel v1.22e"
+      // (FIRMWARE_VERSION is the bare "v1.22e" form.)
+      char splash_buf[64];
+      snprintf(splash_buf, sizeof(splash_buf), "HA AutoPanel %s", FIRMWARE_VERSION);
+      lv_label_set_text(this->splash_label_, splash_buf);
       // Pure red (0xFF0000) per the spec. Default font is fine here —
       // it's larger and bolder than the title-bar label, which is what we
       // want for a centered splash. If you want a specific face/size, set
@@ -982,16 +992,23 @@ void HaAutoPanel::update_title_time_() {
     uint32_t now_ms = millis();
     int64_t elapsed_s = (int64_t)(now_ms - this->time_baseline_millis_) / 1000;
     int64_t unix_now = this->time_unix_seconds_ + elapsed_s;
-    // Convert to local time. The HA last_updated is in HA's
-    // configured timezone (or UTC if no tz). The panel currently
-    // doesn't do per-tz arithmetic, so we just show UTC and
-    // log the offset. (The user's yaml uses America/New_York;
-    // we should add timezone support later. For now, UTC is
-    // good enough to prove the mechanism works - we'll show
-    // the right time once a TZ source is in place.)
+    // v1.22e: convert to LOCAL time. Was gmtime_r() in v1.22,
+    // which is UTC. The user's yaml sets America/New_York, so
+    // the panel was 4-5 hours ahead of the wall clock. We use
+    // localtime_r() which honors the system's TZ environment
+    // variable. The yaml's `timezone:` block doesn't set TZ
+    // (it sets a different internal field), so we also force
+    // TZ here to a reasonable default that matches the user's
+    // home - "America/New_York" - if the env is unset. The
+    // long-term fix is to read the timezone from the user's
+    // yaml (yaml's time.timezone field) and setenv() at boot.
+    // For now, env override + EST/EDT localtime_r is correct
+    // for the user's install.
+    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 0);  // America/New_York
+    tzset();
     time_t t = (time_t)unix_now;
     struct tm tm_buf;
-    gmtime_r(&t, &tm_buf);
+    localtime_r(&t, &tm_buf);
     int hour = tm_buf.tm_hour;
     int minute = tm_buf.tm_min;
     int minute_key = hour * 100 + minute;
@@ -1003,6 +1020,14 @@ void HaAutoPanel::update_title_time_() {
       char buf[16];
       snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
       lv_label_set_text(this->title_time_label_, buf);
+      // v1.22e: re-fit the label width to the new text. Without
+      // this, switching from "8 PM" (narrow) to "11:03 PM" (wide)
+      // would either clip or leave dead space. The flex cluster
+      // reflows when the label grows.
+      const lv_font_t* f = lv_obj_get_style_text_font(
+          this->title_time_label_, LV_PART_MAIN);
+      lv_obj_set_width(this->title_time_label_,
+                       button_width_for_text_(buf, f, 4));
     }
     return;
   }
@@ -1169,7 +1194,7 @@ void HaAutoPanel::dump_config() {
   }
   ESP_LOGI(TAG, "  Layout: %d cards/row (%dx%d cards, screen %dx%d)",
            this->compute_cards_per_row_(),
-           this->card_width_, this->card_width_,
+           this->card_width_, this->card_height_,
            this->screen_width_, this->screen_height_);
   ESP_LOGI(TAG, "  Discovered areas: %d", (int)discovered_areas_.size());
 }
@@ -1424,7 +1449,9 @@ void HaAutoPanel::create_ui_from_room_cards_() {
     // row reflows automatically. Flex is now enabled (LV_USE_FLEX=1
     // in the user's lvgl config).
     lv_obj_t* row_container = lv_obj_create(this->main_container_);
-    lv_obj_set_size(row_container, row_width, this->card_width_);
+    // v1.22f: was card_width_ (square). Now card_height_ so the
+    // row is tall enough for the card's expanded height.
+    lv_obj_set_size(row_container, row_width, this->card_height_);
     lv_obj_set_style_bg_opa(row_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row_container, 0, 0);
     lv_obj_set_style_pad_all(row_container, 0, 0);
@@ -1432,7 +1459,7 @@ void HaAutoPanel::create_ui_from_room_cards_() {
     lv_obj_set_flex_flow(row_container, LV_FLEX_FLOW_ROW);
     lv_obj_remove_flag(row_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(row_container, LV_OBJ_FLAG_CLICKABLE);
-    int row_y = this->start_y_ + row * (this->card_width_ + this->card_gap_);
+    int row_y = this->start_y_ + row * (this->card_height_ + this->card_gap_);
     lv_obj_align(row_container, LV_ALIGN_TOP_MID, 0, row_y);
 
     // Add this row's cards. The flex layout handles the per-card x
@@ -1478,7 +1505,7 @@ void HaAutoPanel::create_ui_from_room_cards_() {
   // added a full card_gap_ + 20px padding, which left dead scrollable space
   // below the last row (especially noticeable when the page is taller than
   // the screen, since the user could scroll past the cards into emptiness).
-  int actual_bottom = this->start_y_ + (num_rows - 1) * (this->card_width_ + this->card_gap_) + this->card_width_;
+  int actual_bottom = this->start_y_ + (num_rows - 1) * (this->card_height_ + this->card_gap_) + this->card_height_;
   // But still expand to fill the screen if content is shorter, so the dark
   // background of main_container_ covers the full display (otherwise the
   // bottom of the screen would show the default screen background).
@@ -1554,13 +1581,23 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
 
   // Local clock (HH:MM AM/PM). Right cluster child. Updated by
   // update_title_time_() called from loop() (~1Hz) once NTP sync has
-  // completed. Width 70 fits "12:34 PM" at the default font.
+  // completed. v1.22e: width is now data-driven via
+  // button_width_for_text_() against the placeholder "--:--".
+  // update_title_time_() also calls the same helper on every
+  // minute-change to re-fit the label to the new text, so a future
+  // switch to 24-hour or non-Latin digits just works.
   this->title_time_label_ = lv_label_create(this->title_right_cluster_);
   lv_label_set_text(this->title_time_label_, "--:--");
   lv_label_set_long_mode(this->title_time_label_, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(this->title_time_label_, lv_color_hex(0x9ca3af), 0);
   lv_obj_set_style_text_align(this->title_time_label_, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_width(this->title_time_label_, 70);
+  // The font is the lvgl `text_font` default (set in yaml). We
+  // pull it from the parent lvgl config rather than hard-coding
+  // a font id so the width adapts if the user swaps the font.
+  const lv_font_t* time_font = lv_obj_get_style_text_font(
+      this->title_time_label_, LV_PART_MAIN);
+  lv_obj_set_width(this->title_time_label_,
+                   button_width_for_text_("--:--", time_font, 4));
   lv_obj_set_height(this->title_time_label_, LV_SIZE_CONTENT);
   lv_obj_add_flag(this->title_time_label_, LV_OBJ_FLAG_HIDDEN);
 
@@ -1599,8 +1636,14 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   //
   // v1.22b: bumped from 28 to 32 high to match the back button
   // (Fix #5 button audit).
+  // v1.22e: width is data-driven. v1.22b had 60 hard-coded which
+  // is fine for "Edit" but would clip "Edit Rooms" or any future
+  // relabel. We measure the actual text and add 14px of horizontal
+  // padding (7px each side) for a comfortable touch target.
   this->title_sort_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_sort_btn_, 60, 32);
+  lv_obj_set_width(this->title_sort_btn_,
+                   button_width_for_text_("Edit", &lv_font_montserrat_14));
+  lv_obj_set_height(this->title_sort_btn_, 32);
   lv_obj_set_style_bg_color(this->title_sort_btn_, lv_color_hex(0x374151), 0);
   lv_obj_set_style_radius(this->title_sort_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_sort_btn_, 0, 0);
@@ -1695,8 +1738,11 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // v1.22b: bumped from 28 to 32 high to match the back button
   // (Fix #5 button audit - mixed heights in the title bar looked
   // ragged).
+  // v1.22e: data-driven width via button_width_for_text_().
   this->title_save_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_save_btn_, 60, 32);
+  lv_obj_set_width(this->title_save_btn_,
+                   button_width_for_text_("Save", &lv_font_montserrat_14));
+  lv_obj_set_height(this->title_save_btn_, 32);
   lv_obj_set_style_bg_color(this->title_save_btn_, lv_color_hex(0xfacc15), 0);
   lv_obj_set_style_radius(this->title_save_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_save_btn_, 0, 0);
@@ -1718,8 +1764,11 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
 
   // v1.22b: bumped from 28 to 32 high to match the back button
   // (Fix #5 button audit).
+  // v1.22e: data-driven width via button_width_for_text_().
   this->title_cancel_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_cancel_btn_, 70, 32);
+  lv_obj_set_width(this->title_cancel_btn_,
+                   button_width_for_text_("Cancel", &lv_font_montserrat_14));
+  lv_obj_set_height(this->title_cancel_btn_, 32);
   lv_obj_set_style_bg_color(this->title_cancel_btn_, lv_color_hex(0xef4444), 0);
   lv_obj_set_style_radius(this->title_cancel_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_cancel_btn_, 0, 0);
@@ -1756,7 +1805,14 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // bar looked ragged; the user pointed this out in Fix #5.
   if (this->agent_debug_) {
     this->title_reboot_btn_ = lv_obj_create(this->title_right_cluster_);
-    lv_obj_set_size(this->title_reboot_btn_, 70, 32);
+    // v1.22e: width is data-driven via button_width_for_text_().
+    // The previous 70px hard-coded value clipped "Reboot" to
+    // "Reboo"; the 85px v1.22e value was still a guess. Now
+    // the button is exactly the right size for whatever the
+    // label says, plus 14px touch padding.
+    lv_obj_set_width(this->title_reboot_btn_,
+                     button_width_for_text_("Reboot", &lv_font_montserrat_14));
+    lv_obj_set_height(this->title_reboot_btn_, 32);
     lv_obj_set_style_bg_color(this->title_reboot_btn_, lv_color_hex(0xdc2626), 0);  // red
     lv_obj_set_style_radius(this->title_reboot_btn_, 6, 0);
     lv_obj_set_style_border_width(this->title_reboot_btn_, 0, 0);
@@ -1811,7 +1867,12 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // high). The 32x position is what the user meant by "slightly too
   // small" - the button was sized right but offset upward, so it
   // didn't visually line up with the other chrome.
-  lv_obj_set_size(this->title_back_btn_, 75, 32);
+  // v1.22e: width is data-driven via button_width_for_text_() against
+  // "< Back". "<" + " " + "Back" is wider than the v1.22b hand-tuned
+  // 75px at larger fonts; the helper fixes that.
+  lv_obj_set_width(this->title_back_btn_,
+                   button_width_for_text_("< Back", &lv_font_montserrat_14));
+  lv_obj_set_height(this->title_back_btn_, 32);
   lv_obj_set_pos(this->title_back_btn_, 32, 4);
   lv_obj_set_style_bg_color(this->title_back_btn_, lv_color_hex(0x374151), 0);
   lv_obj_set_style_radius(this->title_back_btn_, 6, 0);
@@ -1849,7 +1910,7 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
 
   lv_obj_t* card = lv_obj_create((lv_obj_t*) parent);
   lv_obj_set_pos(card, room.x, room.y);
-  lv_obj_set_size(card, this->card_width_, this->card_width_);  // square
+  lv_obj_set_size(card, this->card_width_, this->card_height_);  // v1.22f: was square; now wider-than-tall to fit arc + ON/OFF button
   // Register the card widget so the drag-to-reorder code can find it by
   // area_id. The card is destroyed with the parent on refresh, and this
   // map is cleared in refresh_room_cards_() to match.
@@ -1903,7 +1964,12 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // opa=0 fallback (e.g. if the knob widget ignores the parent style).
   lv_obj_add_flag(arc, LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_size(arc, arc_size, arc_size);  // square
-  lv_obj_align(arc, LV_ALIGN_CENTER, 0, -10);  // shift up a bit to make room for button
+  // v1.22e: was LV_ALIGN_CENTER, 0, -10 (shifted up 10px to make
+  // room for the ON/OFF button). The user said the arc looked
+  // "too high" in the card - the 10px shift was visible.
+  // Centered now; the ON/OFF button below sits inside the
+  // card just under the arc (see its LV_ALIGN_*-10 offset).
+  lv_obj_align(arc, LV_ALIGN_CENTER, 0, 0);
   lv_arc_set_min_value(arc, 0);
   lv_arc_set_max_value(arc, 100);
   lv_arc_set_value(arc, initial_pct);  // From computed state, not hardcoded 50
@@ -1998,11 +2064,27 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // button is also centered horizontally (was LV_ALIGN_BOTTOM_MID
   // with x=0; same alignment, but the new size means it's
   // visually more present).
+  //
+  // v1.22e: was LV_ALIGN_BOTTOM_MID, 0, -8 (pinned 8px above
+  // the card's bottom edge). The user wanted the button to
+  // sit "just below the arc, inside the card, slightly down"
+  // - i.e. visually paired with the arc, not glued to the
+  // card's bottom. With the arc now centered in the card
+  // (v1.22e), the arc's bottom edge is at card_center + arc/2.
+  // We place the button 10px below that, so it reads as part
+  // of the same composition instead of floating at the bottom.
+  // 8px is too close to the card edge and looks disconnected.
   lv_obj_t* btn = lv_obj_create(card);
   int btn_w = 140;
   int btn_h = std::max(36, this->card_width_ / 7);
   lv_obj_set_size(btn, btn_w, btn_h);
-  lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+  // Arc is square at arc_size_(); its bottom is at
+  // card_center + arc_size/2. Add 10px gap so the button sits
+  // just below the arc with a small visual breath. We compute
+  // the absolute y from the card height so the alignment
+  // doesn't depend on where the arc is.
+  int btn_y = (this->card_width_ / 2) + (this->arc_size_() / 2) + 10;
+  lv_obj_set_pos(btn, (this->card_width_ - btn_w) / 2, btn_y);
   // Disable all internal scrolling on the button. By default lv_obj_create()
   // makes a scrollable object, which means dragging on the button can
   // scroll its contents (the label) around. We want the button to be a
@@ -2121,9 +2203,53 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // name. The label is centered in the label_btn (which is centered
   // on the arc). lv_label_set_text takes a null-terminated const
   // char*; room.area.name is std::string so .c_str() is safe.
+  //
+  // v1.22e: room names like "Front Porch Overhead Light" or
+  // "Master Bedroom Closet" overflow the arc width on 250px
+  // cards at 28pt. The previous code just clipped them
+  // (LV_LABEL_LONG_CLIP). The user asked: if a name doesn't
+  // fit on one line, split on the most balanced space and
+  // render two lines, both centered. split_room_name_to_fit_()
+  // picks the split that minimizes |len(line1)-len(line2)| so
+  // "Front Porch\nOverhead Light" reads more cleanly than
+  // "Front\nPorch Overhead Light".
   lv_obj_t* label = lv_label_create(label_btn);
-  lv_label_set_text(label, room.area.name.c_str());
+  char name_buf[128];
+  // Use the label's own font style (the lvgl text_font from
+  // yaml) so the width measurement matches what gets rendered.
+  // The label is brand new so we have to read the font after
+  // creating it; lvgl inherits the parent style.
+  const lv_font_t* room_font = lv_obj_get_style_text_font(
+      label, LV_PART_MAIN);
+  // The label is arc_size wide minus the 5px pad we set on
+  // label_btn above. Use that as the budget.
+  this->split_room_name_to_fit_(
+      room.area.name.c_str(),
+      arc_size - 10,  // -10 for the label_btn's 5px L/R pad
+      room_font,
+      name_buf, sizeof(name_buf));
+  lv_label_set_text(label, name_buf);
+  // v1.22e: room name labels that fit on one line are set with
+  // default (auto) line-height. Two-line splits need
+  // LV_LABEL_LONG_WRAP and a line_height that matches the
+  // font so the two lines sit visually centered on the arc.
+  // We detect a split by the presence of '\n' in the buffer
+  // and switch the long_mode accordingly. We also expand
+  // label_btn's height so the two lines actually fit.
+  bool is_two_line = (strchr(name_buf, '\n') != nullptr);
+  if (is_two_line) {
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    // 2px line gap between the two lines (28pt font is
+    // ~36px line height on its own, so the total label
+    // height is ~74px). Resize label_btn to fit.
+    lv_obj_set_style_text_line_space(label, 2, 0);
+    lv_obj_set_height(label_btn, 74);
+  } else {
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_height(label_btn, 32);
+  }
   lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_width(label, arc_size - 10);
   lv_obj_center(label);
   // Move label_btn to the top of the z-order so touches on the
   // text (not the arc underneath) register as the room name click
@@ -5529,7 +5655,9 @@ void HaAutoPanel::refresh_room_cards_() {
                     (row_count > 0 ? (row_count - 1) : 0) * this->card_gap_;
 
     lv_obj_t* row_container = lv_obj_create(this->main_container_);
-    lv_obj_set_size(row_container, row_width, this->card_width_);
+    // v1.22f: was card_width_ (square). Now card_height_ so the
+    // row is tall enough for the card's expanded height.
+    lv_obj_set_size(row_container, row_width, this->card_height_);
     lv_obj_set_style_bg_opa(row_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row_container, 0, 0);
     lv_obj_set_style_pad_all(row_container, 0, 0);
@@ -5537,7 +5665,7 @@ void HaAutoPanel::refresh_room_cards_() {
     lv_obj_set_flex_flow(row_container, LV_FLEX_FLOW_ROW);
     lv_obj_remove_flag(row_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(row_container, LV_OBJ_FLAG_CLICKABLE);
-    int row_y = this->start_y_ + row * (this->card_width_ + this->card_gap_);
+    int row_y = this->start_y_ + row * (this->card_height_ + this->card_gap_);
     lv_obj_align(row_container, LV_ALIGN_TOP_MID, 0, row_y);
 
     for (int c = 0; c < row_count; c++) {
@@ -5687,6 +5815,114 @@ void HaAutoPanel::simulate_scroll_(int x1, int y1, int x2, int y2) {
   }
   ESP_LOGI(TAG, "[scroll] injected from (%d, %d) to (%d, %d) on obj=%p",
            x1, y1, x2, y2, (void *) obj);
+}
+
+// --- v1.22e data-driven sizing helpers ---
+
+// Internal: measure the rendered pixel width of `text` using
+// the given font. Uses a one-shot hidden label widget because
+// that's the portable LVGL 9 API - lv_txt_get_width() /
+// lv_obj_measure_text() aren't in this LVGL build (the
+// Crowpanel uses an older LVGL 9.x from pioarduino's
+// esp32 platform). The label is created, measured, then
+// deleted. The overhead is a few microseconds per call - fine
+// for the small N of title-bar buttons.
+//
+// If `parent` is nullptr we use lv_scr_act() (the active
+// screen). A real parent isn't strictly needed because the
+// label is hidden before any layout pass, but LVGL still
+// needs a parent to assign a style.
+static int measure_text_width_(const char* text, const lv_font_t* font) {
+  if (text == nullptr || font == nullptr) return 0;
+  lv_obj_t* screen = lv_scr_act();
+  if (screen == nullptr) return 0;
+  lv_obj_t* lbl = lv_label_create(screen);
+  if (lbl == nullptr) return 0;
+  lv_label_set_text(lbl, text);
+  lv_obj_set_style_text_font(lbl, font, 0);
+  // Force a layout pass so the label measures itself.
+  lv_obj_update_layout(lbl);
+  int w = lv_obj_get_self_width(lbl);
+  lv_obj_del(lbl);
+  return w;
+}
+
+int HaAutoPanel::button_width_for_text_(const char* text, const lv_font_t* font, int pad_x) {
+  // Measure the actual text width for the given font, then
+  // add pad_x*2 (left + right) for the touch target, plus
+  // a 2px fudge for sub-pixel rounding in the font glyph
+  // cache. Minimum width is 24px so a one-char label like
+  // "X" is still tappable.
+  int text_w = measure_text_width_(text, font);
+  if (text_w <= 0) return 24;
+  int w = text_w + (2 * pad_x) + 2;
+  return w < 24 ? 24 : w;
+}
+
+void HaAutoPanel::split_room_name_to_fit_(const char* name, int max_width_px,
+                                           const lv_font_t* font, char* out, size_t out_size) const {
+  if (name == nullptr || out == nullptr || out_size == 0) return;
+  // First check if the name fits on one line. If it does, copy
+  // it as-is and we're done.
+  size_t name_len = strlen(name);
+  if ((size_t)measure_text_width_(name, font) <= (size_t)max_width_px) {
+    strncpy(out, name, out_size - 1);
+    out[out_size - 1] = '\0';
+    return;
+  }
+  // Doesn't fit on one line. Try splitting on every space and
+  // pick the split that puts the longest-possible prefix on
+  // the first line while keeping the second line as balanced
+  // as possible. LVGL labels render '\n' as a hard line break.
+  //
+  // The "most balanced" split is found by trying every space
+  // and computing |len(line1) - len(line2)|. We want the
+  // smallest difference. On a tie we keep the FIRST such
+  // split (so long room names tend to break on the first
+  // natural word boundary).
+  int best_diff = INT_MAX;
+  size_t best_split = 0;  // index of the space to break at
+  for (size_t i = 0; i < name_len; i++) {
+    if (name[i] != ' ') continue;
+    // Sanity: both lines must individually fit. We don't
+    // recurse (3+ line names would need a different layout)
+    // but real room names are 1-3 words.
+    char line1[64];
+    char line2[64];
+    int l1 = snprintf(line1, sizeof(line1), "%.*s", (int)i, name);
+    int l2 = snprintf(line2, sizeof(line2), "%s", name + i + 1);
+    if (l1 <= 0 || l2 <= 0) continue;
+    if (measure_text_width_(line1, font) > max_width_px) continue;
+    if (measure_text_width_(line2, font) > max_width_px) continue;
+    int diff = l1 - l2;
+    if (diff < 0) diff = -diff;
+    if (diff < best_diff) {
+      best_diff = diff;
+      best_split = i;
+    }
+  }
+  if (best_split == 0) {
+    // No valid split found (single long word, or every split
+    // overflows). Just copy the original - the label widget
+    // will clip or scroll as configured by the caller.
+    strncpy(out, name, out_size - 1);
+    out[out_size - 1] = '\0';
+    return;
+  }
+  // Format as "Line1\nLine2". Trim trailing spaces from
+  // line1 so the break looks clean.
+  size_t line1_end = best_split;
+  while (line1_end > 0 && name[line1_end - 1] == ' ') line1_end--;
+  size_t line2_start = best_split + 1;
+  while (line2_start < name_len && name[line2_start] == ' ') line2_start++;
+  int n = snprintf(out, out_size, "%.*s\n%.*s",
+                   (int)line1_end, name,
+                   (int)(name_len - line2_start), name + line2_start);
+  if (n < 0 || (size_t)n >= out_size) {
+    // Truncated; fall back to single line.
+    strncpy(out, name, out_size - 1);
+    out[out_size - 1] = '\0';
+  }
 }
 
 
