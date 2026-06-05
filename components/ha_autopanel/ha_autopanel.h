@@ -299,6 +299,11 @@ class HaAutoPanel : public Component {
   void set_start_x(int x) { this->start_x_ = x; }
   void set_start_y(int y) { this->start_y_ = y; }
   void set_default_on_pct(int pct) { this->default_on_pct_ = pct; }
+  // AGENT_DEBUG opt-in switch. When true, /autopanel/test/* HTTP
+  // endpoints are registered (click, scroll, cmd, state). Default
+  // false so a production build does not expose them. See
+  // __init__.py for the full security rationale.
+  void set_agent_debug(bool v) { this->agent_debug_ = v; }
 
  protected:
   std::string ha_api_url_;
@@ -507,6 +512,10 @@ class HaAutoPanel : public Component {
 
   // Web UI handler
   bool web_handler_registered_{false};
+  // AGENT_DEBUG opt-in. When true, /autopanel/test/* handlers are
+  // registered and respond. Default false (set in the schema), so
+  // production builds do not expose the test API.
+  bool agent_debug_{false};
   void register_web_handler_();
   void handle_setup_get_(class AsyncWebServerRequest *request);
   void handle_setup_post_(class AsyncWebServerRequest *request);
@@ -521,13 +530,40 @@ class HaAutoPanel : public Component {
   // directly read the display's draw buffer (which is populated
   // by lv_refr_now()).
   void handle_screenshot_(class AsyncWebServerRequest *request);
+  // JPEG screenshot handler. Returns a JPEG-compressed screenshot
+  // suitable for direct viewing by an AI agent (no PIL conversion
+  // needed). Uses the P4's hardware JPEG encoder when available
+  // (SOC_JPEG_ENCODE_SUPPORTED); on chips without it (S2, S3,
+  // C3, C6) the handler returns 501 Not Implemented so the test
+  // harness can fall back to /autopanel/screenshot.bmp.
+  // The LVGL display buffer is RGB565; the handler converts to
+  // RGB888 in-place into a PSRAM scratch buffer before encoding.
+  // Output quality is fixed at 80 (visually lossless for UI text
+  // and arcs, ~5-10x smaller than the BMP at 1024x600).
+  void handle_screenshot_jpg_(class AsyncWebServerRequest *request);
   // Simulated input device (test harness helpers). Both drive the
   // default LVGL input device (the GT911 touchscreen) by injecting
   // press/release + point events. Triggered by 'C' and 'S' serial
   // commands (see loop()) and exercised by send_cmd.py click /
-  // scroll subcommands.
+  // scroll subcommands. The same functions are also called from
+  // the /autopanel/test/click and /autopanel/test/scroll HTTP
+  // handlers when agent_debug_ is true.
   void simulate_click_(int x, int y);
   void simulate_scroll_(int x1, int y1, int x2, int y2);
+  // Process a single-character command the same way the serial
+  // command parser does. Extracted so the web API can trigger the
+  // same state transitions ('g' for grid, '0'..'9' for detail, 'o'
+  // for sort, etc.) without needing the serial port to be free.
+  // Returns true if the command was recognized, false otherwise.
+  bool process_command_(char c);
+
+  // AGENT_DEBUG: opt-in /autopanel/test/* endpoints. Each handler
+  // checks agent_debug_ at the top and returns 404 if disabled, so
+  // the URL space is invisible to a non-test build.
+  void handle_test_click_(class AsyncWebServerRequest *request);
+  void handle_test_scroll_(class AsyncWebServerRequest *request);
+  void handle_test_cmd_(class AsyncWebServerRequest *request);
+  void handle_test_state_(class AsyncWebServerRequest *request);
 
   // LittleFS helpers
   bool mount_storage_();

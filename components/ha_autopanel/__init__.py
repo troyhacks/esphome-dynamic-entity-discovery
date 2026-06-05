@@ -70,6 +70,18 @@ CONFIG_SCHEMA = cv.Schema(
         # a room that has no recorded previous brightness. Used as the
         # bounce-back value.
         cv.Optional("default_on_pct", default=30): cv.int_range(min=1, max=100),
+        # AGENT_DEBUG: opt-in switch that exposes /autopanel/test/* HTTP
+        # endpoints (click, scroll, cmd, state). Default OFF so a
+        # production build does not allow an attacker on the same LAN
+        # to drive the panel, dump state, or trigger discovery by
+        # spoofing a few GET requests. Test/CI builds (e.g.
+        # test_dynamic_component.yaml) set this to true. There is no
+        # auth on the test endpoints by design - they are only useful
+        # in a controlled test environment, and adding a key check
+        # would make the test harness more brittle without raising
+        # the security bar meaningfully (an attacker on the LAN with
+        # the same WiFi key can already see the panel's full state).
+        cv.Optional("agent_debug", default=False): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -137,3 +149,6 @@ async def to_code(config):
     cg.add(var.set_start_x(config["start_x"]))
     cg.add(var.set_start_y(config["start_y"]))
     cg.add(var.set_default_on_pct(config["default_on_pct"]))
+    # AGENT_DEBUG: see schema comment. Off by default for production
+    # safety. Test yaml flips it on.
+    cg.add(var.set_agent_debug(config["agent_debug"]))

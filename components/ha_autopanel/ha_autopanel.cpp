@@ -1924,6 +1924,17 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   // the room title and the entity list. The entity list starts below
   // the title bar (y=36).
 
+  // Hide the home-name label while the detail page is open. Both
+  // title_home_label_ (e.g. "406 Brock Ave") and title_room_label_
+  // (e.g. "Front Room") are centered in the title bar, so showing
+  // both at once paints them on top of each other. show_room_grid_()
+  // un-hides the home label on the way back. (The user spotted the
+  // overlap in the v1.6 test screenshots - the room title was
+  // rendering under the home name on the detail page header.)
+  if (this->title_home_label_ != nullptr) {
+    lv_obj_add_flag(this->title_home_label_, LV_OBJ_FLAG_HIDDEN);
+  }
+
   // Room title - shown in the title bar (we move the status label out
   // of the way and put the room name in the center).
   if (this->title_bar_ != nullptr) {
@@ -3056,69 +3067,21 @@ void HaAutoPanel::loop() {
         continue;
       }
       switch (c) {
-        case 'p': case 'r':
-          this->probe_authorization_();
-          break;
-        case 's':
-          this->set_panel_state_(PanelState::SETUP_REQUIRED);
-          break;
-        case 'a':
-          this->set_panel_state_(PanelState::AUTH_FAILED);
-          break;
-        case 'n':
-          this->set_panel_state_(PanelState::NOT_AUTHORIZED);
-          break;
-        case 'c':
-          this->set_panel_state_(PanelState::CONNECTING);
-          break;
-        case 'g':
-          // Force a re-render of the room grid
-          this->set_panel_state_(PanelState::READY);
-          break;
-        case 'h':
-          // Force a re-fetch of the home-name label, bypassing the
-          // HOME_FETCH_INTERVAL_MS throttle. Useful for the test
-          // harness when verifying a fresh /api/states response
-          // (e.g. after the user changed the friendly_name in HA).
-          this->last_home_fetch_ms_ = 0;
-          this->fetch_home_name_();
-          break;
-        case 'o':
-          // Open the sort panel (the user-preferred popup-list way
-          // to reorder and hide rooms). The panel handles its own
-          // seeding from customizations_, so calling this even
-          // outside of edit mode works - it just looks the same.
-          this->show_sort_panel_();
-          break;
-        case 'O':
-          // Close the sort panel. (Pair to 'o'.)
-          this->hide_sort_panel_();
-          break;
         case 'C':
-          // The next line is "x y" - parse it on the next \n.
-          pending_cmd = 'C';
-          ESP_LOGI(TAG, "[cmd] click: awaiting x y");
-          break;
         case 'S':
-          // The next line is "x1 y1 x2 y2".
-          pending_cmd = 'S';
-          ESP_LOGI(TAG, "[cmd] scroll: awaiting x1 y1 x2 y2");
+          // The next line is the coordinate payload ("x y" for C,
+          // "x1 y1 x2 y2" for S). These are serial-only - the web
+          // API takes coordinates as query params. Hand off to the
+          // multi-line parser below.
+          pending_cmd = c;
+          ESP_LOGI(TAG, "[cmd] %s: awaiting coordinates",
+                   c == 'C' ? "click" : "scroll");
           break;
-        case 'd':
-          this->start_discovery_();
-          break;
-        case '0': case '1': case '2': case '3': case '4':
-        case '5': case '6': case '7': case '8': case '9': {
-          int idx = c - '0';
-          if (idx >= 0 && idx < (int) this->room_cards_.size()) {
-            ESP_LOGI(TAG, "[cmd] opening detail for room %d (%s)", idx,
-                     this->room_cards_[idx].area.name.c_str());
-            this->show_entity_detail_(idx);
-          }
-          break;
-        }
         default:
-          ESP_LOGW(TAG, "[cmd] unknown command '%c'", c);
+          // Every other single-char command is handled by the
+          // shared process_command_() helper so the web API can
+          // drive the exact same state transitions.
+          this->process_command_(c);
           break;
       }
     } else if (cmd_len < sizeof(cmd_buf) - 1) {
@@ -3624,6 +3587,160 @@ void HaAutoPanel::handle_screenshot_(AsyncWebServerRequest *request) {
   // do NOT free it here.
 }
 
+#if SOC_JPEG_ENCODE_SUPPORTED
+// JPEG driver headers. The functions used here are declared in
+// driver/jpeg_encode.h, the input format enum in
+// driver/jpeg_types.h, and SOC_JPEG_ENCODE_SUPPORTED is gated in
+// soc_caps.h (which is already pulled in via the esp-idf framework).
+#include "driver/jpeg_encode.h"
+#include "driver/jpeg_types.h"
+// JPEG screenshot path. P4 has a hardware JPEG encoder; the
+// handler builds an RGB888 scratch buffer in PSRAM, encodes it
+// with esp_jpeg, and streams the resulting bytes. Quality 80 is
+// visually lossless for LVGL-rendered UI (text edges, antialiased
+// arcs, solid fills) and the output is typically 80-200 KB at
+// 1024x600 - small enough to send over the existing AsyncWebServer
+// in one httpd_resp_send call without chunked transfer encoding.
+//
+// Older ESP32 family (S2, S3, C3, C6) lack the JPEG encoder; the
+// build system will leave this entire function out for them. The
+// web handler at /autopanel/screenshot.jpg returns 501 in that
+// case (see the URL match list and the runtime guard below).
+void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
+  lv_display_t* disp = lv_display_get_default();
+  if (disp == nullptr) {
+    request->send(500, "text/plain", "no display");
+    return;
+  }
+  // Force a synchronous refresh so the buffer matches what's on
+  // screen (same pattern as handle_screenshot_).
+  lv_refr_now(disp);
+
+  lv_draw_buf_t* draw_buf = lv_display_get_buf_active(disp);
+  if (draw_buf == nullptr || draw_buf->data == nullptr || draw_buf->data_size == 0) {
+    request->send(500, "text/plain", "no draw buffer");
+    return;
+  }
+  const int width = lv_display_get_horizontal_resolution(disp);
+  const int height = lv_display_get_vertical_resolution(disp);
+  if (width <= 0 || height <= 0) {
+    request->send(500, "text/plain", "bad dimensions");
+    return;
+  }
+
+  // Allocate the RGB888 scratch buffer. 1024*600*3 = 1.84 MB. PSRAM
+  // (32 MB on Crowpanel) has plenty of room. Fall back to internal
+  // heap if PSRAM is somehow unavailable (e.g. someone runs this
+  // build on a board without PSRAM).
+  const size_t rgb_size = (size_t)width * (size_t)height * 3u;
+  uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM);
+  if (rgb == nullptr) {
+    rgb = (uint8_t*)malloc(rgb_size);
+  }
+  if (rgb == nullptr) {
+    request->send(500, "text/plain", "OOM allocating RGB888 buffer");
+    return;
+  }
+
+  // RGB565 -> RGB888. The display buffer is RGB565 in
+  // little-endian byte order on this target (LV_COLOR_DEPTH=16).
+  // We pack three output bytes per pixel: R, G, B. Alpha is not
+  // used by JPEG. The draw buffer's data_size should equal
+  // width*height*2 - we trust that (validated by handle_screenshot_).
+  const uint16_t* src = (const uint16_t*)draw_buf->data;
+  uint8_t* dst = rgb;
+  const size_t npix = (size_t)width * (size_t)height;
+  for (size_t i = 0; i < npix; i++) {
+    uint16_t px = src[i];
+    // Expand 5/6/5 to 8/8/8 by replicating the MSBs into the LSBs.
+    // (px >> 8) is endian-dependent; the BMP path's RGB565 layout
+    // tells us the high byte is R-low5|G-high3 and low byte is
+    // G-low2|B-low5, so R is bits 11-15, G is 5-10, B is 0-4.
+    uint8_t r5 = (px >> 11) & 0x1F;
+    uint8_t g6 = (px >> 5)  & 0x3F;
+    uint8_t b5 =  px        & 0x1F;
+    dst[0] = (uint8_t)((r5 << 3) | (r5 >> 2));  // 5 -> 8 bits
+    dst[1] = (uint8_t)((g6 << 2) | (g6 >> 4));  // 6 -> 8 bits
+    dst[2] = (uint8_t)((b5 << 3) | (b5 >> 2));  // 5 -> 8 bits
+    dst += 3;
+  }
+
+  // JPEG output buffer. JPEG is typically 1/5 to 1/20 the size of
+  // raw RGB for UI content, so 256 KB is more than enough. If the
+  // encode somehow needs more (a very busy screen), we'll fail
+  // gracefully and return 500.
+  const size_t jpg_cap = 256 * 1024;
+  uint8_t* jpg = (uint8_t*)heap_caps_malloc(jpg_cap, MALLOC_CAP_SPIRAM);
+  if (jpg == nullptr) {
+    free(rgb);
+    request->send(500, "text/plain", "OOM allocating JPEG output buffer");
+    return;
+  }
+
+  // Build the encoder engine. The default priority + timeout=2000
+  // (2s) is fine for a 1024x600 encode (~50-100 ms on P4).
+  jpeg_encoder_handle_t enc = nullptr;
+  jpeg_encode_engine_cfg_t eng_cfg = {};
+  eng_cfg.intr_priority = 0;     // driver picks default
+  eng_cfg.timeout_ms = 2000;
+  esp_err_t err = jpeg_new_encoder_engine(&eng_cfg, &enc);
+  if (err != ESP_OK || enc == nullptr) {
+    free(rgb);
+    free(jpg);
+    request->send(500, "text/plain", "jpeg_new_encoder_engine failed");
+    return;
+  }
+
+  jpeg_encode_cfg_t cfg = {};
+  cfg.width = (uint32_t)width;
+  cfg.height = (uint32_t)height;
+  // Driver-level input format enum. There's also a HAL-level
+  // JPEG_ENC_SRC_RGB888 that has the same numeric value
+  // (COLOR_TYPE_ID(COLOR_SPACE_RGB, COLOR_PIXEL_RGB888)) but is
+  // a different typedef - using it here triggers a C++ narrowing
+  // error. The driver enum (jpeg_enc_input_format_t) is what
+  // jpeg_encode_cfg_t::src_type expects.
+  cfg.src_type = JPEG_ENCODE_IN_FORMAT_RGB888;
+  cfg.sub_sample = JPEG_DOWN_SAMPLING_YUV422;  // 4:2:2 - good for UI
+  cfg.image_quality = 80;
+
+  uint32_t jpg_size = 0;
+  err = jpeg_encoder_process(enc, &cfg, rgb, (uint32_t)rgb_size,
+                             jpg, (uint32_t)jpg_cap, &jpg_size);
+  // Always release the encoder + scratch buffers, even on error.
+  // rgb is large; we'd rather leak the 1.84MB than re-encode the
+  // frame if the encoder doesn't release its own memory.
+  // jpeg_del_encoder_engine is safe to call regardless of process
+  // result.
+  jpeg_del_encoder_engine(enc);
+  free(rgb);
+
+  if (err != ESP_OK) {
+    free(jpg);
+    request->send(500, "text/plain", "jpeg_encoder_process failed");
+    return;
+  }
+
+  // Send the JPEG. The handler runs on the httpd task, not the
+  // LVGL task, so it's safe to block here on httpd_resp_send. The
+  // jpg buffer is owned by httpd after this call (same contract as
+  // the BMP path) so do not free it.
+  httpd_req_t* req = *request;  // operator httpd_req_t*()
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition",
+                     "inline; filename=\"screenshot.jpg\"");
+  esp_err_t send_err = httpd_resp_send(req, (const char*)jpg, (ssize_t)jpg_size);
+  if (send_err != ESP_OK) {
+    ESP_LOGE(TAG, "[screenshot.jpg] httpd_resp_send failed: %d", (int)send_err);
+    // httpd may not own the buffer if send failed; free here.
+    free(jpg);
+  } else {
+    ESP_LOGI(TAG, "[screenshot.jpg] sent %dx%d JPEG (%u bytes, src=%u bytes)",
+             width, height, (unsigned)jpg_size, (unsigned)rgb_size);
+  }
+}
+#endif  // SOC_JPEG_ENCODE_SUPPORTED
+
 void HaAutoPanel::register_web_handler_() {
   if (this->web_handler_registered_) return;
   if (web_server_base::global_web_server_base == nullptr) {
@@ -3638,8 +3755,18 @@ void HaAutoPanel::register_web_handler_() {
     bool canHandle(AsyncWebServerRequest *request) const override {
       char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
       std::string url(request->url_to(url_buf).str());
+      // Always-present URL space. The /autopanel/test/* URLs are
+      // appended at the end only when agent_debug_ is true (see
+      // the if-block in register_web_handler_) so a production
+      // build's canHandle will not match the test URLs and they
+      // will look like 404s to anyone scanning the device.
       return url == "/autopanel" || url == "/autopanel/save" || url == "/autopanel/reset"
-          || url == "/autopanel/customizations" || url == "/autopanel/screenshot.bmp";
+          || url == "/autopanel/customizations" || url == "/autopanel/screenshot.bmp"
+          || url == "/autopanel/screenshot.jpg"
+          || url == "/autopanel/test/click"
+          || url == "/autopanel/test/scroll"
+          || url == "/autopanel/test/cmd"
+          || url == "/autopanel/test/state";
     }
     void handleRequest(AsyncWebServerRequest *request) override {
       char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
@@ -3679,6 +3806,51 @@ void HaAutoPanel::register_web_handler_() {
         } else {
           request->send(405, "text/plain", "Method not allowed");
         }
+      } else if (url == "/autopanel/screenshot.jpg") {
+        if (request->method() == HTTP_GET) {
+#if SOC_JPEG_ENCODE_SUPPORTED
+          parent_->handle_screenshot_jpg_(request);
+#else
+          request->send(501, "text/plain",
+                        "JPEG encoder not available on this chip");
+#endif
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/click") {
+        // AGENT_DEBUG gated. Reject the request with 404 when the
+        // gate is off so the URL appears non-existent.
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET || request->method() == HTTP_POST) {
+          parent_->handle_test_click_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/scroll") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET || request->method() == HTTP_POST) {
+          parent_->handle_test_scroll_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/cmd") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET || request->method() == HTTP_POST) {
+          parent_->handle_test_cmd_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/state") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET) {
+          parent_->handle_test_state_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
       } else {
         request->send(404, "text/plain", "Not found");
       }
@@ -3689,7 +3861,152 @@ void HaAutoPanel::register_web_handler_() {
 
   web_server_base::global_web_server_base->add_handler(new AutoPanelHandler(this));
   this->web_handler_registered_ = true;
-  ESP_LOGI(TAG, "Web handler registered for /autopanel, /autopanel/customizations");
+  ESP_LOGI(TAG, "Web handler registered for /autopanel, /autopanel/customizations%s",
+           this->agent_debug_ ? " (agent_debug ON - test API exposed)"
+                              : "");
+}
+
+// ----------------------------------------------------------------------------
+// AGENT_DEBUG: /autopanel/test/* handler bodies
+//
+// These endpoints let a test harness on the same LAN drive the panel
+// without holding the serial port. Coordinates and one-char commands
+// come in as query params. The web URL space is gated by agent_debug_
+// at registration time (404 otherwise). The handlers themselves
+// assume the gate is on - register_web_handler_() already 404s on
+// non-debug builds.
+// ----------------------------------------------------------------------------
+
+// Helper: pull a numeric query param from an AsyncWebServerRequest.
+// Returns defval if the param is missing or not a valid integer.
+// The handler logs the value at INFO so the test harness can see
+// what was actually received (useful when a typo in the URL turns
+// 123 into 0 silently).
+static int get_int_query_(AsyncWebServerRequest *request, const char* key, int defval) {
+  if (!request->hasParam(key)) return defval;
+  const char* raw = request->getParam(key)->value().c_str();
+  char* end = nullptr;
+  long v = strtol(raw, &end, 10);
+  if (end == raw || *end != '\0') {
+    ESP_LOGW("ha_autopanel", "[test] %s=%s is not an integer, using %d", key, raw, defval);
+    return defval;
+  }
+  return (int) v;
+}
+
+void HaAutoPanel::handle_test_click_(AsyncWebServerRequest *request) {
+  // GET /autopanel/test/click?x=N&y=M
+  // POST same shape (used when the test harness wants the click
+  // form-encoded rather than in the URL).
+  int x = get_int_query_(request, "x", -1);
+  int y = get_int_query_(request, "y", -1);
+  if (x < 0 || y < 0) {
+    request->send(400, "text/plain", "missing or invalid x/y");
+    return;
+  }
+  ESP_LOGI(TAG, "[test] click at (%d, %d)", x, y);
+  this->simulate_click_(x, y);
+  // 200 with a small body so the test harness can confirm the
+  // request was accepted (LVGL's own CLICKED events are async -
+  // the actual tap effect on the screen happens after we return).
+  char body[64];
+  snprintf(body, sizeof(body), "click %d %d queued\n", x, y);
+  request->send(200, "text/plain", body);
+}
+
+void HaAutoPanel::handle_test_scroll_(AsyncWebServerRequest *request) {
+  // GET /autopanel/test/scroll?x1=N&y1=N&x2=N&y2=N
+  int x1 = get_int_query_(request, "x1", -1);
+  int y1 = get_int_query_(request, "y1", -1);
+  int x2 = get_int_query_(request, "x2", -1);
+  int y2 = get_int_query_(request, "y2", -1);
+  if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0) {
+    request->send(400, "text/plain", "missing or invalid x1/y1/x2/y2");
+    return;
+  }
+  ESP_LOGI(TAG, "[test] scroll (%d,%d) -> (%d,%d)", x1, y1, x2, y2);
+  this->simulate_scroll_(x1, y1, x2, y2);
+  char body[96];
+  snprintf(body, sizeof(body), "scroll %d %d %d %d queued\n", x1, y1, x2, y2);
+  request->send(200, "text/plain", body);
+}
+
+void HaAutoPanel::handle_test_cmd_(AsyncWebServerRequest *request) {
+  // GET /autopanel/test/cmd?c=X (or POST with the same query param)
+  // c is a single character that is the same as the serial command
+  // set: g=grid, 0-9=detail page, o=open sort, O=close sort,
+  // s/a/n/c=force state, h=home-name refresh, d=discovery,
+  // p/r=auth probe. C and S (click/scroll) are rejected here
+  // because they need coordinate payloads - the harness should
+  // use /autopanel/test/click and /autopanel/test/scroll instead.
+  if (!request->hasParam("c")) {
+    request->send(400, "text/plain", "missing c=");
+    return;
+  }
+  std::string c = request->getParam("c")->value();
+  if (c.size() != 1) {
+    request->send(400, "text/plain", "c must be a single character");
+    return;
+  }
+  char ch = c[0];
+  if (ch == 'C' || ch == 'S') {
+    request->send(400, "text/plain",
+                  "C/S need coordinates - use /test/click or /test/scroll");
+    return;
+  }
+  bool ok = this->process_command_(ch);
+  char body[64];
+  snprintf(body, sizeof(body), "cmd '%c' -> %s\n", ch, ok ? "ok" : "unknown");
+  request->send(ok ? 200 : 400, "text/plain", body);
+}
+
+// Stringify the current PanelState for the /test/state response.
+// Matches the enum class PanelState defined earlier; kept as a
+// free function so we don't grow the header with one more
+// internal helper.
+static const char* panel_state_name_(PanelState s) {
+  switch (s) {
+    case PanelState::BOOTING:         return "BOOTING";
+    case PanelState::SETUP_REQUIRED:  return "SETUP_REQUIRED";
+    case PanelState::AUTH_FAILED:     return "AUTH_FAILED";
+    case PanelState::NOT_AUTHORIZED:  return "NOT_AUTHORIZED";
+    case PanelState::CONNECTING:      return "CONNECTING";
+    case PanelState::READY:           return "READY";
+  }
+  return "?";
+}
+
+void HaAutoPanel::handle_test_state_(AsyncWebServerRequest *request) {
+  // GET /autopanel/test/state - returns a small text snapshot of
+  // panel state for the test harness. Format: one key=value per
+  // line, easy to grep or parse.
+  std::string body;
+  body += std::string("panel_state=") + panel_state_name_(this->state_) + "\n";
+  body += std::string("room_count=") + std::to_string(this->room_cards_.size()) + "\n";
+  body += std::string("current_room_index=") + std::to_string(this->current_room_index_) + "\n";
+  body += std::string("edit_mode=") + (this->edit_mode_ ? "1" : "0") + "\n";
+  body += std::string("in_edit_session=") + (this->in_edit_session_ ? "1" : "0") + "\n";
+  body += std::string("agent_debug=1\n");
+  body += std::string("home_name=") + this->home_name_ + "\n";
+  body += std::string("ha_api_url=") + this->ha_api_url_ + "\n";
+  body += std::string("screen=") + std::to_string(this->screen_width_) + "x"
+        + std::to_string(this->screen_height_) + "\n";
+  // jpeg_available lets the test script make a clean one-shot
+  // decision: if the device advertises JPEG, hit /screenshot.jpg
+  // (much smaller payload, no Python BMP->PNG conversion). If
+  // not, fall back to /screenshot.bmp. This is checked once at
+  // the start of the test run, not on every screenshot.
+#if SOC_JPEG_ENCODE_SUPPORTED
+  body += std::string("jpeg_available=1\n");
+#else
+  body += std::string("jpeg_available=0\n");
+#endif
+  // The IDF AsyncWebServerRequest wrapper takes const char* for
+  // the body, not std::string& (the Arduino variant does, but
+  // we're on esp-idf). The handler returns immediately so the
+  // std::string temporary lives long enough for the underlying
+  // httpd_resp_send to copy it out.
+  request->send(200, "text/plain", body.c_str());
 }
 
 void HaAutoPanel::handle_setup_get_(AsyncWebServerRequest *request) {
@@ -4682,6 +4999,73 @@ void HaAutoPanel::refresh_room_cards_() {
   // Update the title bar so the room count / status reflects the new view
   this->update_title_bar_();
   ESP_LOGI(TAG, "Room cards refreshed (edit_mode=%d)", (int) this->edit_mode_);
+}
+
+bool HaAutoPanel::process_command_(char c) {
+  // Single-character command dispatch shared by the serial input
+  // loop and the AGENT_DEBUG web API (/autopanel/test/cmd?c=X).
+  // Returns true if c was a recognized command, false otherwise.
+  // 'C' and 'S' are intentionally NOT handled here - they are
+  // multi-line (the next line is the coordinate payload) and only
+  // make sense on the serial path. The web API has separate
+  // /autopanel/test/click and /autopanel/test/scroll endpoints
+  // that take coordinates as query params.
+  switch (c) {
+    case 'p': case 'r':
+      this->probe_authorization_();
+      return true;
+    case 's':
+      this->set_panel_state_(PanelState::SETUP_REQUIRED);
+      return true;
+    case 'a':
+      this->set_panel_state_(PanelState::AUTH_FAILED);
+      return true;
+    case 'n':
+      this->set_panel_state_(PanelState::NOT_AUTHORIZED);
+      return true;
+    case 'c':
+      this->set_panel_state_(PanelState::CONNECTING);
+      return true;
+    case 'g':
+      // Force a re-render of the room grid
+      this->set_panel_state_(PanelState::READY);
+      return true;
+    case 'h':
+      // Force a re-fetch of the home-name label, bypassing the
+      // HOME_FETCH_INTERVAL_MS throttle. Useful for the test
+      // harness when verifying a fresh /api/states response
+      // (e.g. after the user changed the friendly_name in HA).
+      this->last_home_fetch_ms_ = 0;
+      this->fetch_home_name_();
+      return true;
+    case 'o':
+      // Open the sort panel (the user-preferred popup-list way
+      // to reorder and hide rooms). The panel handles its own
+      // seeding from customizations_, so calling this even
+      // outside of edit mode works - it just looks the same.
+      this->show_sort_panel_();
+      return true;
+    case 'O':
+      // Close the sort panel. (Pair to 'o'.)
+      this->hide_sort_panel_();
+      return true;
+    case 'd':
+      this->start_discovery_();
+      return true;
+    case '0': case '1': case '2': case '3': case '4':
+    case '5': case '6': case '7': case '8': case '9': {
+      int idx = c - '0';
+      if (idx >= 0 && idx < (int) this->room_cards_.size()) {
+        ESP_LOGI(TAG, "[cmd] opening detail for room %d (%s)", idx,
+                 this->room_cards_[idx].area.name.c_str());
+        this->show_entity_detail_(idx);
+      }
+      return true;
+    }
+    default:
+      ESP_LOGW(TAG, "[cmd] unknown command '%c'", c);
+      return false;
+  }
 }
 
 void HaAutoPanel::simulate_click_(int x, int y) {
