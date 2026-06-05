@@ -1985,8 +1985,17 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
                  (this->screen_width_ - (int)lv_obj_get_self_width(this->title_room_label_)) / 2);
   }
 
-  // Entity list - start below title bar
-  int y_offset = 50;
+  // Entity list - start below title bar. v1.18: bumped from y=50
+  // to y=70 so the first entity isn't right at the title bar's
+  // bottom edge. The title bar ends at y=36 and has a 1px
+  // bottom border; starting at y=50 left the first row's top
+  // edge only 13px from the bar. y=70 gives a 34px gap, which
+  // is the same as the room card's start_y_ (the cards start 40
+  // below the top of main_container_, which sits at y=0 - so the
+  // cards effectively have 40px top padding in the grid view).
+  // Standardizing the detail page to ~40px top padding makes the
+  // two pages feel visually consistent.
+  int y_offset = 70;
   for (size_t i = 0; i < room.entities.size(); i++) {
     create_entity_control_(this->detail_container_, room.entities[i], (int)i, y_offset, room.color);
     y_offset += 80;
