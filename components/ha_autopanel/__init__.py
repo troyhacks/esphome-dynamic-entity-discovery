@@ -1,10 +1,11 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
-from esphome.components import http_request, wifi, web_server_base
+from esphome.components import http_request, time, wifi, web_server_base
 from esphome.components.esp32 import add_idf_component, include_builtin_idf_component
+from esphome.components.lvgl.defines import add_define as lv_add_define
 
-DEPENDENCIES = ["lvgl", "http_request", "api", "wifi", "web_server_base"]
+DEPENDENCIES = ["lvgl", "http_request", "api", "time", "wifi", "web_server_base"]
 
 ha_autopanel_ns = cg.esphome_ns.namespace("ha_autopanel")
 
@@ -12,12 +13,39 @@ HaAutoPanel = ha_autopanel_ns.class_(
     "HaAutoPanel", cg.Component
 )
 
+# Force-enable the LVGL flex layout at module-load time. ESPHome's
+# lvgl component defaults LV_USE_FLEX to 0 in the generated
+# lv_conf.h. Our title-bar right cluster and the room grid both
+# use lv_obj_set_flex_flow so the layout reflows across screen
+# widths and rotation - absolute x/y positions would break under
+# rotation or any other screen-size change.
+#
+# This call has to happen at module load (NOT inside to_code())
+# because lvgl's to_code() reads its defines dict and generates
+# lv_conf.h in a single pass. ha_autopanel is processed AFTER
+# lvgl (lvgl is in our DEPENDENCIES), so calling lv_add_define()
+# from our to_code() would happen too late - lv_conf.h is already
+# written. Module-load is the earliest point the import system
+# gives us, which is well before any to_code() runs.
+lv_add_define("LV_USE_FLEX", "1")
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(HaAutoPanel),
         cv.Required("ha_api_url"): cv.url,
-        cv.Required("ha_api_password"): cv.string,
+        # ha_api_password is now optional. The user might be still
+        # setting up their token, or the device might be running
+        # purely as a read-only display before they wire it to HA.
+        # The C++ side already checks for an empty string and
+        # gracefully degrades (auth-required features get skipped;
+        # fetch_home_name_() exits early; the panel shows
+        # SETUP_REQUIRED if HA calls would be made).
+        cv.Optional("ha_api_password", default=""): cv.string,
         cv.Optional("http_request_ref"): cv.use_id(http_request.HttpRequestComponent),
+        # Optional SNTP-backed time component. When set, the title bar's
+        # clock + the debug panel's Date/Time section read from it.
+        # The user's yaml must declare one (see test_dynamic_component.yaml).
+        cv.Optional("time_ref"): cv.use_id(time.RealTimeClock),
         cv.Optional("include_all", default=True): cv.boolean,
         # All filtering options default to empty so the user doesn't have
         # to hardcode them in YAML. In the no-code vision, these are
@@ -51,6 +79,10 @@ async def to_code(config):
     # too late to affect lv_conf.h generation. Widgets used by the C++ code
     # must be declared in the user's YAML under lvgl.widgets:.
 
+    # The LV_USE_FLEX define is set at module load time (see the top
+    # of this file) so it's in CORE.data before lvgl's to_code()
+    # generates lv_conf.h. Adding it here would be too late.
+
     # Enable the action-response defines so we can build HomeassistantActionRequest
     # with a call_id and surface the response back to C++ for the auth probe.
     # The api component only sets these if the user has a YAML automation with
@@ -79,6 +111,13 @@ async def to_code(config):
     if "http_request_ref" in config:
         http_request_var = await cg.get_variable(config["http_request_ref"])
         cg.add(var.set_http_request(http_request_var))
+
+    # Get the SNTP time component (optional - the title bar shows
+    # "--:--" until this is wired up). The user's YAML must declare
+    # a `time:` block with a `time_ref` here.
+    if "time_ref" in config:
+        time_var = await cg.get_variable(config["time_ref"])
+        cg.add(var.set_time(time_var))
 
     # The wifi component is accessed directly via wifi::global_wifi_component
     # in C++ - no Python-side reference needed. The component has a hard
