@@ -439,18 +439,10 @@ class HaAutoPanel : public Component {
   // older "Show hidden (N)" button + hidden_panel_ + drag-to-reorder
   // gesture paths, which the user found jumpy and didn't save).
   lv_obj_t* title_sort_btn_{nullptr};
-  // "Sort" button in the title bar. Visible only in edit mode. Tapping
-  // it opens sort_panel_, a full-screen list view of every room with
-  // up/down arrow buttons and a Hide/Show toggle per row. The user
-  // sorts and toggles there, then taps Apply to persist to
-  // /storage/customizations.cfg and re-render the grid. This is the
-  // recommended way to reorder rooms (replaces the drag-to-reorder
-  // gesture, which the user found jumpy and didn't save).
-  lv_obj_t* title_sort_btn_{nullptr};
   // Full-screen sort & hide overlay. Created lazily on the first tap
   // of title_sort_btn_, rebuilt every show so live state is current.
   // Lives as a child of the screen. Same lazy-create / rebuild-on-show
-  // pattern as hidden_panel_ and debug_panel_.
+  // pattern as debug_panel_.
   lv_obj_t* sort_panel_{nullptr};
   // Local copy of the room order while the sort panel is open. On
   // Apply, this is what we persist to customizations_.room_order.

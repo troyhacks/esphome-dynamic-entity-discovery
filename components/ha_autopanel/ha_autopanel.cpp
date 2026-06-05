@@ -1807,14 +1807,349 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
     std::string* p = (std::string*)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(event));
     delete p;
   }, LV_EVENT_DELETE, nullptr);
-  // Free the heap string when the row is destroyed.
+}
+
+void HaAutoPanel::show_entity_detail_(int room_index) {
+  ESP_LOGI(TAG, "Showing entity detail for room index %d", room_index);
+
+  if (room_index < 0 || room_index >= (int)room_cards_.size()) {
+    ESP_LOGW(TAG, "Invalid room index %d", room_index);
+    return;
+  }
+
+  const RoomCard& room = room_cards_[room_index];
+  this->current_room_index_ = room_index;
+
+  // Hide main container
+  if (this->main_container_) {
+    lv_obj_scroll_to_y(this->main_container_, 0, LV_ANIM_OFF);  // Reset scroll to top
+    lv_obj_add_flag(this->main_container_, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // Create detail container if not exists
+  if (this->detail_container_) {
+    lv_obj_del(this->detail_container_);
+    // Per-render registries for the entity detail view start fresh.
+    // The room-level registries were cleared at the top of create_room_card_()
+    // and are not used in the detail view.
+    this->arc_records_.clear();
+    this->control_records_.clear();
+  }
+
+  lv_obj_t* screen = lv_scr_act();
+  this->detail_container_ = lv_obj_create(screen);
+  // Sit *below* the title bar instead of overlapping it. The title bar is a
+  // child of the screen at y=0, height 36. Putting the detail container at
+  // y=36 keeps it from covering the status dot/label, the Back button, and
+  // the (later-added) room name label. Earlier this was at y=0, which left
+  // the title bar invisible because the detail container was created after
+  // the title bar and therefore sat on top of it in z-order.
+  lv_obj_set_pos(this->detail_container_, 0, 36);
+  lv_obj_set_size(this->detail_container_, this->screen_width_, this->screen_height_ - 36);
+
+  // Show the back button (hidden on the grid page) and re-create the
+  // title bar with the back button visible.
+  if (this->title_back_btn_ != nullptr) {
+    lv_obj_remove_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_edit_btn_ != nullptr) {
+    // Replace the Edit button with a Done button on the detail page
+    lv_obj_t* edit_label = lv_obj_get_child(this->title_edit_btn_, 0);
+    if (edit_label != nullptr) {
+      lv_label_set_text(edit_label, "Done");
+    }
+  }
+  // Defense in depth: make sure the title bar is the topmost child of the
+  // screen, even after this new detail container was added underneath.
+  if (this->title_bar_ != nullptr) {
+    lv_obj_move_foreground(this->title_bar_);
+  }
+  // Update the title bar (the status dot/label stay the same, but the
+  // back button visibility changed and we may want to show the room name
+  // in the title).
+  lv_obj_set_style_bg_color(this->detail_container_, lv_color_hex(0x111827), 0);
+  lv_obj_set_scrollbar_mode(this->detail_container_, LV_SCROLLBAR_MODE_OFF);  // Clean, no scrollbar
+  lv_obj_set_style_pad_all(this->detail_container_, 0, 0);  // No padding
+  lv_obj_set_style_border_width(this->detail_container_, 0, 0);  // No border
+
+  // The room name (centered in the title bar area). Set the bar above
+  // the detail body which starts at y=36.
+  if (this->title_status_label_ != nullptr) {
+    // Move status to make room for the room title in the middle
+    lv_obj_set_pos(this->title_status_label_, 110, 11);
+  }
+
+  // The back button is in the title bar (top-left). Here we just add
+  // the room title and the entity list. The entity list starts below
+  // the title bar (y=36).
+
+  // Room title - shown in the title bar (we move the status label out
+  // of the way and put the room name in the center).
+  if (this->title_bar_ != nullptr) {
+    if (this->title_room_label_ == nullptr) {
+      this->title_room_label_ = lv_label_create(this->title_bar_);
+      lv_obj_set_style_text_color(this->title_room_label_, lv_color_hex(0xFFFFFF), 0);
+    }
+    lv_label_set_text(this->title_room_label_, room.area.name.c_str());
+    // Center horizontally in the title bar. y=8 puts the text roughly centered
+    // vertically inside the 36px-tall bar.
+    lv_obj_set_pos(this->title_room_label_,
+                   (this->screen_width_ - (int)lv_obj_get_self_width(this->title_room_label_)) / 2,
+                   8);
+    // Re-center on next layout pass in case the width changed (long room names)
+    lv_obj_update_layout(this->title_room_label_);
+    lv_obj_set_x(this->title_room_label_,
+                 (this->screen_width_ - (int)lv_obj_get_self_width(this->title_room_label_)) / 2);
+  }
+
+  // Entity list - start below title bar
+  int y_offset = 50;
+  for (size_t i = 0; i < room.entities.size(); i++) {
+    create_entity_control_(this->detail_container_, room.entities[i], (int)i, y_offset, room.color);
+    y_offset += 80;
+  }
+
+  // Expand container height to fit all entities for scrolling
+  int total_content_height = y_offset + 20;  // Add some padding at bottom
+  if (total_content_height > 600) {
+    lv_obj_set_style_height(this->detail_container_, total_content_height, LV_PART_MAIN);
+    ESP_LOGI(TAG, "Expanded detail container to %d px for %d entities", total_content_height, (int)room.entities.size());
+  }
+
+  // Make sure the detail page opens scrolled to the top. The container is
+  // newly created so it should already be at 0, but be explicit in case LVGL
+  // is mid-tick and the first paint of the long content pulls the scroll.
+  lv_obj_scroll_to_y(this->detail_container_, 0, LV_ANIM_OFF);
+
+  if (room.entities.empty()) {
+    lv_obj_t* no_entities = lv_label_create(this->detail_container_);
+    lv_label_set_text(no_entities, "No entities in this room");
+    lv_obj_set_style_text_color(no_entities, lv_color_hex(0x888888), 0);
+    lv_obj_set_pos(no_entities, 50, 100);
+  }
+
+  ESP_LOGI(TAG, "Entity detail view created with %d entities", (int)room.entities.size());
+}
+
+void HaAutoPanel::show_room_grid_() {
+  ESP_LOGI(TAG, "Showing room grid");
+
+  // Hide detail container
+  if (this->detail_container_) {
+    lv_obj_add_flag(this->detail_container_, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // Show main container
+  if (this->main_container_) {
+    lv_obj_scroll_to_y(this->main_container_, 0, LV_ANIM_OFF);  // Reset scroll to top
+    lv_obj_remove_flag(this->main_container_, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // Restore the title bar to the grid-page state. show_entity_detail_ set
+  // the back button visible and renamed "Edit" -> "Done"; both need to
+  // revert so the grid page is identical to the first boot.
+  if (this->title_back_btn_ != nullptr) {
+    lv_obj_add_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_edit_btn_ != nullptr) {
+    lv_obj_t* edit_label = lv_obj_get_child(this->title_edit_btn_, 0);
+    if (edit_label != nullptr) {
+      lv_label_set_text(edit_label, "Edit");
+    }
+  }
+  if (this->title_room_label_ != nullptr) {
+    lv_obj_add_flag(this->title_room_label_, LV_OBJ_FLAG_HIDDEN);
+  }
+  // Put the status label back where it lives on the grid page (top-left
+  // status area) â€” show_entity_detail_ shifted it right to make room
+  // for the room name.
+  if (this->title_status_label_ != nullptr) {
+    lv_obj_set_pos(this->title_status_label_, 32, 11);
+  }
+
+  this->current_room_index_ = -1;
+}
+
+void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int entity_index, int y_pos, uint32_t color) {
+  if (this->is_entity_hidden_(entity.entity_id)) {
+    ESP_LOGI(TAG, "Skipping hidden entity: %.*s",
+             (int) entity.entity_id.size(), entity.entity_id.data());
+    return;
+  }
+
+  lv_obj_t* control = lv_obj_create((lv_obj_t*) parent);
+  lv_obj_set_pos(control, 32, y_pos);
+  lv_obj_set_size(control, 960, 70);
+  lv_obj_set_style_bg_color(control, lv_color_hex(0x1a1a2e), 0);
+  lv_obj_set_style_radius(control, 8, 0);
+  lv_obj_set_style_border_width(control, 1, 0);
+  lv_obj_set_style_border_color(control, lv_color_hex(color), 0);
+  lv_obj_set_scrollbar_mode(control, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_remove_flag(control, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Row layout: [Name] [State badge] [Domain] [Arc/%] [Hide X]
+
+  // Name (left, vcenter). .data() is null-terminated because the
+  // underlying string_view points into a std::string.
+  lv_obj_t* name_label = lv_label_create(control);
+  lv_label_set_text(name_label, entity.name.data());
+  lv_obj_set_style_text_color(name_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 15, 0);
+
+  // State badge (color-coded: on=green, off/unknown=gray, else=amber)
+  lv_obj_t* state_label = lv_label_create(control);
+  const char* state_text = entity.state.empty() ? "--" : entity.state.c_str();
+  uint32_t state_color;
+  if (entity.state == "on") {
+    state_color = 0x22DD55;
+  } else if (entity.state == "off" || entity.state == "unavailable" || entity.state == "unknown") {
+    state_color = 0x888888;
+  } else {
+    state_color = 0xFFCC44;
+  }
+  lv_label_set_text(state_label, state_text);
+  lv_obj_set_style_text_color(state_label, lv_color_hex(state_color), 0);
+  lv_obj_align(state_label, LV_ALIGN_LEFT_MID, 250, 0);
+
+  // Domain (middle)
+  lv_obj_t* domain_label = lv_label_create(control);
+  if (entity.domain == "binary_sensor") {
+    lv_label_set_text(domain_label, "contact");
+  } else if (entity.domain == "light") {
+    lv_label_set_text(domain_label, "light");
+  } else {
+    lv_label_set_text(domain_label, entity.domain.data());
+  }
+  lv_obj_set_style_text_color(domain_label, lv_color_hex(color), 0);
+  lv_obj_align(domain_label, LV_ALIGN_LEFT_MID, 380, 0);
+
+  if (entity.domain == "light" && entity.has_brightness) {
+    uint8_t initial_pct = (entity.state == "on" && entity.brightness > 0)
+        ? static_cast<uint8_t>((entity.brightness * 100) / 255)
+        : 0;
+    lv_obj_t* arc = lv_arc_create(control);
+    lv_obj_set_size(arc, 50, 50);
+    lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -150, 0);
+    lv_arc_set_min_value(arc, 0);
+    lv_arc_set_max_value(arc, 100);
+    lv_arc_set_value(arc, initial_pct);
+    lv_arc_set_bg_start_angle(arc, 135);
+    lv_arc_set_bg_end_angle(arc, 405);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(0x404040), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(color), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arc, 6, LV_PART_INDICATOR);
+
+    lv_obj_t* pct_label = lv_label_create(control);
+    lv_label_set_text_fmt(pct_label, "%d%%", initial_pct);
+    lv_obj_set_style_text_color(pct_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(pct_label, LV_ALIGN_RIGHT_MID, -100, 0);
+
+    ArcRecord arc_rec;
+    arc_rec.entity_id = entity.entity_id;
+    arc_rec.area_id = entity.area_id;
+    arc_rec.pct_label = pct_label;
+    arc_rec.is_room_arc = false;
+    this->arc_records_.push_back(arc_rec);
+    size_t arc_idx = this->arc_records_.size() - 1;
+    lv_obj_set_user_data(arc, (void*)(intptr_t)arc_idx);
+
+    lv_obj_add_event_cb(arc, [](lv_event_t* event) {
+      lv_obj_t* arc = (lv_obj_t*)lv_event_get_target(event);
+      int value = lv_arc_get_value(arc);
+      size_t idx = (size_t)(intptr_t)lv_obj_get_user_data(arc);
+      if (s_instance != nullptr && idx < s_instance->arc_records_.size()) {
+        lv_obj_t* label = s_instance->arc_records_[idx].pct_label;
+        if (label != nullptr) lv_label_set_text_fmt(label, "%d%%", value);
+      }
+    }, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    lv_obj_add_event_cb(arc, [](lv_event_t* event) {
+      lv_obj_t* arc = (lv_obj_t*)lv_event_get_target(event);
+      size_t idx = (size_t)(intptr_t)lv_obj_get_user_data(arc);
+      if (s_instance == nullptr || idx >= s_instance->arc_records_.size()) return;
+      const auto& rec = s_instance->arc_records_[idx];
+      int value = lv_arc_get_value(arc);
+      if (value <= 0) {
+        s_instance->call_ha_service_("light.turn_off", "entity_id", rec.entity_id, -1);
+      } else {
+        s_instance->call_ha_service_("light.turn_on", "entity_id", rec.entity_id, value);
+      }
+    }, LV_EVENT_RELEASED, nullptr);
+  } else if (entity.domain == "switch") {
+    lv_obj_t* toggle_btn = lv_obj_create(control);
+    lv_obj_set_size(toggle_btn, 100, 40);
+    lv_obj_align(toggle_btn, LV_ALIGN_RIGHT_MID, -120, 0);
+    lv_obj_set_style_radius(toggle_btn, 6, 0);
+    lv_obj_set_style_bg_color(toggle_btn, lv_color_hex(0x333333), 0);
+    lv_obj_t* toggle_label = lv_label_create(toggle_btn);
+    lv_label_set_text(toggle_label, "Toggle");
+    lv_obj_set_style_text_color(toggle_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(toggle_label);
+
+    ControlRecord rec;
+    rec.entity_id = entity.entity_id;
+    rec.area_id = entity.area_id;
+    rec.domain = "switch";
+    rec.btn = toggle_btn;
+    rec.state_label = toggle_label;
+    this->control_records_.push_back(rec);
+    size_t btn_idx = this->control_records_.size() - 1;
+    lv_obj_set_user_data(toggle_btn, (void*)(intptr_t)btn_idx);
+
+    lv_obj_add_event_cb(toggle_btn, [](lv_event_t* event) {
+      lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
+      size_t idx = (size_t)(intptr_t)lv_obj_get_user_data(btn);
+      if (s_instance == nullptr || idx >= s_instance->control_records_.size()) return;
+      const auto& rec = s_instance->control_records_[idx];
+      s_instance->call_ha_service_("switch.toggle", "entity_id", rec.entity_id, -1);
+    }, LV_EVENT_CLICKED, nullptr);
+  }
+
+  // Per-entity hide (X) button - far right. Tap to add the entity
+  // to the hidden_entities set, persist, and re-render the detail
+  // view.
+  lv_obj_t* hide_btn = lv_obj_create(control);
+  lv_obj_set_size(hide_btn, 40, 40);
+  lv_obj_align(hide_btn, LV_ALIGN_RIGHT_MID, -15, 0);
+  lv_obj_set_style_radius(hide_btn, 20, 0);
+  lv_obj_set_style_bg_color(hide_btn, lv_color_hex(0x3a1a1a), 0);
+  lv_obj_set_style_border_width(hide_btn, 1, 0);
+  lv_obj_set_style_border_color(hide_btn, lv_color_hex(0xAA4444), 0);
+  lv_obj_set_scrollbar_mode(hide_btn, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_remove_flag(hide_btn, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* hide_label = lv_label_create(hide_btn);
+  lv_label_set_text(hide_label, "X");
+  lv_obj_set_style_text_color(hide_label, lv_color_hex(0xFF8888), 0);
+  lv_obj_center(hide_label);
+
+  std::string* eid_copy = new std::string(entity.entity_id.data(), entity.entity_id.size());
+  lv_obj_set_user_data(hide_btn, eid_copy);
+  lv_obj_add_event_cb(hide_btn, [](lv_event_t* event) {
+    lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
+    std::string* p = (std::string*)lv_obj_get_user_data(btn);
+    if (s_instance == nullptr || p == nullptr) return;
+    ESP_LOGI(TAG, "Hide entity: %s", p->c_str());
+    s_instance->customizations_.hidden_entities.insert(*p);
+    s_instance->write_customizations_file_();
+    if (s_instance->current_room_index_ >= 0 &&
+        s_instance->current_room_index_ < (int) s_instance->room_cards_.size()) {
+      s_instance->show_entity_detail_(s_instance->current_room_index_);
+    }
+  }, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_event_cb(hide_btn, [](lv_event_t* event) {
     lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
     std::string* p = (std::string*)lv_obj_get_user_data(btn);
     delete p;
     lv_obj_set_user_data(btn, nullptr);
   }, LV_EVENT_DELETE, nullptr);
+
+  ESP_LOGI(TAG, "  Created control for entity: %.*s (%.*s) state=%s",
+           (int) entity.name.size(), entity.name.data(),
+           (int) entity.domain.size(), entity.domain.data(),
+           entity.state.c_str());
 }
+
 
 int HaAutoPanel::compute_cards_per_row_() const {
   // How many square cards of `card_width_` fit horizontally in `screen_width_`,
