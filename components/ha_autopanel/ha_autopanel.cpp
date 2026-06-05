@@ -3681,15 +3681,26 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
     dst += 3;
   }
 
-  // JPEG output buffer. JPEG is typically 1/5 to 1/20 the size of
-  // raw RGB for UI content, so 256 KB is more than enough. If the
-  // encode somehow needs more (a very busy screen), we'll fail
-  // gracefully and return 500.
-  const size_t jpg_cap = 256 * 1024;
-  uint8_t* jpg = (uint8_t*)heap_caps_malloc(jpg_cap, MALLOC_CAP_SPIRAM);
+  // JPEG output buffer. The ESP-IDF JPEG driver requires the output
+  // buffer to be allocated via jpeg_alloc_encoder_mem() (not a plain
+  // malloc) because the hardware encoder writes the bit stream to
+  // a word-aligned address and tracks the buffer's actual size for
+  // the bitstream alignment checks. A heap_caps_malloc'd buffer
+  // triggers "jpeg encode bit stream is not aligned, please use
+  // jpeg_alloc_encoder_mem to malloc your buffer" and the encode
+  // fails. jpeg_alloc_encoder_mem uses an internal DMA-capable pool
+  // (heap_caps_malloc with MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+  // preferred, falls back to internal) and returns the actual size
+  // allocated, which can be larger than the requested size.
+  const size_t jpg_req = 256 * 1024;
+  size_t jpg_size_actual = 0;
+  jpeg_encode_memory_alloc_cfg_t mem_cfg = {};
+  mem_cfg.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
+  uint8_t* jpg = (uint8_t*)jpeg_alloc_encoder_mem(
+      jpg_req, &mem_cfg, &jpg_size_actual);
   if (jpg == nullptr) {
     free(rgb);
-    request->send(500, "text/plain", "OOM allocating JPEG output buffer");
+    request->send(500, "text/plain", "jpeg_alloc_encoder_mem failed");
     return;
   }
 
@@ -3722,7 +3733,7 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
 
   uint32_t jpg_size = 0;
   err = jpeg_encoder_process(enc, &cfg, rgb, (uint32_t)rgb_size,
-                             jpg, (uint32_t)jpg_cap, &jpg_size);
+                             jpg, (uint32_t)jpg_size_actual, &jpg_size);
   // Always release the encoder + scratch buffers, even on error.
   // rgb is large; we'd rather leak the 1.84MB than re-encode the
   // frame if the encoder doesn't release its own memory.
