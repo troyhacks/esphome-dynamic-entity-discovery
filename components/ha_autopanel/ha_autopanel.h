@@ -464,6 +464,47 @@ class HaAutoPanel : public Component {
   // Stamp a freshly-parsed ISO string into the time baseline.
   // Safe to call from any thread (lvgl or http_request callback).
   void set_time_from_iso_(const char* iso);
+  // v1.22l: periodic single-entity fetch to keep the HA-derived
+  // time baseline fresh. The bulk /api/states fetch only runs
+  // once (at discovery) and uses the first entity's last_updated
+  // as the baseline. If the entity hasn't changed in hours, the
+  // baseline is hours stale. Throttled to once every 5 minutes
+  // (TIME_BASELINE_REFRESH_INTERVAL_MS). The fetched entity is
+  // zone.home (a HA virtual entity that's always present and
+  // has a current last_updated).
+  void maybe_refresh_time_baseline_();
+  // Wall-clock millis of the last successful time baseline
+  // refresh, so maybe_refresh_time_baseline_() can throttle
+  // itself. Set to 0 initially so the first call after READY
+  // fires immediately.
+  uint32_t last_time_baseline_refresh_ms_{0};
+  // The HA entity we refresh against. zone.home is always
+  // present and has a real last_updated. We could also use
+  // sensor.time if the user has one, but zone.home is
+  // universal.
+  static constexpr uint32_t TIME_BASELINE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;  // 5 min
+  // v1.22l: entity-state poll interval (Fix #11 real-time
+  // sync). The user said "realtime within a second or two"
+  // but a 2s interval overwhelms the httpd (the bulk
+  // /api/states response is ~200KB and the httpd queue
+  // gets backed up with the screenshot handler). 5s is
+  // the practical floor - the state subscription pushes
+  // updates within ~100ms when it works, and the poll
+  // is the safety net for missed pushes. With both, the
+  // user sees real-time updates most of the time and the
+  // panel never goes more than 5s stale.
+  static constexpr uint32_t STATE_POLL_INTERVAL_MS = 5 * 1000;  // 5 s
+  // Wall-clock millis of the last entity-state poll. Throttles
+  // maybe_poll_entity_states_().
+  uint32_t last_state_poll_ms_{0};
+  // v1.22l: re-fetch /api/states periodically and apply any
+  // state changes to the entity model. Real-time sync
+  // (Fix #11). Reuses fetch_entities_() to read the JSON,
+  // then iterates and updates the in-memory entity records.
+  // The visual state (arc, ON/OFF) is repainted via
+  // update_room_card_visual_state_for_area_() for any room
+  // whose state changed.
+  void maybe_poll_entity_states_();
   // HA zone.home friendly_name, fetched at runtime and shown in the
   // center of the title bar on the main grid page. Hidden on the
   // detail page (where title_room_label_ takes that spot) and during
@@ -576,6 +617,11 @@ class HaAutoPanel : public Component {
 
   // Web UI handler
   bool web_handler_registered_{false};
+  // v1.22l: set true after the first successful
+  // fetch_entities_() (bulk /api/states). Used to gate the
+  // periodic state poll - we don't want a poll racing with
+  // the initial discovery fetch.
+  bool entities_by_area_ready_{false};
   // AGENT_DEBUG opt-in. When true, /autopanel/test/* handlers are
   // registered and respond. Default false (set in the schema), so
   // production builds do not expose the test API.

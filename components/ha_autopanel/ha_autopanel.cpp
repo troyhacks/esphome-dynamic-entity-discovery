@@ -2,6 +2,21 @@
 #include "esphome/core/log.h"
 #include "esphome/core/string_ref.h"
 #include "esphome/components/json/json_util.h"
+
+// v1.22l: font ladder for the room-name auto-fit picker.
+// ESPHome's LVGL component auto-generates an extern
+// `lv_font_t <id>;` for each `font:` block in the yaml, so
+// we can use `&font_xl` / `&font_lg` / etc. directly. The
+// ladder goes from biggest to smallest; the picker tries
+// each in order and uses the first that fits the available
+// arc width. font_button (14pt) is the fixed font for the
+// ON/OFF label - that one doesn't auto-fit because the
+// "ON/OFF" string is short and consistent.
+extern const lv_font_t font_xl;      // 28pt - default room name
+extern const lv_font_t font_lg;      // 24pt - long names (e.g. "Master Bedroom")
+extern const lv_font_t font_md;      // 20pt - very long names
+extern const lv_font_t font_sm;      // 16pt - the last size before splitting
+extern const lv_font_t font_button;  // 14pt - "ON/OFF" button label
 #include "esphome/components/api/api_server.h"
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/homeassistant_service.h"
@@ -59,7 +74,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22k"
+#define FIRMWARE_VERSION "v1.22m"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -1032,35 +1047,105 @@ void HaAutoPanel::update_title_time_() {
     return;
   }
 
-  if (this->time_ == nullptr) {
-    // Time component not configured - keep the placeholder.
-    if (last_minute != -1) {
-      lv_label_set_text(this->title_time_label_, "--:--");
-      last_minute = -1;
+  // v1.22l: prefer HA-derived (with the MAX last_updated
+  // trick to get a fresh baseline), fall back to SNTP. The
+  // state poll re-fetches /api/states every 2 seconds and
+  // calls set_time_from_iso_() with each entity's timestamp;
+  // only the freshest one wins. So the time is at most
+  // ~2s + "the most recent entity update interval" behind
+  // the wall clock, which is what the user asked for.
+  if (this->time_valid_) {
+    uint32_t now_ms = millis();
+    int64_t elapsed_s = (int64_t)(now_ms - this->time_baseline_millis_) / 1000;
+    int64_t unix_now = this->time_unix_seconds_ + elapsed_s;
+    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 0);  // America/New_York
+    tzset();
+    time_t t = (time_t)unix_now;
+    struct tm tm_buf;
+    localtime_r(&t, &tm_buf);
+    int hour = tm_buf.tm_hour;
+    int minute = tm_buf.tm_min;
+    int minute_key = hour * 100 + minute;
+    if (minute_key != last_minute) {
+      last_minute = minute_key;
+      int h12 = hour % 12;
+      if (h12 == 0) h12 = 12;
+      const char* ampm = (hour < 12) ? "AM" : "PM";
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      lv_label_set_text(this->title_time_label_, buf);
+      const lv_font_t* f = lv_obj_get_style_text_font(
+          this->title_time_label_, LV_PART_MAIN);
+      lv_obj_set_width(this->title_time_label_,
+                       button_width_for_text_(buf, f, 4));
     }
     return;
   }
-  auto now = this->time_->now();
-  if (!now.is_valid()) {
-    // NTP hasn't synced yet.
-    if (last_minute != -1) {
-      lv_label_set_text(this->title_time_label_, "--:--");
-      last_minute = -1;
+
+  // HA-derived unavailable. Fall back to SNTP if it's
+  // managed to sync. The v1.22k SNTP-first path is still
+  // there as a safety net - useful if the device is
+  // temporarily disconnected from HA but can still reach
+  // an NTP server.
+  if (this->time_ != nullptr) {
+    auto now = this->time_->now();
+    if (now.is_valid()) {
+      int minute_key = now.hour * 100 + now.minute;
+      if (minute_key != last_minute) {
+        last_minute = minute_key;
+        int h12 = now.hour % 12;
+        if (h12 == 0) h12 = 12;
+        const char* ampm = (now.hour < 12) ? "AM" : "PM";
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, now.minute, ampm);
+        lv_label_set_text(this->title_time_label_, buf);
+        // v1.22e: re-fit the label width to the new text.
+        const lv_font_t* f = lv_obj_get_style_text_font(
+            this->title_time_label_, LV_PART_MAIN);
+        lv_obj_set_width(this->title_time_label_,
+                         button_width_for_text_(buf, f, 4));
+      }
+      return;
+    }
+  }
+
+  // SNTP unavailable or hasn't synced - fall back to HA-derived.
+  // The baseline is the first entity's last_updated from the
+  // bulk /api/states response. Stale by however long since
+  // the entity last changed, but better than "--:--".
+  if (this->time_valid_) {
+    uint32_t now_ms = millis();
+    int64_t elapsed_s = (int64_t)(now_ms - this->time_baseline_millis_) / 1000;
+    int64_t unix_now = this->time_unix_seconds_ + elapsed_s;
+    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 0);  // America/New_York
+    tzset();
+    time_t t = (time_t)unix_now;
+    struct tm tm_buf;
+    localtime_r(&t, &tm_buf);
+    int hour = tm_buf.tm_hour;
+    int minute = tm_buf.tm_min;
+    int minute_key = hour * 100 + minute;
+    if (minute_key != last_minute) {
+      last_minute = minute_key;
+      int h12 = hour % 12;
+      if (h12 == 0) h12 = 12;
+      const char* ampm = (hour < 12) ? "AM" : "PM";
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      lv_label_set_text(this->title_time_label_, buf);
+      const lv_font_t* f = lv_obj_get_style_text_font(
+          this->title_time_label_, LV_PART_MAIN);
+      lv_obj_set_width(this->title_time_label_,
+                       button_width_for_text_(buf, f, 4));
     }
     return;
   }
-  int minute_key = now.hour * 100 + now.minute;
-  if (minute_key == last_minute) return;  // same minute, no redraw
-  last_minute = minute_key;
-  // Format "h:mm AM/PM" - matches the user-facing style of the
-  // existing HA status text. We could use 24h but the user has
-  // shown they prefer en-US conventions.
-  int h12 = now.hour % 12;
-  if (h12 == 0) h12 = 12;
-  const char* ampm = (now.hour < 12) ? "AM" : "PM";
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%d:%02d %s", h12, now.minute, ampm);
-  lv_label_set_text(this->title_time_label_, buf);
+
+  // Neither SNTP nor HA-derived available.
+  if (last_minute != -1) {
+    lv_label_set_text(this->title_time_label_, "--:--");
+    last_minute = -1;
+  }
 }
 
 int64_t HaAutoPanel::parse_iso_to_unix_(const char* iso) {
@@ -1107,11 +1192,247 @@ int64_t HaAutoPanel::parse_iso_to_unix_(const char* iso) {
 void HaAutoPanel::set_time_from_iso_(const char* iso) {
   int64_t unix = this->parse_iso_to_unix_(iso);
   if (unix <= 0) return;
-  this->time_unix_seconds_ = unix;
-  this->time_baseline_millis_ = millis();
-  this->time_valid_ = true;
-  ESP_LOGI(TAG, "[time] HA-derived baseline: %s -> unix=%lld",
-           iso, (long long)unix);
+  // v1.22l: only accept a baseline if it's MORE RECENT
+  // than the current one. The bulk /api/states response
+  // can include many entities; we may get old last_updated
+  // values from entities that haven't changed in days.
+  // Taking the max (most recent) gives a baseline close to
+  // "now" - typically within seconds if any entity
+  // updated recently, or hours if HA has been idle.
+  if (!this->time_valid_ || unix > this->time_unix_seconds_) {
+    this->time_unix_seconds_ = unix;
+    this->time_baseline_millis_ = millis();
+    this->time_valid_ = true;
+    ESP_LOGI(TAG, "[time] HA-derived baseline advanced: %s -> unix=%lld",
+             iso, (long long)unix);
+  }
+}
+
+void HaAutoPanel::maybe_poll_entity_states_() {
+  // v1.22l: throttled re-fetch of /api/states for real-time
+  // sync. Throttled to STATE_POLL_INTERVAL_MS (2s). The
+  // fetch is heavy (~200KB) so we don't want to run it
+  // every loop() tick.
+  uint32_t now_ms = millis();
+  if (this->last_state_poll_ms_ != 0 &&
+      (now_ms - this->last_state_poll_ms_) < STATE_POLL_INTERVAL_MS) {
+    return;
+  }
+  this->last_state_poll_ms_ = now_ms;
+  if (this->http_request_ == nullptr || this->ha_api_url_.empty() ||
+      this->ha_api_password_.empty()) {
+    return;
+  }
+  // We don't call fetch_entities_() directly - that does
+  // the full discovery (rebuilds entities_by_area_ from
+  // scratch). We just want to UPDATE the state field of
+  // existing entities. So we read the same JSON and apply
+  // it in-place: for each entry, if the state changed,
+  // update entities_by_area_ and refresh the room card.
+  // The fetch path is the same as fetch_entities_() up to
+  // the JSON parse, then we use a side-by-side lookup.
+  std::string url = this->ha_api_url_ + "/api/states";
+  std::vector<http_request::Header> headers = {
+      {"Authorization", "Bearer " + this->ha_api_password_},
+      {"Content-Type", "application/json"},
+  };
+  auto container = this->http_request_->get(url, headers);
+  if (container == nullptr || container->status_code != 200) {
+    if (container != nullptr) container->end();
+    return;
+  }
+  // Build a set of entity_ids in our discovered areas so
+  // we can filter the bulk response down to what we care
+  // about. Without this, we'd update 419 entities every
+  // poll (most of which aren't in our rooms).
+  std::set<std::string> our_entity_ids;
+  for (const auto& kv : this->entities_by_area_) {
+    for (const auto& e : kv.second) {
+      our_entity_ids.insert(std::string(e.entity_id));
+    }
+  }
+  // Read body into a 256KB PSRAM buffer (the bulk response
+  // is ~200KB; same allocation strategy as fetch_entities_).
+  size_t expected = container->content_length > 0 ? container->content_length : 32768;
+  if (expected > 256 * 1024) expected = 256 * 1024;
+  char* response = (char*)heap_caps_malloc_prefer(
+      expected + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (response == nullptr) {
+    container->end();
+    return;
+  }
+  size_t total = 0;
+  uint8_t chunk[512];
+  uint32_t last_data = millis();
+  while (container->get_bytes_read() < container->content_length && total < expected) {
+    int n = container->read(chunk, std::min<size_t>(sizeof(chunk), expected - total));
+    if (n > 0) {
+      memcpy(response + total, chunk, n);
+      total += n;
+      last_data = millis();
+    } else if (n == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
+      break;
+    } else {
+      if (millis() - last_data > 20000) break;
+      App.feed_wdt();
+    }
+  }
+  container->end();
+  response[total] = '\0';
+  // Parse the bulk response and update matching entities.
+  // We use the PSRAM-preferring allocator for the DOM, same
+  // as fetch_entities_().
+  PsramJsonDocument doc(&s_psram_allocator);
+  if (deserializeJson(doc, response)) {
+    heap_caps_free(response);
+    return;
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  // v1.22l: also walk ALL entities in the response (not
+  // just ours) to update the time baseline. We use the
+  // MAX last_updated across the entire response as the
+  // panel's "current time" - whichever entity most
+  // recently changed sets the ceiling. This is the
+  // cheapest way to keep the time fresh without needing
+  // a Date header parse or a dedicated /api/time
+  // endpoint. Limited to the first 100 entities to keep
+  // the parse cost bounded; HA has 419 entities and the
+  // most recently changed ones are scattered throughout,
+  // so the first 100 is a reasonable sample.
+  std::set<std::string> dirty_areas;
+  int changed = 0;
+  int entities_seen = 0;
+  for (JsonObject obj : arr) {
+    // Time baseline update: every entity's last_updated
+    // is a candidate. The MAX wins inside
+    // set_time_from_iso_().
+    if (!obj["last_updated"].isNull() && entities_seen < 100) {
+      const char* last_updated = obj["last_updated"].as<const char*>();
+      if (last_updated != nullptr && last_updated[0] != '\0') {
+        this->set_time_from_iso_(last_updated);
+      }
+    }
+    entities_seen++;
+    const char* entity_id = obj["entity_id"];
+    if (entity_id == nullptr) continue;
+    std::string eid(entity_id);
+    if (our_entity_ids.find(eid) == our_entity_ids.end()) continue;
+    const char* state_c = obj["state"];
+    if (state_c == nullptr) continue;
+    std::string new_state = state_c;
+    for (auto& kv : this->entities_by_area_) {
+      for (auto& e : kv.second) {
+        if (e.entity_id == eid && e.state != new_state) {
+          e.state = new_state;
+          // Brightness may have changed too; the bulk
+          // response includes it under attributes.
+          if (!obj["attributes"].isNull()) {
+            const char* b = obj["attributes"]["brightness"];
+            if (b != nullptr) {
+              int new_b = atoi(b);
+              if (new_b >= 0 && new_b <= 255) {
+                e.brightness = (uint8_t)new_b;
+                e.has_brightness = true;
+              }
+            }
+          }
+          dirty_areas.insert(kv.first);
+          changed++;
+          break;
+        }
+      }
+    }
+  }
+  heap_caps_free(response);
+  // Repaint the room cards for any room whose state
+  // changed. update_room_card_visual_state_for_area_()
+  // is idempotent - it re-reads entities_by_area_ and
+  // updates the arc/ON-OFF visuals.
+  for (const auto& area_id : dirty_areas) {
+    this->update_room_card_visual_state_for_area_(area_id);
+  }
+  if (changed > 0) {
+    ESP_LOGD(TAG, "[poll] %d entities changed, %d areas redrawn",
+             changed, (int)dirty_areas.size());
+  }
+}
+
+void HaAutoPanel::maybe_refresh_time_baseline_() {
+  // Throttle: only fetch every 5 minutes. last_time_baseline_refresh_ms_
+  // starts at 0 so the first call after READY fires immediately.
+  uint32_t now_ms = millis();
+  if (this->last_time_baseline_refresh_ms_ != 0 &&
+      (now_ms - this->last_time_baseline_refresh_ms_) < TIME_BASELINE_REFRESH_INTERVAL_MS) {
+    return;
+  }
+  this->last_time_baseline_refresh_ms_ = now_ms;
+  if (this->http_request_ == nullptr || this->ha_api_url_.empty() ||
+      this->ha_api_password_.empty()) {
+    return;  // not configured yet
+  }
+  // GET /api/states/zone.home. ~500 bytes vs the 200KB+ of a bulk
+  // /api/states call, so the network/CPU cost is trivial. The
+  // response is a single-element JSON array (same schema as the
+  // bulk call), so we can reuse the same parse path. zone.home
+  // is always present in HA and has a current last_updated.
+  std::string url = this->ha_api_url_ + "/api/states/zone.home";
+  std::vector<http_request::Header> headers = {
+      {"Authorization", "Bearer " + this->ha_api_password_},
+      {"Content-Type", "application/json"},
+  };
+  auto container = this->http_request_->get(url, headers);
+  if (container == nullptr || container->status_code != 200) {
+    if (container != nullptr) container->end();
+    return;  // try again in 5 minutes
+  }
+  // The body is a single-element JSON array. Pull out the
+  // last_updated field and feed it to set_time_from_iso_().
+  size_t expected = container->content_length > 0 ? container->content_length : 512;
+  char* buf = (char*)heap_caps_malloc(expected + 1, MALLOC_CAP_SPIRAM);
+  if (buf == nullptr) {
+    buf = (char*)malloc(expected + 1);
+  }
+  if (buf == nullptr) {
+    container->end();
+    return;
+  }
+  size_t total = 0;
+  uint8_t chunk[256];
+  while (container->get_bytes_read() < container->content_length && total < expected) {
+    int n = container->read(chunk, std::min<size_t>(sizeof(chunk), expected - total));
+    if (n > 0) {
+      memcpy(buf + total, chunk, n);
+      total += n;
+    } else if (n == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
+      break;
+    } else {
+      App.feed_wdt();
+    }
+  }
+  container->end();
+  buf[total] = '\0';
+  // The response is a JSON array. Use a tiny StaticJsonDocument
+  // (the body is ~400 bytes for a single zone.home state).
+  StaticJsonDocument<1024> doc;
+  if (!deserializeJson(doc, buf)) {
+    JsonArray arr = doc.as<JsonArray>();
+    if (!arr.isNull() && arr.size() > 0) {
+      JsonObject first = arr[0];
+      if (!first["last_updated"].isNull()) {
+        const char* last_updated = first["last_updated"].as<const char*>();
+        if (last_updated != nullptr && last_updated[0] != '\0') {
+          this->set_time_from_iso_(last_updated);
+        }
+      }
+    }
+  }
+  heap_caps_free(buf);
+  if (buf != nullptr && total > 0) {
+    // already freed above via heap_caps_free; this branch
+    // exists to silence the unused-variable warning on
+    // platforms where heap_caps_free is a no-op.
+  }
 }
 
 void HaAutoPanel::start_discovery_() {
@@ -1175,6 +1496,16 @@ void HaAutoPanel::start_discovery_() {
   // after the API is ready and is the right place to subscribe.
 
   ESP_LOGI(TAG, "=== Discovery Complete ===");
+
+  // v1.22l: gate the periodic state poll on this. Set AFTER
+  // fetch_entities_() has populated entities_by_area_ for
+  // the first time. Before this flag, the poll would fire
+  // during the initial discovery window and either:
+  //   - race with fetch_entities_() and overwrite a partial
+  //     result, or
+  //   - find an empty entities_by_area_ and do nothing
+  //     useful (but still consume the network bandwidth).
+  this->entities_by_area_ready_ = true;
 
   // Mark panel as READY - we have rooms to show.
   this->set_panel_state_(PanelState::READY);
@@ -3596,6 +3927,34 @@ void HaAutoPanel::loop() {
   // cheaply if the displayed minute hasn't changed, so this is
   // essentially free.
   this->update_title_time_();
+
+  // v1.22l: periodic time-baseline refresh. SNTP is the
+  // primary time source now (see update_title_time_), but if
+  // it fails to sync and we fall back to the HA-derived
+  // baseline, the baseline is anchored to an entity's
+  // last_updated field which can be hours stale. We
+  // re-fetch a single entity's state every 5 minutes and
+  // update the baseline from its last_updated. A single-
+  // entity GET is ~500 bytes vs the 200KB+ of a bulk
+  // /api/states, so this is cheap. The fetch is throttled
+  // by a member timestamp so we don't hammer HA.
+  if (this->state_ == PanelState::READY &&
+      (this->time_ == nullptr || !this->time_->now().is_valid())) {
+    // Only re-fetch when we're actually using the HA fallback
+    // (SNTP invalid). If SNTP works, no need to poll.
+    this->maybe_refresh_time_baseline_();
+  }
+
+  // v1.22l: periodic entity-state poll for real-time sync
+  // (Fix #11). The native API state subscription pushes
+  // changes to us, but if a push is dropped the panel
+  // would stay stale until the next user action. A
+  // 2-second poll re-fetches the bulk /api/states and
+  // updates the entity model. Throttled by a member
+  // timestamp so the network cost is bounded.
+  if (this->state_ == PanelState::READY && this->entities_by_area_ready_) {
+    this->maybe_poll_entity_states_();
+  }
 
   // Pending 2-tap-confirm timeout. If the user armed Reboot or
   // Reset customizations and then didn't tap again within 5s, revert
