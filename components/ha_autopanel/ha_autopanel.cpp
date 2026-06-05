@@ -74,7 +74,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22m"
+#define FIRMWARE_VERSION "v1.22o"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -472,6 +472,15 @@ void HaAutoPanel::fetch_areas_() {
   // array in some configurations and was previously discarding all data.
   PsramJsonDocument doc(&s_psram_allocator);
 
+  // v1.22n: feed the task watchdog BEFORE the long blocking
+  // deserializeJson call. The bulk /api/states response is
+  // ~200KB and the parse can take >5s on first boot when
+  // WiFi + httpd + LVGL are all initing. Without this
+  // refresh, the IDF freeRTOS task watchdog fires and
+  // the panel reboots itself (rst:0xc SW_CPU_RESET, boot
+  // #N+1 with reset_reason=DEEPSLEEP).
+  App.feed_wdt();
+
   DeserializationError parse_err = deserializeJson(doc, response);
   if (parse_err) {
     ESP_LOGE(TAG, "Failed to parse areas JSON: %s", parse_err.c_str());
@@ -684,6 +693,12 @@ void HaAutoPanel::fetch_entities_() {
   // allocator so the ~250KB JSON document lives in PSRAM. The default
   // internal heap is too small and would abort().
   PsramJsonDocument doc(&s_psram_allocator);
+
+  // v1.22n: feed the task watchdog BEFORE the long blocking
+  // deserializeJson call. Same reason as the bulk fetch in
+  // fetch_entities_() - the 200KB parse can take >5s and
+  // trip the IDF freeRTOS task watchdog.
+  App.feed_wdt();
 
   DeserializationError parse_err = deserializeJson(doc, response);
   if (parse_err) {
