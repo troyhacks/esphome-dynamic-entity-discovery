@@ -1203,12 +1203,28 @@ void HaAutoPanel::create_ui_from_room_cards_() {
     // within the row; room.x / room.y are still tracked (0, 0) for
     // any code that reads them (drag-to-reorder, animations) but
     // they're not the source of truth for placement anymore.
+    //
+    // STACK YIELD: calling lv_task_handler() once per row gives LVGL
+    // a chance to run its event loop, which drains any queued timer
+    // or layout work and returns the call stack to a safe depth. The
+    // crash we hit on 15 rooms (v1.7 build) was a "Stack protection
+    // fault" in tlsf_realloc, deep inside the flex_update path - the
+    // 4KB-ish main-task stack had no breathing room when 90+ widgets
+    // were created back-to-back with no yields. Yelding every 4 cards
+    // (= one row) keeps the stack depth under control without
+    // slowing first-paint noticeably.
     for (int c = 0; c < row_count; c++) {
       int card_index = row * cards_per_row + c;
       if (card_index >= (int) room_cards_.size()) break;
       room_cards_[card_index].x = 0;
       room_cards_[card_index].y = 0;
       create_room_card_(row_container, room_cards_[card_index]);
+      // Yield every card. Cheap (~few ms), prevents the stack from
+      // growing past its allocated region even on a board with many
+      // areas. The first card of a row already gets a yield via the
+      // row boundary; yielding again on every card is a deliberate
+      // belt-and-suspenders for large room counts.
+      lv_task_handler();
     }
   }
 
@@ -4994,6 +5010,10 @@ void HaAutoPanel::refresh_room_cards_() {
       room_cards_[card_index].x = 0;
       room_cards_[card_index].y = 0;
       this->create_room_card_(row_container, room_cards_[card_index]);
+      // STACK YIELD: see create_ui_from_room_cards_(). Without
+      // these, refresh_room_cards_ on a board with 15+ rooms hits
+      // the same stack protection fault we saw on 2026-06-05.
+      lv_task_handler();
     }
   }
   // Update the title bar so the room count / status reflects the new view
