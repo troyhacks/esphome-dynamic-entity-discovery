@@ -58,7 +58,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22b"
+#define FIRMWARE_VERSION "v1.22d"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -2324,6 +2324,16 @@ void HaAutoPanel::show_room_grid_() {
   if (this->title_back_btn_ != nullptr) {
     lv_obj_add_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
   }
+  // v1.22c (Fix #9): show_entity_detail_() hides title_sort_btn_ at
+  // line 2193 (Sort doesn't make sense on a single-room detail
+  // view), but show_room_grid_() never un-hid it. So after a
+  // Detail -> Back round trip the Sort button stayed missing until
+  // the next reboot, and the user lost the only path into the
+  // customizer. Un-hide it here so the grid returns to its
+  // expected chrome.
+  if (this->title_sort_btn_ != nullptr) {
+    lv_obj_remove_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+  }
   // v1.11: title_edit_btn_ was removed. No label to flip back to
   // "Edit" on return from the detail page. The title bar on the
   // grid page is now: [Back hidden] [Home name centered] [Sort].
@@ -2577,11 +2587,23 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   if (entity.state == "on") {
     state_bg_color = 0x22DD55;  // green
     state_text_color = 0x111827;  // dark
-  } else if (entity.state == "off" || entity.state == "unavailable" || entity.state == "unknown") {
+  } else if (entity.state.empty()
+             || entity.state == "off"
+             || entity.state == "unavailable"
+             || entity.state == "unknown") {
+    // v1.22c (Fix #3+4 'no more yellow block'): an empty state
+    // used to fall into the else{} amber branch (because it
+    // doesn't match 'on' or 'off'). The badge text shows '--'
+    // (no state from HA yet) but the bg was amber, so the user
+    // saw every row painted bright orange before HA reported a
+    // real value. Now empty -> dim gray like 'off'. The amber
+    // branch is reserved for real non-on/off states like
+    // media_player "playing" or person "home" - states that
+    // mean "the entity has a real value, just not on or off".
     state_bg_color = 0x444444;  // dim gray
     state_text_color = 0xCCCCCC;  // light
   } else {
-    state_bg_color = 0xCC8800;  // amber
+    state_bg_color = 0xCC8800;  // amber - real non-on/off state
     state_text_color = 0x111827;  // dark
   }
   lv_obj_set_style_bg_color(state_bg, lv_color_hex(state_bg_color), 0);
