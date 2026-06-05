@@ -1277,7 +1277,7 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_set_width(this->title_home_label_, this->screen_width_ - 360);
   lv_obj_set_style_text_align(this->title_home_label_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(this->title_home_label_, LV_ALIGN_CENTER, 0, -1);
-  lv_obj_add_flag(this->title_home_label_, LV_OBJ_FLAG_HIDDEN);
+  // Start hidden. un-hide logic below in set_panel_state_().
 
   // --- Right cluster (flex row, adapts to any screen width) ---
   // All the right-side buttons (Time, Sort, Cancel, Debug, Edit)
@@ -1963,9 +1963,21 @@ void HaAutoPanel::show_room_grid_() {
     if (edit_label != nullptr) {
       lv_label_set_text(edit_label, "Edit");
     }
+    lv_obj_remove_flag(this->title_edit_btn_, LV_OBJ_FLAG_HIDDEN);
   }
   if (this->title_room_label_ != nullptr) {
     lv_obj_add_flag(this->title_room_label_, LV_OBJ_FLAG_HIDDEN);
+  }
+  // The home name + time + status indicator are all created with
+  // LV_OBJ_FLAG_HIDDEN in create_title_bar_() (default to off, no
+  // flicker before the first state machine tick). Now that we're
+  // committed to the grid page, un-hide them so the user sees the
+  // home name centered in the title bar and the clock on the right.
+  if (this->title_home_label_ != nullptr) {
+    lv_obj_remove_flag(this->title_home_label_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->title_time_label_ != nullptr) {
+    lv_obj_remove_flag(this->title_time_label_, LV_OBJ_FLAG_HIDDEN);
   }
   // Put the status label back where it lives on the grid page (top-left
   // status area) â€” show_entity_detail_ shifted it right to make room
