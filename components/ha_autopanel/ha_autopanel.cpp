@@ -58,7 +58,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22a"
+#define FIRMWARE_VERSION "v1.22b"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -1596,8 +1596,11 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // edit mode. Tapping it opens sort_panel_, the full-screen
   // sort+hide list (the user-preferred way to reorder rooms, which
   // replaces the drag-to-reorder gesture).
+  //
+  // v1.22b: bumped from 28 to 32 high to match the back button
+  // (Fix #5 button audit).
   this->title_sort_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_sort_btn_, 60, 28);
+  lv_obj_set_size(this->title_sort_btn_, 60, 32);
   lv_obj_set_style_bg_color(this->title_sort_btn_, lv_color_hex(0x374151), 0);
   lv_obj_set_style_radius(this->title_sort_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_sort_btn_, 0, 0);
@@ -1688,8 +1691,12 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // the existing accent color. Cancel is RED (destructive
   // discard) with white text. Edit is the cool gray of the
   // existing chrome.
+  //
+  // v1.22b: bumped from 28 to 32 high to match the back button
+  // (Fix #5 button audit - mixed heights in the title bar looked
+  // ragged).
   this->title_save_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_save_btn_, 60, 28);
+  lv_obj_set_size(this->title_save_btn_, 60, 32);
   lv_obj_set_style_bg_color(this->title_save_btn_, lv_color_hex(0xfacc15), 0);
   lv_obj_set_style_radius(this->title_save_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_save_btn_, 0, 0);
@@ -1709,8 +1716,10 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   }, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_flag(this->title_save_btn_, LV_OBJ_FLAG_HIDDEN);
 
+  // v1.22b: bumped from 28 to 32 high to match the back button
+  // (Fix #5 button audit).
   this->title_cancel_btn_ = lv_obj_create(this->title_right_cluster_);
-  lv_obj_set_size(this->title_cancel_btn_, 70, 28);
+  lv_obj_set_size(this->title_cancel_btn_, 70, 32);
   lv_obj_set_style_bg_color(this->title_cancel_btn_, lv_color_hex(0xef4444), 0);
   lv_obj_set_style_radius(this->title_cancel_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_cancel_btn_, 0, 0);
@@ -1741,9 +1750,13 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // confirm-tap pattern because agent_debug builds are not
   // user-facing (only the test harness / developer should be
   // hitting Reboot).
+  //
+  // v1.22b: bumped from 28 to 32 high to match the back button
+  // (which was already 32). Mix-and-match heights in the title
+  // bar looked ragged; the user pointed this out in Fix #5.
   if (this->agent_debug_) {
     this->title_reboot_btn_ = lv_obj_create(this->title_right_cluster_);
-    lv_obj_set_size(this->title_reboot_btn_, 70, 28);
+    lv_obj_set_size(this->title_reboot_btn_, 70, 32);
     lv_obj_set_style_bg_color(this->title_reboot_btn_, lv_color_hex(0xdc2626), 0);  // red
     lv_obj_set_style_radius(this->title_reboot_btn_, 6, 0);
     lv_obj_set_style_border_width(this->title_reboot_btn_, 0, 0);
@@ -1792,11 +1805,14 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // entity detail page it pops back to the grid.
   this->title_back_btn_ = lv_obj_create(this->title_bar_);
   // Bumped from 70x28 to 75x32 per user request ("about 5px bigger")
-  // for an easier tap target. Repositioned at y=2 so the taller button
-  // still fits inside the 36px-tall title bar with a 2px top margin and
-  // 2px bottom margin.
+  // for an easier tap target. v1.22b: re-centered vertically in the
+  // 36px-tall title bar (y=4 leaves 2px top + 2px bottom margin and
+  // lines up with the right-cluster buttons which are now also 32
+  // high). The 32x position is what the user meant by "slightly too
+  // small" - the button was sized right but offset upward, so it
+  // didn't visually line up with the other chrome.
   lv_obj_set_size(this->title_back_btn_, 75, 32);
-  lv_obj_set_pos(this->title_back_btn_, 32, 2);
+  lv_obj_set_pos(this->title_back_btn_, 32, 4);
   lv_obj_set_style_bg_color(this->title_back_btn_, lv_color_hex(0x374151), 0);
   lv_obj_set_style_radius(this->title_back_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_back_btn_, 0, 0);
