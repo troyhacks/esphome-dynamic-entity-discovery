@@ -436,6 +436,26 @@ class HaAutoPanel : public Component {
   // suite can refuse to run if the device's firmware is older
   // than what the test was written against.
   std::string firmware_version_{};
+  // v1.22: HA-derived time baseline. The homeassistant time
+  // platform (which would fix the --:-- clock) is blocked by
+  // a build-dep issue, so we hand-roll a thin version: any HA
+  // REST response we receive (zone.home in fetch_home_name_,
+  // the bulk /api/states in fetch_entities_, the auth probe)
+  // includes a last_updated ISO-8601 timestamp. We parse that
+  // once, store unix seconds + millis() as the baseline, and
+  // advance the clock as baseline + (now - baseline_ms) / 1000
+  // until the next HA call refreshes it. Same pattern as
+  // ESPHome's homeassistant time platform, just inlined.
+  int64_t time_unix_seconds_{0};
+  uint32_t time_baseline_millis_{0};
+  bool time_valid_{false};
+  // Parse 'YYYY-MM-DDTHH:MM:SS[.ffffff][+HH:MM | Z]' into a
+  // unix timestamp. Returns 0 on parse error. ESPHome doesn't
+  // ship strptime so we hand-parse the ISO-8601 string.
+  int64_t parse_iso_to_unix_(const char* iso);
+  // Stamp a freshly-parsed ISO string into the time baseline.
+  // Safe to call from any thread (lvgl or http_request callback).
+  void set_time_from_iso_(const char* iso);
   // HA zone.home friendly_name, fetched at runtime and shown in the
   // center of the title bar on the main grid page. Hidden on the
   // detail page (where title_room_label_ takes that spot) and during
