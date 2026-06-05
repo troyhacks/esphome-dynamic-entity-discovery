@@ -2841,6 +2841,31 @@ void HaAutoPanel::show_status_screen_(const char* title, const char* message, bo
   ESP_LOGI(TAG, "show_status_screen: title='%s' show_retry=%d", title, (int) show_retry);
   ESP_LOGI(TAG, "  message: %s", message);
 
+  // Hide the other full-screen overlays so the renderer doesn't have
+  // to repaint all of them on top of each other. Before this change,
+  // switching from READY (room grid) to any non-READY state left the
+  // main_container_ visible behind the status_container_, and the
+  // compositor did a full-screen paint for both. With 15 rooms the
+  // room grid is 1000+ px tall, so the layout/repaint took ~1.9s and
+  // blocked the httpd task for the duration (the test harness would
+  // see cmd/shot timeouts). Hiding main/detail/sort/debug here means
+  // the status screen is the only full-screen thing the renderer
+  // touches; hide_status_screen_() doesn't bring them back, because
+  // the state machine drives main_container_ visibility on its own
+  // (see set_panel_state_()).
+  if (this->main_container_ != nullptr) {
+    lv_obj_add_flag(this->main_container_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->detail_container_ != nullptr) {
+    lv_obj_add_flag(this->detail_container_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->sort_panel_ != nullptr) {
+    lv_obj_add_flag(this->sort_panel_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->debug_panel_ != nullptr) {
+    lv_obj_add_flag(this->debug_panel_, LV_OBJ_FLAG_HIDDEN);
+  }
+
   if (this->status_container_ == nullptr) {
     // Create the status container on the first time we show it
     this->status_container_ = lv_obj_create(screen);
