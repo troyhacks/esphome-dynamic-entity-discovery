@@ -1366,7 +1366,12 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
       s_instance->show_sort_panel_();
     }
   }, LV_EVENT_CLICKED, nullptr);
-  lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+  // Sort is always visible on the grid page (matches the v1.0
+  // behavior - the "before" screenshot showed Sort and Edit side
+  // by side on the title bar). Earlier builds set this to
+  // LV_OBJ_FLAG_HIDDEN and gated it on edit mode, but that hid
+  // it from the normal grid view too. The user pointed this out
+  // during v1.5 review.
 
   // Edit button (top-right). Right cluster child. Always visible.
   // Toggles edit_mode_; label flips between "Edit" and "Done".
@@ -1802,6 +1807,35 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   lv_obj_remove_flag(label_btn, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
   lv_obj_set_scrollbar_mode(label_btn, LV_SCROLLBAR_MODE_OFF);
   lv_obj_add_flag(label_btn, LV_OBJ_FLAG_CLICKABLE);
+  // Tap → open the entity detail view for this room. We stash the
+  // room's grid_index in the label_btn's user_data so the callback
+  // can recover it. (The same room's click also fires the card's
+  // own event handler, but it has no CLICKED handler so it's
+  // ignored - the label_btn handler is the one that runs.)
+  lv_obj_set_user_data(label_btn, (void*)(intptr_t)room.grid_index);
+  lv_obj_add_event_cb(label_btn, [](lv_event_t* event) {
+    if (s_instance == nullptr) return;
+    int room_index = (int)(intptr_t)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(event));
+    s_instance->show_entity_detail_(room_index);
+  }, LV_EVENT_CLICKED, nullptr);
+
+  // The room-name label that the user can see and tap. Restored in
+  // v1.6 - the previous v1.x builds had the label_btn container but
+  // no label inside it, so the cards were blank arcs with no room
+  // name. The label is centered in the label_btn (which is centered
+  // on the arc). lv_label_set_text takes a null-terminated const
+  // char*; room.area.name is std::string so .c_str() is safe.
+  lv_obj_t* label = lv_label_create(label_btn);
+  lv_label_set_text(label, room.area.name.c_str());
+  lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_center(label);
+  // Move label_btn to the top of the z-order so touches on the
+  // text (not the arc underneath) register as the room name click
+  // and route to show_entity_detail_. Without this, the label sits
+  // behind the arc/button widgets in the same card and the arc's
+  // touch handler steals the press.
+  lv_obj_move_foreground(label_btn);
+
   // Store the room name (heap-allocated std::string*) in the CARD's
   // user_data so any click target on the card (label_btn, arc, button)
   // can recover the area via lv_event_get_target -> lv_obj_get_parent.
