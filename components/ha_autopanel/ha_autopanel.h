@@ -468,6 +468,27 @@ class HaAutoPanel : public Component {
   // Number of rooms currently visible (for the status line)
   int visible_room_count_{0};
 
+  // Active media player banner. A horizontal strip at the top of the
+  // grid (just below the title bar) that surfaces any media_player
+  // entity currently in 'playing' state. Tapping the banner pauses
+  // the media player. Hidden when no media is playing.
+  //
+  // Design: a single banner row holds up to N "tile" widgets, one
+  // per currently-playing media_player. Each tile shows the friendly
+  // name + a small pause icon. The whole banner row is hidden
+  // (LV_OBJ_FLAG_HIDDEN) when there are no active tiles.
+  //
+  // The banner's visibility is recomputed from on_entity_state_changed_
+  // (real-time, when state-sync works) and from refresh_room_cards_()
+  // (initial render, and after hide/reveal).
+  //
+  // When the state-sync bug is open (state_changed never fires), the
+  // banner shows whatever entities have state set at fetch time. This
+  // is documented in [[project_state_sync_bug]].
+  lv_obj_t* media_banner_{nullptr};
+  // Map: entity_id (as string) -> tile widget. Cleared on rebuild.
+  std::map<std::string, lv_obj_t*> media_tiles_;
+
   // Authorization probe state
   bool auth_probe_pending_{false};
   uint32_t auth_probe_started_ms_{0};
@@ -661,6 +682,12 @@ class HaAutoPanel : public Component {
   // Re-render the room grid (called when edit_mode toggles, when
   // customizations change, or when a room is hidden/shown).
   void refresh_room_cards_();
+  // Update the "Now Playing" banner at the top of the grid. Reads
+  // the current entity state fields and shows one tile per media_player
+  // in 'playing' state. Lazy-creates the banner container on first
+  // call. Called from create_ui_from_room_cards_() at render time
+  // and from on_entity_state_changed_() for live updates.
+  void update_media_banner_();
 
   // Boot: mount LittleFS, read config, decide what state to start in.
   void boot_from_storage_();

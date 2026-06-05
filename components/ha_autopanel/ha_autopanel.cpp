@@ -1150,6 +1150,13 @@ void HaAutoPanel::create_ui_from_room_cards_() {
   // grid scrolls under it). 36px tall.
   this->create_title_bar_(screen);
 
+  // Active media player banner sits just below the title bar (y=36..).
+  // 60px tall by default; we recompute on the fly so a narrow screen
+  // (Freenove 240x320) sees a smaller banner. The banner is hidden
+  // by default and only shown when at least one media_player is
+  // actively playing - see update_media_banner_().
+  this->update_media_banner_();
+
   // Layout the room cards in row containers. Each row container is
   // sized to fit N cards + gaps, and aligned with LV_ALIGN_TOP_MID
   // on main_container_ so the row is centered horizontally on the
@@ -1970,6 +1977,167 @@ void HaAutoPanel::show_room_grid_() {
   this->current_room_index_ = -1;
 }
 
+void HaAutoPanel::update_media_banner_() {
+  // Build/refresh the "Now Playing" banner that sits just below the
+  // title bar (y=36..96 by default). Hidden unless at least one
+  // media_player entity is currently in 'playing' state.
+  //
+  // Behavior:
+  //   - If no tiles are needed, hide the banner container.
+  //   - If tiles are needed, create or update them in-place so the
+  //     banner always reflects the current set of playing media
+  //     players. Tiles that are no longer playing are deleted; new
+  //     tiles are added at the end.
+  //
+  // Tile content: friendly name + a small "II" (pause) icon. Tapping
+  // the tile sends media_player.media_pause to HA. (The pause icon
+  // is rendered as "II" text since the default LVGL font doesn't
+  // include U+23F8 PAUSE SYMBOL; same workaround as the restore
+  // badge in the old hidden_panel_.)
+  //
+  // This depends on the entity state field being kept current by
+  // on_entity_state_changed_(). When the state-sync bug is open
+  // (see [[project_state_sync_bug]]), the banner shows whatever
+  // entities happen to have state set at fetch time.
+
+  // Lazily create the banner container the first time we need it.
+  // Anchor: just below the title bar (y=36), full width, 60px tall.
+  // On narrow screens we keep 60px (it's the same height as a room
+  // card, so it slots in cleanly).
+  if (this->media_banner_ == nullptr) {
+    lv_obj_t* screen = lv_scr_act();
+    if (screen == nullptr) return;
+    this->media_banner_ = lv_obj_create(screen);
+    lv_obj_set_pos(this->media_banner_, 0, 36);
+    lv_obj_set_size(this->media_banner_, this->screen_width_, 60);
+    // Match the main_container_'s bg so the banner reads as part of
+    // the same surface. 0x0f1620 is the same color as main_container_.
+    lv_obj_set_style_bg_color(this->media_banner_, lv_color_hex(0x0f1620), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(this->media_banner_, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(this->media_banner_, 0, 0);
+    lv_obj_set_style_border_width(this->media_banner_, 0, 0);
+    lv_obj_set_style_pad_all(this->media_banner_, 8, 0);
+    // Banner stays put while the room grid scrolls under it. Use a
+    // flex row so the tiles line up automatically as we add/remove.
+    lv_obj_set_flex_flow(this->media_banner_, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(this->media_banner_,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    // The banner is below the title bar (which is at y=0..36) but the
+    // title bar is drawn last so it stays on top. Defensive: move
+    // the banner behind the title bar explicitly.
+    if (this->title_bar_ != nullptr) {
+      lv_obj_move_background(this->media_banner_);
+    }
+  }
+
+  // Find currently-playing media_player entities across all rooms.
+  // We collect into a small list with a parallel "tile to keep"
+  // map so the loop can update the UI incrementally.
+  std::vector<std::string> playing_ids;
+  for (const auto& kv : this->entities_by_area_) {
+    for (const auto& e : kv.second) {
+      if (e.domain == "media_player" && e.state == "playing") {
+        // .data() is null-terminated (string_view over std::string
+        // in the arena). For the std::string map key, we need a
+        // std::string copy; the allocation is bounded by the number
+        // of playing media_players (typically 0..3).
+        playing_ids.emplace_back(e.entity_id.data(), e.entity_id.size());
+      }
+    }
+  }
+
+  // Stale-tile removal: any tile in media_tiles_ that isn't in
+  // playing_ids is destroyed.
+  std::set<std::string> playing_set(playing_ids.begin(), playing_ids.end());
+  for (auto it = this->media_tiles_.begin(); it != this->media_tiles_.end(); ) {
+    if (playing_set.find(it->first) == playing_set.end()) {
+      if (it->second != nullptr) lv_obj_del(it->second);
+      it = this->media_tiles_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // Tile creation/update: for each currently-playing entity, ensure
+  // a tile widget exists in the banner. Tiles are 200x44 with the
+  // entity's friendly name on the left and a "II" pause hint on the
+  // right. Tapping the tile sends media_pause to the entity.
+  for (const auto& eid : playing_ids) {
+    if (this->media_tiles_.count(eid) > 0) continue;  // already there
+    // Find the entity so we can read its friendly name.
+    std::string_view eid_view(eid);
+    std::string_view name_view;
+    for (const auto& kv : this->entities_by_area_) {
+      for (const auto& e : kv.second) {
+        if (e.entity_id == eid_view) {
+          name_view = e.name;
+          break;
+        }
+      }
+      if (!name_view.empty()) break;
+    }
+    if (name_view.empty()) name_view = eid_view;  // fall back to entity_id
+
+    // Tile body
+    lv_obj_t* tile = lv_obj_create(this->media_banner_);
+    lv_obj_set_size(tile, 200, 44);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(0x1f2937), 0);
+    lv_obj_set_style_radius(tile, 6, 0);
+    lv_obj_set_style_border_width(tile, 1, 0);
+    lv_obj_set_style_border_color(tile, lv_color_hex(0x22c55e), 0);
+    lv_obj_set_scrollbar_mode(tile, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+
+    // Name label (left)
+    lv_obj_t* name_label = lv_label_create(tile);
+    lv_label_set_text(name_label, name_view.data());
+    lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(name_label, 130);
+    lv_obj_set_style_text_color(name_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 10, 0);
+
+    // Pause icon (right). "II" in lieu of U+23F8 PAUSE (not in the
+    // default Montserrat font - same workaround as elsewhere).
+    lv_obj_t* pause_lbl = lv_label_create(tile);
+    lv_label_set_text(pause_lbl, "II");
+    lv_obj_set_style_text_color(pause_lbl, lv_color_hex(0x22c55e), 0);
+    lv_obj_align(pause_lbl, LV_ALIGN_RIGHT_MID, -10, 0);
+
+    // Tap handler: media_pause. We capture the entity_id as a
+    // heap-allocated std::string (small, bounded by # of playing
+    // media_players) and free it on the DELETE event.
+    std::string* eid_copy = new std::string(eid);
+    lv_obj_set_user_data(tile, eid_copy);
+    lv_obj_add_event_cb(tile, [](lv_event_t* event) {
+      lv_obj_t* t = (lv_obj_t*)lv_event_get_target(event);
+      std::string* p = (std::string*)lv_obj_get_user_data(t);
+      if (s_instance == nullptr || p == nullptr) return;
+      ESP_LOGI(TAG, "Banner tap: pausing %s", p->c_str());
+      s_instance->call_ha_service_("media_player.media_pause", "entity_id", *p, -1);
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(tile, [](lv_event_t* event) {
+      lv_obj_t* t = (lv_obj_t*)lv_event_get_target(event);
+      std::string* p = (std::string*)lv_obj_get_user_data(t);
+      delete p;
+      lv_obj_set_user_data(t, nullptr);
+    }, LV_EVENT_DELETE, nullptr);
+
+    this->media_tiles_[eid] = tile;
+  }
+
+  // Show the banner only if there's at least one tile. The banner
+  // is positioned at y=36 (just below the title bar). When hidden,
+  // the room grid below renders against the same bg and the gap
+  // is invisible.
+  bool any = !this->media_tiles_.empty();
+  if (any) {
+    lv_obj_remove_flag(this->media_banner_, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(this->media_banner_, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
 void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int entity_index, int y_pos, uint32_t color) {
   if (this->is_entity_hidden_(entity.entity_id)) {
     ESP_LOGI(TAG, "Skipping hidden entity: %.*s",
@@ -2341,6 +2509,7 @@ void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const cha
 
   for (auto& kv : this->entities_by_area_) {
     for (auto& e : kv.second) {
+      if (e.domain == "media_player") continue;  // scanned separately in update_media_banner_
       if (e.entity_id == entity_id) {
         e.state = new_state;
         break;
@@ -2348,6 +2517,10 @@ void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const cha
     }
   }
   this->update_room_card_visual_state_for_entity_(entity_id);
+  // The "Now Playing" banner lives on the grid page. When the
+  // changed entity is a media_player, the banner's tile set may
+  // need to grow or shrink.
+  this->update_media_banner_();
 }
 
 void HaAutoPanel::on_entity_attribute_changed_(std::string_view entity_id, const char* value) {
