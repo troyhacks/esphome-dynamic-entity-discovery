@@ -328,14 +328,15 @@ class HaAutoPanel : public Component {
   // (square cards). cards_per_row is computed from screen_width and
   // card_gap. main_container_ height is computed from card count.
   int card_width_{250};
-  // v1.22g: card is back to square (was 310 in v1.22f). The
-  // arc lives in the upper portion (top gap=12px), the room
-  // name sits inside the arc's lower opening, and the ON/OFF
-  // button is pinned to the bottom of the card. Square 250x250
-  // is what the user said looks "very good" in the reference
-  // screenshot - we just needed to lift the arc a tiny bit
-  // off the top edge.
-  int card_height_{250};
+  // v1.22q: parametric arc size - 96% of the smaller card
+  // dimension with a 2% padding on each side. For 250x250
+  // that's 240. The 2% padding means the arc leaves a
+  // visible gap on all sides (the user's "breathing room"
+  // request). 96% chosen so the arc and button together
+  // fit a 250x250 card with the button pinned to the
+  // bottom (250 - 240 = 10px gap below the arc, plus the
+  // button is 32px tall with 8px bottom margin).
+  int arc_size_() const { return (std::min(this->card_width_, this->card_height_) * 96) / 100; }
   int card_gap_{12};
   int screen_width_{1024};
   int screen_height_{600};
@@ -512,10 +513,41 @@ class HaAutoPanel : public Component {
   // bar has something to show on the next boot before the network
   // call returns.
   lv_obj_t* title_home_label_{nullptr};
+  // v1.22r: weather label on the LEFT of the title bar. Text-only
+  // (e.g. "Cloudy 3°C"). Populated by fetch_weather_() from the
+  // HA weather entity (default: weather.home). Hidden until the
+  // first fetch completes; if no weather entity is configured,
+  // stays hidden.
+  lv_obj_t* title_weather_label_{nullptr};
+  // Cached "Cloudy 3°C" string. Refreshed on each fetch_weather_().
+  // Cached so the title bar has something to show on the next
+  // boot before the network call returns.
+  std::string weather_text_;
+  // v1.22r: left cluster (the weather + future left-side widgets).
+  // Anchored to the LEFT edge of the title bar with LV_ALIGN_LEFT_MID
+  // + a small left padding (8px). Lives in a flex row so adding
+  // more left-side widgets (e.g. a status icon next to the weather)
+  // is a one-line change.
+  lv_obj_t* title_left_cluster_{nullptr};
+  // v1.22r: state of the Edit/Reboot button toggle. The time
+  // label is the tap target: tapping it shows/hides the Edit
+  // and Reboot buttons (which are in the right cluster). Default
+  // is hidden so the title bar stays tidy (user request: "the
+  // edit and reboot buttons should be hidden").
+  bool title_chrome_visible_{false};
+  // v1.22r: last time the user tapped the time label. Used to
+  // debounce rapid taps (so a finger drag across the title bar
+  // doesn't accidentally trigger multiple toggles). Set to
+  // millis() on each click; only toggle if >250ms since last.
+  uint32_t last_title_tap_ms_{0};
   // Local clock, populated by the SNTP time component (yaml id
   // `sntp_time`) and refreshed every loop() tick (~1Hz). Sits to
   // the right of the home name, just left of the Edit button.
   // Shows "--:--" until NTP sync succeeds.
+  //
+  // v1.22r: the time label is now CLICKABLE. Tapping it
+  // toggles the Edit/Reboot button visibility (see
+  // title_chrome_visible_).
   lv_obj_t* title_time_label_{nullptr};
   // "DBG" button in the title bar. Shown when the panel is in any
   // non-READY state (the user needs to diagnose AUTH_FAILED /

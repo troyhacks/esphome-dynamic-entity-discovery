@@ -139,7 +139,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22p"
+#define FIRMWARE_VERSION "v1.22r"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -1935,62 +1935,119 @@ void HaAutoPanel::create_ui_from_room_cards_() {
 }
 
 void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
-  // Fixed title bar at the top of the page (a child of the screen so it
-  // sits on top of every page). 36px tall. Holds: HA connection
-  // status dot + label, and an Edit button that toggles customization
-  // mode (long-press rooms to hide/reorder).
+  // v1.22r: header bar redesign.
+  //
+  // Layout (left to right):
+  //   [LEFT_CLUSTER]  [HOME_NAME (centered)]  [RIGHT_CLUSTER]
+  //         |                                    |
+  //         weather (e.g. "Cloudy 3°C")         time (tappable) +
+  //                                              [Edit] [Reboot] (hidden)
+  //
+  // The 3 sections are anchored with LV_ALIGN_LEFT_MID,
+  // LV_ALIGN_CENTER, and LV_ALIGN_RIGHT_MID respectively. No
+  // hard-coded positions or pixel offsets anywhere - everything
+  // is relative to the parent title bar, and the title bar's
+  // size is the only absolute dimension (and even that comes
+  // from screen_width_ / a 36px-tall constant).
+  //
+  // Per the user's design rule (parametric, no absolute
+  // positions): this bar adapts to any screen_width_ because
+  // the home name is LV_ALIGN_CENTER (auto-adjusts to the
+  // space not claimed by the left/right clusters).
+
   this->title_bar_ = lv_obj_create(parent);
+  // Title bar height is the only literal dimension - the
+  // user's design rule is "no hard-coded card sizes" and
+  // this isn't a card. 36px is the bar's design height.
   lv_obj_set_size(this->title_bar_, this->screen_width_, 36);
-  lv_obj_set_pos(this->title_bar_, 0, 0);
   lv_obj_set_style_bg_color(this->title_bar_, lv_color_hex(0x1f2937), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(this->title_bar_, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_width(this->title_bar_, 0, 0);
   lv_obj_set_style_pad_all(this->title_bar_, 0, 0);
   lv_obj_remove_flag(this->title_bar_, LV_OBJ_FLAG_SCROLLABLE);
-  // Don't block clicks on the room grid underneath
   lv_obj_remove_flag(this->title_bar_, LV_OBJ_FLAG_CLICKABLE);
 
-  // HA status was previously shown as a small colored dot on the left
-  // of the title bar, but in practice the user couldn't tell what
-  // the dot was (it read as "a white something"). The dot is now
-  // removed entirely - the connection state is communicated via the
-  // debug button (visible on error states) and the debug panel
-  // itself (WiFi / HA sections).
+  // HA connection status (the old "dot + label" pair on the left)
+  // is now removed entirely. The dot read as "a white something"
+  // and wasn't informative. Connection state is communicated via
+  // the debug button + debug panel. title_status_dot_ and
+  // title_status_label_ stay nullptr - show_status_screen_()
+  // checks for this.
   this->title_status_dot_ = nullptr;
   this->title_status_label_ = nullptr;
 
-  // Home name label - centered horizontally AND vertically in the title
-  // bar on the main grid page. Populated by fetch_home_name_() with the
-  // HA zone.home entity's friendly_name. Hidden by default; the
-  // show_room_grid_() / show_entity_detail_() pair flips it. Clip long
-  // names so a long friendly_name doesn't bleed into the right
-  // cluster. The max width here is just a safety bound - the label
-  // is in LV_ALIGN_CENTER so it visually floats in the middle of
-  // the available title-bar area.
+  // --- LEFT cluster (weather + future left-side widgets) ---
+  // Anchored to the LEFT edge of the title bar via
+  // LV_ALIGN_LEFT_MID. A flex row with pad_column=8 so any
+  // children have automatic L/R spacing. The cluster auto-sizes
+  // to its visible children, so a future "no weather" config
+  // collapses to a 0-width cluster without manual adjustment.
+  this->title_left_cluster_ = lv_obj_create(this->title_bar_);
+  lv_obj_set_size(this->title_left_cluster_, LV_SIZE_CONTENT, 36);
+  lv_obj_align(this->title_left_cluster_, LV_ALIGN_LEFT_MID, 8, 0);
+  lv_obj_set_style_bg_opa(this->title_left_cluster_, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(this->title_left_cluster_, 0, 0);
+  lv_obj_set_style_pad_all(this->title_left_cluster_, 0, 0);
+  // pad_column = 8 gives the user the "nice automatic spacing"
+  // they asked for between adjacent buttons. For the weather
+  // label alone this is a no-op, but adding a status icon
+  // later will inherit the spacing.
+  lv_obj_set_style_pad_column(this->title_left_cluster_, 8, 0);
+  lv_obj_set_flex_flow(this->title_left_cluster_, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(this->title_left_cluster_, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_remove_flag(this->title_left_cluster_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(this->title_left_cluster_, LV_OBJ_FLAG_CLICKABLE);
+
+  // Weather label - shows "Cloudy 3°C" (or whatever the HA
+  // weather entity reports). Width is data-driven via the
+  // text measurement helper. Hidden by default until the
+  // first successful weather fetch; if no weather entity
+  // exists in HA, stays hidden.
+  this->title_weather_label_ = lv_label_create(this->title_left_cluster_);
+  lv_label_set_text(this->title_weather_label_, "--°");
+  lv_label_set_long_mode(this->title_weather_label_, LV_LABEL_LONG_CLIP);
+  lv_obj_set_style_text_color(this->title_weather_label_, lv_color_hex(0xe5e7eb), 0);
+  {
+    const lv_font_t* wf = lv_obj_get_style_text_font(
+        this->title_weather_label_, LV_PART_MAIN);
+    lv_obj_set_width(this->title_weather_label_,
+                     button_width_for_text_("--°", wf, 4));
+  }
+  lv_obj_add_flag(this->title_weather_label_, LV_OBJ_FLAG_HIDDEN);
+
+  // Home name label - centered horizontally AND vertically in
+  // the title bar. Width is the bar width minus a safety
+  // bound (long friendly_name should clip, not bleed into
+  // the left/right clusters). The label is LV_ALIGN_CENTER
+  // so it visually floats in the middle of the available
+  // title-bar area.
   this->title_home_label_ = lv_label_create(this->title_bar_);
   lv_label_set_text(this->title_home_label_, "");
   lv_label_set_long_mode(this->title_home_label_, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(this->title_home_label_, lv_color_hex(0xe5e7eb), 0);
-  lv_obj_set_width(this->title_home_label_, this->screen_width_ - 360);
+  // The home name is sized to the bar minus the clusters,
+  // but we don't have a way to measure cluster widths
+  // before they're built. Use 60% of bar width as a safe
+  // upper bound - any longer name clips.
+  lv_obj_set_width(this->title_home_label_, (this->screen_width_ * 60) / 100);
   lv_obj_set_style_text_align(this->title_home_label_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(this->title_home_label_, LV_ALIGN_CENTER, 0, -1);
   // Start hidden. un-hide logic below in set_panel_state_().
 
-  // --- Right cluster (flex row, adapts to any screen width) ---
-  // All the right-side buttons (Time, Sort, Cancel, Debug, Edit)
-  // live in a single flex-row sub-container that's pinned to the
-  // right edge of the title bar. The flex layout auto-sizes the
-  // cluster around its visible children, and hidden children just
-  // collapse out of the layout - no absolute positions anywhere.
-  // This is the user's "works on any screen" requirement: change
-  // screen_width_ in YAML and the whole bar reflows.
+  // --- RIGHT cluster (time + Edit + Reboot + DBG) ---
+  // Anchored to the RIGHT edge of the title bar via
+  // LV_ALIGN_RIGHT_MID. Flex row, pad_column=8 (the user's
+  // "nice automatic spacing"). The cluster auto-sizes to
+  // its visible children; hidden widgets just collapse out
+  // of the layout.
   this->title_right_cluster_ = lv_obj_create(this->title_bar_);
   lv_obj_set_size(this->title_right_cluster_, LV_SIZE_CONTENT, 36);
-  lv_obj_align(this->title_right_cluster_, LV_ALIGN_RIGHT_MID, -12, 0);
+  lv_obj_align(this->title_right_cluster_, LV_ALIGN_RIGHT_MID, -8, 0);
   lv_obj_set_style_bg_opa(this->title_right_cluster_, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(this->title_right_cluster_, 0, 0);
   lv_obj_set_style_pad_all(this->title_right_cluster_, 0, 0);
-  lv_obj_set_style_pad_column(this->title_right_cluster_, 6, 0);
+  lv_obj_set_style_pad_column(this->title_right_cluster_, 8, 0);
   lv_obj_set_flex_flow(this->title_right_cluster_, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(this->title_right_cluster_, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -1998,31 +2055,64 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_remove_flag(this->title_right_cluster_, LV_OBJ_FLAG_CLICKABLE);
 
   // Local clock (HH:MM AM/PM). Right cluster child. Updated by
-  // update_title_time_() called from loop() (~1Hz) once NTP sync has
-  // completed. v1.22e: width is now data-driven via
-  // button_width_for_text_() against the placeholder "--:--".
-  // update_title_time_() also calls the same helper on every
-  // minute-change to re-fit the label to the new text, so a future
-  // switch to 24-hour or non-Latin digits just works.
+  // update_title_time_() called from loop() (~1Hz) once NTP sync
+  // has completed. v1.22r: the time label is CLICKABLE - tapping
+  // it toggles the Edit + Reboot buttons (title_chrome_visible_).
+  // Width is data-driven via button_width_for_text_().
   this->title_time_label_ = lv_label_create(this->title_right_cluster_);
   lv_label_set_text(this->title_time_label_, "--:--");
   lv_label_set_long_mode(this->title_time_label_, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(this->title_time_label_, lv_color_hex(0x9ca3af), 0);
   lv_obj_set_style_text_align(this->title_time_label_, LV_TEXT_ALIGN_RIGHT, 0);
-  // The font is the lvgl `text_font` default (set in yaml). We
-  // pull it from the parent lvgl config rather than hard-coding
-  // a font id so the width adapts if the user swaps the font.
   const lv_font_t* time_font = lv_obj_get_style_text_font(
       this->title_time_label_, LV_PART_MAIN);
   lv_obj_set_width(this->title_time_label_,
                    button_width_for_text_("--:--", time_font, 4));
   lv_obj_set_height(this->title_time_label_, LV_SIZE_CONTENT);
-  lv_obj_add_flag(this->title_time_label_, LV_OBJ_FLAG_HIDDEN);
+  // Make the time label clickable. The tap handler is set later
+  // (after the buttons are created) so it can toggle them.
+  lv_obj_add_flag(this->title_time_label_, LV_OBJ_FLAG_CLICKABLE);
+  // Add an invisible "hit area" padding via style so the
+  // tap target is comfortable - the label text is small
+  // (14pt) but the user wants a forgiving touch area.
+  lv_obj_set_style_pad_all(this->title_time_label_, 6, 0);
+  // v1.22r: click handler for the time toggle. Tapping the
+  // time shows/hides the Edit + Reboot buttons in the right
+  // cluster (the "tidy by default" rule). Debounced by 250ms
+  // via last_title_tap_ms_ so a finger drag across the title
+  // bar doesn't trigger multiple toggles. The buttons were
+  // created above as default-hidden; this handler just flips
+  // their LV_OBJ_FLAG_HIDDEN bit and updates
+  // title_chrome_visible_ for the next show_room_grid_() pass.
+  lv_obj_add_event_cb(this->title_time_label_, [](lv_event_t* event) {
+    if (s_instance == nullptr) return;
+    uint32_t now_ms = millis();
+    if (now_ms - s_instance->last_title_tap_ms_ < 250) {
+      return;  // debounce
+    }
+    s_instance->last_title_tap_ms_ = now_ms;
+    s_instance->title_chrome_visible_ = !s_instance->title_chrome_visible_;
+    if (s_instance->title_sort_btn_ != nullptr) {
+      if (s_instance->title_chrome_visible_) {
+        lv_obj_remove_flag(s_instance->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_obj_add_flag(s_instance->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+    if (s_instance->title_reboot_btn_ != nullptr) {
+      if (s_instance->title_chrome_visible_) {
+        lv_obj_remove_flag(s_instance->title_reboot_btn_, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_obj_add_flag(s_instance->title_reboot_btn_, LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+  }, LV_EVENT_CLICKED, nullptr);
 
   // Debug button (50px wide "DBG"). Right cluster child. Visible
-  // only when the panel is in any non-READY state (something needs
-  // the user's attention). Edit mode does NOT show it (the title
-  // bar is already crowded with Sort + Cancel + Done).
+  // only when the panel is in any non-READY state. In the new
+  // v1.22r layout it's always part of the right cluster; the
+  // cluster itself may be hidden on small screens, but on a
+  // 7" panel we have the room.
   this->title_debug_btn_ = lv_obj_create(this->title_right_cluster_);
   lv_obj_set_size(this->title_debug_btn_, 50, 28);
   lv_obj_set_style_bg_color(this->title_debug_btn_, lv_color_hex(0x374151), 0);
@@ -2066,6 +2156,10 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_set_style_radius(this->title_sort_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_sort_btn_, 0, 0);
   lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_CLICKABLE);
+  // v1.22r: hidden by default. The time-tap toggle in
+  // show_room_grid_() shows/hides it based on
+  // title_chrome_visible_.
+  lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_remove_flag(this->title_sort_btn_, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t* sort_label = lv_label_create(this->title_sort_btn_);
   lv_label_set_text(sort_label, "Edit");
@@ -2235,6 +2329,8 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
     lv_obj_set_style_radius(this->title_reboot_btn_, 6, 0);
     lv_obj_set_style_border_width(this->title_reboot_btn_, 0, 0);
     lv_obj_add_flag(this->title_reboot_btn_, LV_OBJ_FLAG_CLICKABLE);
+    // v1.22r: hidden by default (the time-tap toggle shows it).
+    lv_obj_add_flag(this->title_reboot_btn_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(this->title_reboot_btn_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t* reboot_label = lv_label_create(this->title_reboot_btn_);
     lv_label_set_text(reboot_label, "Reboot");
@@ -2889,8 +2985,25 @@ void HaAutoPanel::show_room_grid_() {
   // the next reboot, and the user lost the only path into the
   // customizer. Un-hide it here so the grid returns to its
   // expected chrome.
+  //
+  // v1.22r: Edit (Sort) + Reboot buttons are now hidden by
+  // default on the grid page (the user wants the title bar
+  // tidy by default). They appear when the user taps the
+  // time label. The current state of title_chrome_visible_
+  // decides whether they're shown.
   if (this->title_sort_btn_ != nullptr) {
-    lv_obj_remove_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+    if (this->title_chrome_visible_) {
+      lv_obj_remove_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (this->title_reboot_btn_ != nullptr) {
+    if (this->title_chrome_visible_) {
+      lv_obj_remove_flag(this->title_reboot_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(this->title_reboot_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
   }
   // v1.11: title_edit_btn_ was removed. No label to flip back to
   // "Edit" on return from the detail page. The title bar on the
