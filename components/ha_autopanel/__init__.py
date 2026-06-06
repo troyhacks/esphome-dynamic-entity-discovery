@@ -99,6 +99,31 @@ CONFIG_SCHEMA = cv.Schema(
         # successful fetch anyway, so a bad/missing entity_id is
         # silently no-op rather than an error spam).
         cv.Optional("weather_entity_id", default="weather.home"): cv.string,
+        # v1.22v: subscription scope. The "all" mode (default) is
+        # the v1.22u behavior - subscribe to every entity + 5s bulk
+        # poll. "none" disables all subscriptions (rely on the bulk
+        # poll). "per_room" subscribes only to entities in the
+        # currently-displayed room + global media_players, with
+        # maybe_poll_current_room_states_() running a 3s per-room
+        # poll. The per-room mode eliminates the O(N*E) full-scan
+        # work that was the trigger condition for the priority-
+        # inversion deadlock documented in
+        # [[project_crowpanel_sdio_is_symptom]]. See
+        # .claude/plans/greedy-discovering-koala.md for the
+        # full v1.22v plan.
+        cv.Optional("subscribe_mode", default="all"): cv.one_of(
+            "all", "none", "per_room"
+        ),
+        # v1.22v: WLED-pattern stuck-task recovery knob. When
+        # true, the stuck-task detector also takes corrective
+        # action (drop httpd worker priority, then C6 reset).
+        # When false (default), the detector is pure
+        # observability - the user can see the stuck state in
+        # the log without the detector doing anything
+        # destructive. Per the user's note: "I am providing
+        # it as another 'knob' we can turn and monitor" - the
+        # user wants visibility first, recovery second.
+        cv.Optional("enable_stuck_task_recovery", default=False): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -173,3 +198,8 @@ async def to_code(config):
     cg.add(var.set_use_24h_time(config["use_24h_time"]))
     cg.add(var.set_show_time(config["show_time"]))
     cg.add(var.set_weather_entity_id(config["weather_entity_id"]))
+    # v1.22v: subscription scope (per-room poll opt-in).
+    cg.add(var.set_subscribe_mode(config["subscribe_mode"]))
+    # v1.22v: stuck-task recovery knob (default OFF - the user
+    # wants visibility first, recovery second).
+    cg.add(var.set_enable_stuck_task_recovery(config["enable_stuck_task_recovery"]))

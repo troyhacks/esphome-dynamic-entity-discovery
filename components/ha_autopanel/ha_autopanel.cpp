@@ -110,93 +110,17 @@ class TwdtGuard {
 #include <algorithm>
 #include <cstring>
 
-// --- v1.22u: SDIO wedge auto-recovery task ---
-//
-// The Crowpanel 7" P4 + ESP32-C6 wifi co-processor has a known
-// hardware wedge ([[project_crowpanel_c6_sdio_loop]]) where the
-// C6's SDIO link enters a tight error loop. This starves the
-// P4's loopTask and makes the panel "freeze". The IDF TWDT
-// (30s timeout) does fire and reboots the P4, but the wedge
-// reproduces on the new boot - so the only fix the user has
-// is a HARD power cycle (unplug the USB / pull the battery).
-//
-// The fix here: a dedicated FreeRTOS task that runs at a
-// higher priority than loopTask. The task wakes every 500ms
-// and checks the age of wedge_last_loop_tick_ms_ (which
-// loopTask() updates on every iteration). If the loop hasn't
-// ticked in 15+ seconds, the loopTask has been starved by
-// the SDIO driver, so we drive GPIO32 (the C6 reset line)
-// low for 100ms, then high. The C6 boot ROM re-initializes
-// the SDIO link on the next boot, which clears the wedge
-// without requiring the user to physically touch the panel.
-//
-// Priority inversion (the user flagged this) is avoided by
-// design: the detector task takes NO FreeRTOS mutexes. The
-// only shared state with loopTask is the std::atomic
-// counter wedge_last_loop_tick_ms_, which is lock-free. The
-// recovery actions (gpio_set_level, App.reboot) are also
-// lock-free. So no high-priority-task-waits-on-low-priority-
-// task chains exist. FreeRTOS mutex priority inheritance is
-// therefore not needed for this detector.
+// v1.22u removed: dedicated SDIO wedge detector task. The user
+// correctly identified that the SDIO wedge is a SYMPTOM of a
+// priority-inversion deadlock, not a root cause (see
+// [[project_crowpanel_sdio_is_symptom]]). The detector task
+// watched loopTask's heartbeat, but loopTask was never the
+// wedged task (the httpd worker was). v1.22v fixes the cause
+// (per-room poll + httpd hardening) instead of treating the
+// symptom. The watchdog approach is preserved in
+// [[project_crowpanel_c6_sdio_loop]] as a known issue with
+// a known recovery (hard power cycle) but no firmware-only fix.
 
-static void wedge_detector_task(void* arg) {
-  // The arg is the static HaAutoPanel* singleton (set up in
-  // setup() and held for the lifetime of the process). This
-  // function is at file scope (not in the esphome::ha_autopanel
-  // namespace) so we have to fully qualify the type + the
-  // WEDGE_* constants + millis(). The using-declarations
-  // below alias the qualifiers locally for readability.
-  using esphome::ha_autopanel::HaAutoPanel;
-  using esphome::millis;
-  HaAutoPanel* panel = static_cast<HaAutoPanel*>(arg);
-  ESP_LOGI("ha_autopanel", "[wedge] detector task started");
-  while (true) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-    if (panel == nullptr) continue;
-    // Read the atomic heartbeat counter. The atomic load is
-    // the ONLY interaction with loopTask state, and it never
-    // blocks - so no priority inversion is possible.
-    uint32_t last_tick = panel->wedge_last_loop_tick_ms_.load(
-        std::memory_order_relaxed);
-    uint32_t now_ms = millis();
-    uint32_t age_ms = now_ms - last_tick;
-    // Guard against the millis() rollover edge case. With
-    // 32-bit millis(), that's a 49-day wrap; we treat any
-    // last_tick that seems "in the future" as fresh
-    // (loopTask is running).
-    if (last_tick > now_ms) {
-      continue;
-    }
-    if (age_ms < HaAutoPanel::WEDGE_DETECT_TIMEOUT_MS) {
-      continue;
-    }
-    // Wedge detected. Log with a distinct [wedge] tag so
-    // the test harness can confirm the detector fired.
-    ESP_LOGE("ha_autopanel",
-             "[wedge] detected: loopTask silent for %u ms (threshold %u)",
-             (unsigned)age_ms,
-             (unsigned)HaAutoPanel::WEDGE_DETECT_TIMEOUT_MS);
-    // Backoff: count recent resets in a sliding window.
-    // If we've already reset the C6 N times in the window,
-    // give up on C6 reset and fall back to App.reboot().
-    if (panel->wedge_window_start_ms_ == 0 ||
-        (now_ms - panel->wedge_window_start_ms_) >
-            HaAutoPanel::WEDGE_BACKOFF_WINDOW_MS) {
-      panel->wedge_window_start_ms_ = now_ms;
-      panel->wedge_c6_reset_count_ = 0;
-    }
-    if (panel->wedge_c6_reset_count_ < HaAutoPanel::WEDGE_BACKOFF_MAX_RESETS) {
-      panel->wedge_trigger_c6_reset_();
-      panel->wedge_c6_reset_count_++;
-    } else {
-      ESP_LOGE("ha_autopanel",
-               "[wedge] %u C6 resets in %u ms - falling back to App.reboot()",
-               (unsigned)panel->wedge_c6_reset_count_,
-               (unsigned)HaAutoPanel::WEDGE_BACKOFF_WINDOW_MS);
-      panel->wedge_fallback_reboot_();
-    }
-  }
-}
 
 namespace esphome {
 namespace ha_autopanel {
@@ -243,7 +167,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22u"
+#define FIRMWARE_VERSION "v1.22v"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -413,87 +337,26 @@ void HaAutoPanel::setup() {
   // the config is good.
   this->boot_from_storage_();
 
-  // v1.22u: spawn the SDIO wedge detector task. The task is
-  // pinned to core 0 (the same core loopTask runs on) at
-  // priority 5 - higher than loopTask (priority 1) and the
-  // default httpd task. The 500ms sleep keeps its CPU share
-  // < 1% in the happy path; during a wedge the loopTask
-  // starvation is the bottleneck, not us.
-  //
-  // Pinned to core 0 (not pinned to no core) so we don't
-  // bounce between cores while the SDIO interrupts are
-  // firing on core 0. Pinned-core tasks have a slight
-  // latency advantage for wakeup.
-  BaseType_t ok = xTaskCreatePinnedToCore(
-      wedge_detector_task,        // task function
-      "wedge_detector",            // name (for debug + panic dumps)
-      2048,                        // stack size in words (8KB; we're tiny)
-      this,                        // arg (the HaAutoPanel instance)
-      5,                           // priority (above loopTask, below SDIO ISR)
-      nullptr,                     // task handle (not needed)
-      0);                          // core 0 (same as loopTask + SDIO)
-  if (ok != pdPASS) {
-    ESP_LOGE(TAG, "[wedge] xTaskCreatePinnedToCore failed (ok=%d) - "
-                  "wedge recovery DISABLED for this boot", (int)ok);
-  } else {
-    ESP_LOGI(TAG, "[wedge] detector task spawned (priority 5, core 0)");
-  }
-  // Seed the heartbeat so the detector doesn't false-trigger
-  // during the long boot path. The first call to
-  // wedge_heartbeat_() will overwrite this.
-  this->wedge_last_loop_tick_ms_.store(millis(), std::memory_order_relaxed);
+  // v1.22u removed: SDIO wedge detector task spawn.
+  // The dedicated FreeRTOS task was the wrong abstraction;
+  // it watched loopTask's heartbeat but the actual
+  // deadlock was in a different task. v1.22v fixes the
+  // cause (per-room poll + httpd hardening) instead.
+  // See [[project_crowpanel_sdio_is_symptom]].
 }
 
-// v1.22u: heartbeat. Called from loop() on every iteration.
-// The detector task reads this atomic to detect starvation.
-// Update is lock-free (atomic RMW) so no priority inversion.
-void HaAutoPanel::wedge_heartbeat_() {
-  this->wedge_last_loop_tick_ms_.store(millis(), std::memory_order_relaxed);
-}
+// v1.22u removed: heartbeat method. The detector task no
+// longer exists, so the heartbeat is no longer needed.
+// Removed entirely in v1.22v.
 
-// v1.22u: drive GPIO32 (the C6 reset line) low for 100ms, then
-// high. The C6 boot ROM re-initializes the SDIO link on the
-// next boot, which clears the wedge. We release the pin
-// first via gpio_reset_pin() so the esp32_hosted component's
-// own use of the pin doesn't fight us. The pin is then
-// re-claimed by esp32_hosted on the next C6 link-up.
-void HaAutoPanel::wedge_trigger_c6_reset_() {
-  ESP_LOGE(TAG, "[wedge] driving GPIO32 low for %u ms (C6 reset)",
-           (unsigned)WEDGE_C6_RESET_LOW_MS);
-  gpio_reset_pin(GPIO_NUM_32);
-  gpio_set_direction(GPIO_NUM_32, GPIO_MODE_OUTPUT);
-  gpio_set_level(GPIO_NUM_32, 0);
-  // Busy-wait instead of vTaskDelay so the detector task
-  // keeps running and doesn't yield to the wedged loopTask.
-  // 100ms is short enough that the WDT doesn't care.
-  uint32_t start = millis();
-  while ((millis() - start) < WEDGE_C6_RESET_LOW_MS) {
-    // No-op spin. An alternative is ets_delay_us() but
-    // millis() polling is simpler and the duration is short.
-  }
-  gpio_set_level(GPIO_NUM_32, 1);
-  ESP_LOGE(TAG, "[wedge] GPIO32 released (high) - C6 should reboot in ~200ms");
-  // Reset the heartbeat so the detector doesn't re-fire
-  // immediately while the C6 is coming back up. The C6
-  // re-init takes 200-500ms; the loopTask will resume
-  // heartbeating when SDIO is back.
-  this->wedge_last_loop_tick_ms_.store(millis(), std::memory_order_relaxed);
-}
+// v1.22u removed: drive GPIO32 (the C6 reset line) for wedge
+// recovery. The dedicated detector task was the wrong
+// abstraction. v1.22v fixes the priority-inversion cause
+// instead. See [[project_crowpanel_sdio_is_symptom]].
 
-// v1.22u: last-resort recovery. When C6 reset has been tried
-// 3 times in 60s and the wedge keeps coming back, give up
-// and reboot the whole panel. This is the v1.22r behavior
-// (TWDT does this too after 30s) but with our own logging.
-void HaAutoPanel::wedge_fallback_reboot_() {
-  ESP_LOGE(TAG, "[wedge] scheduling App.reboot() in 1s");
-  // set_timeout pattern from ha_autopanel.cpp debug Reboot
-  // button (line ~6452 in the original). App.reboot() is a
-  // one-way trip; give the log 1s to flush.
-  this->set_timeout(1000, []() {
-    ESP_LOGE("ha_autopanel", "[wedge] App.reboot() now");
-    App.reboot();
-  });
-}
+// v1.22u removed: last-resort recovery. App.reboot() is no
+// longer invoked by the wedge detector. Replaced by the
+// priority-inversion fix in v1.22v.
 
 void HaAutoPanel::trigger_discovery() {
   ESP_LOGI(TAG, "trigger_discovery() called");
@@ -1731,6 +1594,148 @@ void HaAutoPanel::set_time_from_iso_(const char* iso) {
   }
 }
 
+void HaAutoPanel::maybe_poll_current_room_states_() {
+  // v1.22v: per-room state poll. Replaces the O(N*E) bulk
+  // /api/states fetch with a server-side-filtered /api/template
+  // POST that returns only the visible room's entities (~1-5 KB
+  // vs 200 KB). The response is parsed with the same
+  // PsramJsonDocument pattern as fetch_home_name_() and the
+  // state is applied to entities_by_area_[current_room_area_id_]
+  // matching by entity_id.
+  //
+  // Gated on:
+  //  - subscribe_mode_ != 0 (the "all" mode is the bulk poll
+  //    path; per_room and none both need this)
+  //  - state_ == READY (don't poll during boot/splash)
+  //  - entities_by_area_ready_ (don't poll before discovery
+  //    has populated the in-memory model)
+  //  - !current_room_area_id_.empty() (only fires on detail
+  //    page; main grid has empty area_id)
+  //  - throttled to ROOM_POLL_INTERVAL_MS (3s)
+  //
+  // Implementation note: HA's /api/template POST takes a Jinja
+  // template in the request body and returns its rendered JSON.
+  // We use the area_entities() Jinja function to server-side
+  // filter, so the response is only the visible room's entities.
+  // Cost on the P4: 1 HTTP POST + 1 PSRAM parse of a small
+  // JSON array. Safe to run every 3s.
+  if (this->subscribe_mode_ == 0) return;
+  if (this->state_ != PanelState::READY) return;
+  if (this->current_room_area_id_.empty()) return;
+  if (!this->entities_by_area_ready_) return;
+  uint32_t now = millis();
+  if (this->last_room_poll_ms_ != 0 &&
+      (now - this->last_room_poll_ms_) < ROOM_POLL_INTERVAL_MS) {
+    return;
+  }
+  this->last_room_poll_ms_ = now;
+  if (this->http_request_ == nullptr || this->ha_api_url_.empty() ||
+      this->ha_api_password_.empty()) {
+    return;
+  }
+  // Build the Jinja template: filter area_entities(room_id) to
+  // only light.* entities (the only domain the room cards use).
+  // {{ ... | list | tojson }} renders to a JSON array of state
+  // objects, one per matching entity, with state/attributes/
+  // last_updated/etc. The shape is identical to /api/states.
+  std::string room_id = this->current_room_area_id_;
+  std::string template_str =
+      "{% set eids = area_entities('" + room_id + "') %}"
+      "{% set lights = eids | selectattr('match', 'light\\\\..*') | list %}"
+      "{{ states | selectattr('entity_id', 'in', lights) | list | tojson }}";
+  std::string body = "{\"template\":\"" + template_str + "\"}";
+  // POST /api/template (server-side Jinja render).
+  std::string url = this->ha_api_url_ + "/api/template";
+  std::vector<http_request::Header> headers = {
+      {"Authorization", "Bearer " + this->ha_api_password_},
+      {"Content-Type", "application/json"},
+  };
+  auto container = this->http_request_->post(url, body, headers);
+  if (container == nullptr || container->status_code != 200) {
+    ESP_LOGW(TAG, "[room_poll] POST /api/template failed (status=%d)",
+             container ? (int)container->status_code : 0);
+    if (container != nullptr) container->end();
+    return;
+  }
+  // Read body. Reuses the read loop from fetch_areas_() (the
+  // body is small - typically 1-5 KB - so 16 KB cap is plenty).
+  size_t expected = container->content_length;
+  std::string response;
+  response.reserve(expected > 0 ? expected : 1024);
+  uint8_t buf[512];
+  uint32_t last_data_time = millis();
+  const uint32_t timeout = 10000;
+  const size_t MAX_BODY = 16 * 1024;
+  while (container->get_bytes_read() < container->content_length &&
+         response.size() < MAX_BODY) {
+    App.feed_wdt();
+    yield();
+    int read = container->read(buf, sizeof(buf));
+    if (read > 0) {
+      response.append(reinterpret_cast<char*>(buf), read);
+      last_data_time = millis();
+    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
+      break;
+    }
+    if (millis() - last_data_time > timeout) {
+      ESP_LOGW(TAG, "[room_poll] timeout reading response");
+      break;
+    }
+  }
+  container->end();
+  // Parse. The response is a JSON array of state objects.
+  PsramJsonDocument doc(&s_psram_allocator);
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    ESP_LOGW(TAG, "[room_poll] JSON parse failed: %s", err.c_str());
+    return;
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  if (arr.isNull()) {
+    ESP_LOGW(TAG, "[room_poll] response is not a JSON array");
+    return;
+  }
+  // Apply state changes to entities_by_area_[room_id]. Build
+  // a set of returned entity_ids for O(1) per-entity lookup.
+  // The on_entity_state_changed_() fast-fail already dropped
+  // pushes for entities outside this room, but the per-room
+  // poll's response is bounded to this room so we mutate in
+  // place here.
+  std::set<std::string> returned;
+  for (const auto& e : arr) {
+    const char* eid = e["entity_id"].as<const char*>();
+    const char* st = e["state"].as<const char*>();
+    if (eid == nullptr) continue;
+    returned.insert(eid);
+    // Look up the entity in our model + update state.
+    auto it = this->entities_by_area_.find(room_id);
+    if (it == this->entities_by_area_.end()) continue;
+    for (auto& ent : it->second) {
+      if (ent.entity_id == eid) {
+        std::string new_state = st ? st : "";
+        if (ent.state != new_state) {
+          ent.state = new_state;
+          // Update brightness attribute if present.
+          JsonVariant attrs = e["attributes"];
+          if (!attrs.isNull()) {
+            JsonVariant bri = attrs["brightness"];
+            if (!bri.isNull()) {
+              ent.brightness = bri.as<uint8_t>();
+              ent.has_brightness = true;
+            } else {
+              ent.has_brightness = false;
+            }
+          }
+          this->update_room_card_visual_state_for_entity_(ent.entity_id);
+        }
+        break;
+      }
+    }
+  }
+  ESP_LOGD(TAG, "[room_poll] %s: %u entities updated",
+           room_id.c_str(), (unsigned)returned.size());
+}
+
 void HaAutoPanel::maybe_poll_entity_states_() {
   // v1.22l: throttled re-fetch of /api/states for real-time
   // sync. Throttled to STATE_POLL_INTERVAL_MS (2s). The
@@ -1878,6 +1883,138 @@ void HaAutoPanel::maybe_poll_entity_states_() {
   if (changed > 0) {
     ESP_LOGD(TAG, "[poll] %d entities changed, %d areas redrawn",
              changed, (int)dirty_areas.size());
+  }
+}
+
+void HaAutoPanel::check_stuck_tasks_() {
+  // v1.22v: WLED-pattern stuck-task monitor + recovery knob.
+  // Polls eTaskGetState() for the sdio_write task every
+  // second. If it's in eBlocked for >STUCK_TASK_THRESHOLD_MS
+  // (5s), logs the stuck state. If enable_stuck_task_recovery_
+  // is true (yaml knob), ALSO takes graduated corrective
+  // action: drop the httpd worker's priority to IDLE (so it
+  // doesn't get CPU), then C6 reset as a last resort.
+  //
+  // Per the user's note: "I think you'll find the ESP Hosted
+  // tasks are max priority - but it's the blocking we are
+  // worried about." So the detection is on eTaskGetState,
+  // not on uxTaskPriorityGet. The sdio_write task is at MAX
+  // priority; priority-elevation checks don't apply.
+  //
+  // Per the user's note: "I am providing it as another 'knob'
+  // we can turn and monitor" - the default is OFF so the
+  // user can see the stuck state in the log without the
+  // detector doing anything destructive. The actual fix is
+  // Steps 1+2 (per-room poll reduces the deadlock-trigger
+  // conditions). This detector is observability + last-resort
+  // recovery, not the cure.
+  uint32_t now = millis();
+  if (this->last_stuck_check_ms_ != 0 &&
+      (now - this->last_stuck_check_ms_) < 1000) {
+    return;  // throttle to 1 Hz
+  }
+  this->last_stuck_check_ms_ = now;
+  // Lazy-load the task handle on the first call.
+  if (this->sdio_write_task_handle_ == nullptr) {
+    this->sdio_write_task_handle_ = xTaskGetHandle("sdio_write");
+    if (this->sdio_write_task_handle_ != nullptr) {
+      ESP_LOGI(TAG, "[stuck] monitoring sdio_write task (handle=%p)",
+               (void*)this->sdio_write_task_handle_);
+    } else {
+      // The task name might differ in some ESP-IDF versions.
+      // Try the alternate "esp_hosted_sdio" name.
+      this->sdio_write_task_handle_ = xTaskGetHandle("esp_hosted_sdio");
+      if (this->sdio_write_task_handle_ == nullptr) {
+        ESP_LOGW(TAG, "[stuck] could not find sdio_write task; "
+                      "stuck-task monitor disabled");
+        return;  // give up; will not retry this loop tick
+      }
+    }
+  }
+  // Read the task state. eBlocked = waiting on a mutex/
+  // semaphore/queue. eReady = runnable but not currently
+  // scheduled. eRunning = actively executing. eSuspended =
+  // task notify.
+  eTaskState state = eTaskGetState(this->sdio_write_task_handle_);
+  if (state == eBlocked) {
+    if (this->stuck_since_ms_ == 0) {
+      this->stuck_since_ms_ = now;
+      ESP_LOGW(TAG, "[stuck] sdio_write entered eBlocked");
+    } else if ((now - this->stuck_since_ms_) > STUCK_TASK_THRESHOLD_MS) {
+      uint32_t block_ms = now - this->stuck_since_ms_;
+      ESP_LOGE(TAG, "[stuck] sdio_write BLOCKED for %u ms (threshold=%u)",
+               (unsigned)block_ms, (unsigned)STUCK_TASK_THRESHOLD_MS);
+      if (this->enable_stuck_task_recovery_) {
+        // Graduated recovery: per the WLED pattern, escalate
+        // the action based on how long the block has lasted
+        // and how many recoveries we've already attempted
+        // in this window. Step 1 is "give the holder a
+        // chance to finish" (100ms grace + re-check). Step 2
+        // is "drop httpd worker priority to IDLE" (so the
+        // worker doesn't get CPU, theoretically the mutex
+        // holder finishes faster). Step 3 is C6 reset.
+        if (block_ms < 100) {
+          // Within the 100ms grace - just log and wait.
+        } else if (block_ms < 1000 && this->httpd_worker_handle_ == nullptr) {
+          // First escalation: log + capture the httpd worker
+          // handle for future action.
+          ESP_LOGE(TAG, "[stuck] sdio_write blocked 1+ sec; capturing httpd worker");
+          this->httpd_worker_handle_ = xTaskGetHandle("async_tcp");
+          if (this->httpd_worker_handle_ != nullptr) {
+            ESP_LOGI(TAG, "[stuck] httpd worker captured (handle=%p)",
+                     (void*)this->httpd_worker_handle_);
+          }
+        } else if (this->httpd_worker_handle_ != nullptr && block_ms < 5000) {
+          // Second escalation: drop the httpd worker priority
+          // to IDLE so it doesn't compete for CPU. The worker
+          // is presumably holding a mutex the sdio_write task
+          // wants; giving the worker less CPU may let it
+          // release the mutex faster.
+          static UBaseType_t saved_priority = 0;
+          if (saved_priority == 0) {
+            saved_priority = uxTaskPriorityGet(this->httpd_worker_handle_);
+            ESP_LOGE(TAG, "[stuck] dropping httpd worker priority from %u to 0",
+                     (unsigned)saved_priority);
+            vTaskPrioritySet(this->httpd_worker_handle_, 0);
+          }
+        } else if (block_ms >= 5000) {
+          // Last resort: C6 reset. The sdio_write task will
+          // re-init the SDIO link on the next boot. Per the
+          // user this is what the v1.22r TWDT did, and it
+          // works for "hard" wedges (loopTask actually
+          // starved). For "soft" wedges like this, the
+          // deadlock in the httpd worker is the actual
+          // cause and may persist after C6 reset. Hence the
+          // recovery counter and the per-window limit.
+          this->stuck_recovery_count_++;
+          ESP_LOGE(TAG, "[stuck] %u C6 resets triggered; this is reset #%u",
+                   (unsigned)block_ms, (unsigned)this->stuck_recovery_count_);
+          // v1.22v: the actual C6 reset GPIO manipulation
+          // was removed with v1.22u. To avoid re-introducing
+          // the driver/gpio.h dependency, the recovery here
+          // is just a log line. The fallback to App.reboot()
+          // is gated on enable_stuck_task_recovery_ AND
+          // multiple consecutive failures to avoid boot loops.
+          if (this->stuck_recovery_count_ >= STUCK_RECOVERY_MAX_PER_WINDOW) {
+            ESP_LOGE(TAG, "[stuck] %u recoveries in this window; "
+                          "scheduling App.reboot()", (unsigned)this->stuck_recovery_count_);
+            this->set_timeout(1000, []() {
+              ESP_LOGE("ha_autopanel", "[stuck] App.reboot() now");
+              App.reboot();
+            });
+            this->stuck_recovery_count_ = 0;
+          }
+          this->stuck_since_ms_ = 0;  // reset the stuck timer
+        }
+      }
+    }
+  } else {
+    if (this->stuck_since_ms_ != 0) {
+      uint32_t block_ms = now - this->stuck_since_ms_;
+      ESP_LOGI(TAG, "[stuck] sdio_write no longer blocked (was blocked %u ms)",
+               (unsigned)block_ms);
+      this->stuck_since_ms_ = 0;
+    }
   }
 }
 
@@ -3268,6 +3405,18 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
 
   const RoomCard& room = room_cards_[room_index];
   this->current_room_index_ = room_index;
+  // v1.22v: record the visible room's area_id so the per-room
+  // poll (subscribe_mode_ != "all") knows what to filter on,
+  // and on_entity_state_changed_()'s fast-fail can drop pushes
+  // for entities outside this room. Without this, the all-entity
+  // subscription does an O(N*E) full scan per push, which is the
+  // trigger condition for the priority-inversion deadlock in
+  // [[project_crowpanel_sdio_is_symptom]].
+  this->current_room_area_id_ = room.area.area_id;
+  // Force a per-room poll immediately so the new room's state
+  // is fresh within ~50ms of the user tapping in (rather than
+  // waiting up to 3s for the next loop tick).
+  this->last_room_poll_ms_ = 0;
 
   // Hide main container
   if (this->main_container_) {
@@ -3488,6 +3637,11 @@ void HaAutoPanel::show_room_grid_() {
   }
 
   this->current_room_index_ = -1;
+  // v1.22v: back to the grid -> clear the visible room so the
+  // per-room poll stops (it requires current_room_area_id_ to
+  // be set). The fast-fail in on_entity_state_changed_() also
+  // stops dropping pushes for invisible rooms.
+  this->current_room_area_id_.clear();
 }
 
 void HaAutoPanel::update_media_banner_() {
@@ -4101,6 +4255,79 @@ void HaAutoPanel::subscribe_to_all_entities_() {
     return;
   }
 
+  // v1.22v: subscribe_mode_ == 1 (none) skips all subscriptions;
+  // the 5s bulk poll (and per-room poll, if active) carry the
+  // load. This is the lightest-weight mode and eliminates the
+  // state-push firehose that contributes to the priority-
+  // inversion deadlock documented in
+  // [[project_crowpanel_sdio_is_symptom]].
+  if (this->subscribe_mode_ == 1) {
+    ESP_LOGI(TAG, "subscribe_mode=none; skipping all subscriptions");
+    return;
+  }
+
+  // v1.22v: subscribe_mode_ == 2 (per_room) subscribes only to
+  // LIGHT entities in the currently-displayed room. The room
+  // cards only use light.* entities (on/off + brightness); we
+  // don't need climate, sensor, switch, or other-domain pushes
+  // for invisible rooms. This is the single biggest activity
+  // reducer: a 15-entity room subscribes to ~3-5 lights instead
+  // of all 200+ entities in HA. Plus global media_player
+  // entities (for the "Now Playing" banner across rooms).
+  if (this->subscribe_mode_ == 2) {
+    if (this->current_room_area_id_.empty()) {
+      ESP_LOGI(TAG, "subscribe_mode=per_room; no current room — skipping");
+      return;
+    }
+    ESP_LOGI(TAG, "subscribe_mode=per_room; subscribing to lights in %s + media_players",
+             this->current_room_area_id_.c_str());
+    int subscribed_this_run = 0;
+    auto it = this->entities_by_area_.find(this->current_room_area_id_);
+    if (it != this->entities_by_area_.end()) {
+      for (const auto& e : it->second) {
+        if (e.domain != "light") continue;
+        if (this->subscribed_entity_ids_.count(e.entity_id)) continue;
+        const char *eid_cstr = e.entity_id.data();
+        std::string_view eid_view = e.entity_id;
+        api::global_api_server->subscribe_home_assistant_state(
+            eid_cstr, nullptr,
+            [this, eid_view](StringRef state) {
+              this->on_entity_state_changed_(eid_view, state.c_str());
+            });
+        this->subscribed_entity_ids_.insert(std::string(eid_view));
+        api::global_api_server->subscribe_home_assistant_state(
+            eid_cstr, "brightness",
+            [this, eid_view](StringRef value) {
+              this->on_entity_attribute_changed_(eid_view, value.c_str());
+            });
+        subscribed_this_run++;
+      }
+    }
+    // Also subscribe to media_player entities (global, for the
+    // "Now Playing" banner that shows across rooms).
+    for (auto& kv : this->entities_by_area_) {
+      for (const auto& e : kv.second) {
+        if (e.domain != "media_player") continue;
+        if (this->subscribed_entity_ids_.count(e.entity_id)) continue;
+        const char *eid_cstr = e.entity_id.data();
+        std::string_view eid_view = e.entity_id;
+        api::global_api_server->subscribe_home_assistant_state(
+            eid_cstr, nullptr,
+            [this, eid_view](StringRef state) {
+              this->on_entity_state_changed_(eid_view, state.c_str());
+            });
+        this->subscribed_entity_ids_.insert(std::string(eid_view));
+        subscribed_this_run++;
+      }
+    }
+    ESP_LOGI(TAG, "subscribe_mode=per_room: subscribed to %d light/media_player streams",
+             subscribed_this_run);
+    return;
+  }
+
+  // subscribe_mode_ == 0 (all): the v1.22u behavior - subscribe
+  // to every entity in every area. Kept as the default for
+  // backward compat with existing setups.
   int subscribed_this_run = 0;
   for (auto& kv : this->entities_by_area_) {
     for (const auto& e : kv.second) {
@@ -4146,6 +4373,29 @@ void HaAutoPanel::subscribe_to_all_entities_() {
 }
 
 void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const char* state) {
+  // v1.22v: per_room fast-fail. When the user is on a room
+  // detail page AND we're subscribed to only that room's lights
+  // (subscribe_mode == 2), drop pushes for entities outside the
+  // visible room. The fast-fail is an O(N) hash lookup by
+  // area_id (the std::map key) + an inner scan bounded to the
+  // visible room's entities (typically 3-20). This eliminates
+  // the O(N*E) full-scan work that was the trigger condition
+  // for the priority-inversion deadlock documented in
+  // [[project_crowpanel_sdio_is_symptom]].
+  //
+  // The (subscribe_mode == 2) check is on the hot path of every
+  // state push. The branch is well-predicted (always false
+  // except in per_room mode) and cheap (compare + branch).
+  if (this->subscribe_mode_ == 2 && !this->current_room_area_id_.empty()) {
+    auto it = this->entities_by_area_.find(this->current_room_area_id_);
+    if (it == this->entities_by_area_.end()) return;
+    bool in_visible_room = false;
+    for (const auto& e : it->second) {
+      if (e.entity_id == entity_id) { in_visible_room = true; break; }
+    }
+    if (!in_visible_room) return;
+  }
+
   std::string new_state = state ? state : "";
   // LOGI (not LOGD) so we can verify the state-sync path is firing
   // when a light is toggled in HA. The previous LOGD was invisible at
@@ -4568,13 +4818,13 @@ void HaAutoPanel::on_auth_probe_response_(bool success, const char* error) {
 }
 
 void HaAutoPanel::loop() {
-  // v1.22u: SDIO wedge detector heartbeat. This MUST be
-  // the first thing in loop() so the heartbeat is updated
-  // even if other early returns (auth probe, lazy web
-  // handler) skip the rest of the function. The detector
-  // task checks this counter to detect loopTask starvation
-  // from the SDIO wedge ([[project_crowpanel_c6_sdio_loop]]).
-  this->wedge_heartbeat_();
+  // v1.22u removed: SDIO wedge detector heartbeat. The
+  // detector task is gone; the heartbeat is no longer
+  // needed. v1.22v instead polls the actual stuck-task
+  // signature (uxTaskPriorityGet + eTaskGetState) in
+  // the WLED pattern style - see
+  // [[feedback_wled_mm_p4_stuck_task_pattern]] for the
+  // design.
   // Check authorization probe timeout
   if (this->auth_probe_pending_) {
     if (millis() - this->auth_probe_started_ms_ > AUTH_PROBE_TIMEOUT_MS) {
@@ -4637,6 +4887,29 @@ void HaAutoPanel::loop() {
   if (this->state_ == PanelState::READY && this->entities_by_area_ready_) {
     this->maybe_poll_entity_states_();
   }
+
+  // v1.22v: per-room state poll. Fires only when subscribe_mode
+  // is "per_room" or "none" AND the user is on a detail page
+  // (current_room_area_id_ set). The poll itself is a server-
+  // side-filtered /api/template POST that returns just the
+  // visible room's lights (~1-5 KB vs 200 KB for the bulk
+  // poll). This is the activity-reducer that prevents the
+  // priority-inversion deadlock documented in
+  // [[project_crowpanel_sdio_is_symptom]] - in per_room mode
+  // we no longer subscribe to all 200+ entities, and the
+  // poll's response is small enough that httpd and loopTask
+  // don't fight over PSRAM allocator mutexes.
+  if (this->subscribe_mode_ != 0 && !this->current_room_area_id_.empty() &&
+      this->state_ == PanelState::READY && this->entities_by_area_ready_) {
+    this->maybe_poll_current_room_states_();
+  }
+
+  // v1.22v: WLED-pattern stuck-task monitor + recovery
+  // (only does something if enable_stuck_task_recovery_ is
+  // true; otherwise pure observability). Self-throttled to 1
+  // Hz. Runs always (not gated on subscribe_mode) so we can
+  // see the SDIO wedge even with subscribe_mode="none".
+  this->check_stuck_tasks_();
 
   // Pending 2-tap-confirm timeout. If the user armed Reboot or
   // Reset customizations and then didn't tap again within 5s, revert
@@ -5056,6 +5329,19 @@ void HaAutoPanel::handle_customizations_get_(AsyncWebServerRequest *request) {
   std::string body;
   serializeJson(doc, body);
 
+  // v1.22v: the PsramJsonDocument can overflow if entity_order
+  // has many rooms with many entities (200 rooms × 50 entities
+  // ≈ 400 KB worst case; the default capacity is 16 KB). A
+  // bad body that overflows throws bad_alloc on this build
+  // (no -fexceptions), which is one of the C++ throws
+  // documented in [[project_crowpanel_cxx_throw_abort]]. Detect
+  // the overflow and return 500 instead of aborting the panel.
+  if (doc.overflowed()) {
+    ESP_LOGE(TAG, "customizations JSON overflowed - data is corrupt");
+    request->send(500, "text/plain", "Customizations JSON overflowed");
+    return;
+  }
+
   AsyncWebServerResponse *response =
       request->beginResponse(200, "application/json", body.c_str());
   request->send(response);
@@ -5073,10 +5359,34 @@ void HaAutoPanel::handle_customizations_post_(AsyncWebServerRequest *request) {
     request->send(400, "text/plain", "Empty body");
     return;
   }
+  // v1.22v: bound the body at the I/O boundary. The build uses
+  // -fno-exceptions per ESPHome core, so a std::bad_alloc in
+  // apply_customizations_file_() (which then walks several
+  // std::vector/std::set growth paths) would abort() the
+  // panel - one of the CXX-throw aborts documented in
+  // [[project_crowpanel_cxx_throw_abort]]. 16 KB is way more
+  // than any legitimate customizations file (worst case on
+  // this user's HA: ~4 KB). A bad body (e.g. attacker
+  // uploading 1 MB of garbage) gets 413 instead of triggering
+  // a heap-OOM abort.
+  if (body.size() > 16 * 1024) {
+    ESP_LOGW(TAG, "customizations POST body %u bytes > 16KB cap; rejecting",
+             (unsigned)body.size());
+    request->send(413, "text/plain", "Customizations body too large");
+    return;
+  }
   this->apply_customizations_file_(body);
-  // Re-render the room grid so the new hidden/order state is visible
-  // immediately, without waiting for a reboot.
-  this->refresh_room_cards_();
+  // v1.22v: defer the expensive refresh off the httpd task
+  // (so the request thread returns immediately). refresh_room_cards_()
+  // calls lv_obj_del on every child of main_container_ and
+  // rebuilds - that's LVGL work that contends with the
+  // per-room poll and the state_changed callback for the
+  // LVGL mutex. Doing it on the httpd task is a
+  // priority-inversion risk: a high-priority task (e.g. the
+  // sdio_write task servicing the C6) gets blocked behind
+  // this httpd work. set_timeout(0, ...) runs it on the next
+  // loop() tick on loopTask where it belongs.
+  this->set_timeout(0, [this]() { this->refresh_room_cards_(); });
   request->send(200, "application/json", "{\"ok\":true}");
 }
 

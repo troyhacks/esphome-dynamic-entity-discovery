@@ -17,9 +17,8 @@
 #include "esp_http_server.h"  // for AsyncWebHandler / AsyncWebServerRequest
 #include "esphome/core/preferences.h"
 #include "esp_heap_caps.h"
-#include <atomic>             // v1.22u: wedge detector atomic heartbeat
-#include <driver/gpio.h>      // v1.22u: drive GPIO32 (C6 reset) for wedge recovery
-#include "freertos/task.h"    // v1.22u: xTaskCreate for the wedge_detector_task
+#include "freertos/task.h"   // v1.22v: uxTaskPriorityGet + eTaskGetState for stuck-task detector
+#include "esp_task.h"        // v1.22v: pcTaskGetHandle for the sdio_write task lookup
 
 namespace esphome {
 namespace ha_autopanel {
@@ -319,23 +318,28 @@ class HaAutoPanel : public Component {
   // label. Default "weather.home". Empty string disables
   // fetch_weather_() entirely.
   void set_weather_entity_id(const std::string& id) { this->weather_entity_id_ = id; }
-  // v1.22u: SDIO wedge auto-recovery. These members need
-  // to be PUBLIC (not protected) because the wedge detector
-  // task is a file-scope static function (not a method) and
-  // needs direct access to the heartbeat atomic and the
-  // backoff state. Marking public is safe because the
-  // detector is internal and the names are well-typed.
-  // (We don't make this method public to avoid making the
-  // rest of the internal API public too.)
-  // v1.22u: SDIO wedge auto-recovery. The detector task (a
-  // free function) updates the WEDGE_DETECT_* state on the
-  // static instance pointer; the heartbeat is called from
-  // loop() once per iteration. See the long comment at
-  // wedge_last_loop_tick_ms_ for the design rationale and
-  // priority-inversion analysis.
-  void wedge_heartbeat_();
-  void wedge_trigger_c6_reset_();
-  void wedge_fallback_reboot_();
+  // v1.22v: subscription scope. The "all" mode (default) is
+  // the v1.22u behavior. "none" disables all HA subscriptions
+  // (rely entirely on the 5s bulk poll). "per_room" subscribes
+  // only to entities in current_room_area_id_ + global
+  // media_player entities, with maybe_poll_current_room_states_()
+  // running a 3s per-room poll. The per-room mode eliminates
+  // the O(N*E) full-scan work that was the trigger condition
+  // for the priority-inversion deadlock documented in
+  // [[project_crowpanel_sdio_is_symptom]].
+  void set_subscribe_mode(const std::string& mode) {
+    if      (mode == "none")     this->subscribe_mode_ = 1;
+    else if (mode == "per_room") this->subscribe_mode_ = 2;
+    else                         this->subscribe_mode_ = 0;
+  }
+  // v1.22v: per-room state poll. Gated on subscribe_mode_ != 0
+  // and !current_room_area_id_.empty() (i.e. only fires while
+  // the user is on a detail page). Uses HA's /api/template
+  // endpoint with a Jinja filter so the response is ~1-5 KB
+  // instead of 200 KB. Runs every ROOM_POLL_INTERVAL_MS
+  // (3s default) in loop(). See
+  // .claude/plans/greedy-discovering-koala.md.
+  void maybe_poll_current_room_states_();
 
  protected:
   std::string ha_api_url_;
@@ -590,59 +594,89 @@ class HaAutoPanel : public Component {
   // is hidden so the title bar stays tidy (user request: "the
   // edit and reboot buttons should be hidden").
   bool title_chrome_visible_{false};
+  // v1.22v: subscription scope. 0=all (v1.22u default; full bulk
+  // subscription + 5s bulk poll). 1=none (per-room poll only; no
+  // subscription at all). 2=per_room (subscribe only to entities
+  // in current_room_area_id_ plus global media_players; per-room
+  // poll supplements at 3s).
+  uint8_t subscribe_mode_{0};
+  // v1.22v: current room's area_id (or empty for grid view).
+  // Set in show_entity_detail_(); cleared in show_room_grid_().
+  // Used as the fast-fail filter for state pushes in per_room
+  // mode, and as the room_id for the per-room poll Jinja
+  // template.
+  std::string current_room_area_id_;
+  // v1.22v: per-room poll throttle + last success ms.
+  uint32_t last_room_poll_ms_{0};
+  static constexpr uint32_t ROOM_POLL_INTERVAL_MS = 3 * 1000;  // 3s
+  // v1.22v: stuck-task detector state. sdio_write task handle
+  // is captured lazily via pcTaskGetHandle("sdio_write") on
+  // the first call to check_stuck_tasks_(). enable_stuck_task_recovery_
+  // is the yaml knob (default false) - when false, the
+  // detector is pure observability; when true, it ALSO takes
+  // graduated corrective action.
+  TaskHandle_t sdio_write_task_handle_{nullptr};
+  TaskHandle_t httpd_worker_handle_{nullptr};
+  bool enable_stuck_task_recovery_{false};
+  uint32_t stuck_since_ms_{0};
+  uint8_t stuck_recovery_count_{0};
+  uint32_t last_stuck_check_ms_{0};
+  // v1.22v: max recoveries per window before falling back to
+  // App.reboot(). 3 is enough to give the C6 a fair chance
+  // to re-init the SDIO link without looping forever.
+  static constexpr uint8_t STUCK_RECOVERY_MAX_PER_WINDOW = 3;
   // v1.22r: last time the user tapped the time label. Used to
   // debounce rapid taps (so a finger drag across the title bar
   // doesn't accidentally trigger multiple toggles). Set to
   // millis() on each click; only toggle if >250ms since last.
   uint32_t last_title_tap_ms_{0};
  public:
-  // v1.22u: SDIO wedge auto-recovery. The Crowpanel 7" P4 +
-  // ESP32-C6 wifi co-processor has a known hardware wedge
-  // ([[project_crowpanel_c6_sdio_loop]]) where the C6's SDIO
-  // link enters a tight error loop producing
-  // `sdmmc_send_cmd returned 0x109` at ~50/sec. This starves
-  // the P4's loopTask and makes the panel "freeze" from the
-  // user's perspective. The only recovery the user has today
-  // is a hard power cycle (TWDT reboot reproduces the wedge
-  // immediately on the new boot).
-  //
-  // The fix is a dedicated FreeRTOS task at higher priority
-  // than loopTask. loopTask() updates
-  // wedge_last_loop_tick_ms_ on every iteration; the detector
-  // task wakes up every 500ms, checks the age of that counter,
-  // and if it's >15s old, drives GPIO32 (the C6 reset line)
-  // low for 100ms to reset the C6. This is the firmware-
-  // equivalent of "unplug the USB" without needing the user
-  // to physically touch the panel.
-  //
-  // Priority inversion considerations (the user flagged this):
-  // the detector task takes NO FreeRTOS mutexes. The only
-  // shared state with loopTask is the atomic counter, which
-  // is lock-free by definition. The recovery action (GPIO
-  // toggle, App.reboot) is also lock-free. So no high-task-
-  // waits-on-low-task chains exist in the detector.
-  std::atomic<uint32_t> wedge_last_loop_tick_ms_{0};
-  // How long the loop must be silent before the detector
-  // declares a wedge. 15s is well above the 5s state-poll
-  // interval (the longest thing loopTask does between
-  // heartbeats) but well below the 30s TWDT. A wedge hits
-  // much faster than 15s of loopTask starvation, so 15s
-  // detects a wedge that's already 15s in - plenty of time
-  // to attempt C6 reset before the TWDT fires.
-  static constexpr uint32_t WEDGE_DETECT_TIMEOUT_MS = 15 * 1000;
-  // After detecting a wedge, the C6 reset pulse: drive low
-  // for 100ms, then high. The C6 boot ROM samples the pin
-  // and re-initializes its SDIO link. If the link is still
-  // wedged after 3 C6 resets in 60s, give up and fall back
-  // to App.reboot() (which is the v1.22r behavior - the
-  // panel reboots, but the wedge returns on the new boot).
-  static constexpr uint32_t WEDGE_C6_RESET_LOW_MS = 100;
-  static constexpr uint32_t WEDGE_BACKOFF_MAX_RESETS = 3;
-  static constexpr uint32_t WEDGE_BACKOFF_WINDOW_MS = 60 * 1000;
-  // Counter for the backoff window. Mutated only by the
-  // detector task, so no synchronization needed.
-  uint32_t wedge_c6_reset_count_{0};
-  uint32_t wedge_window_start_ms_{0};
+  // v1.22v: per-room state poll. Gated on subscribe_mode_ != 0
+  // and !current_room_area_id_.empty() (i.e. only fires while
+  // the user is on a detail page). Uses HA's /api/template
+  // endpoint with a Jinja filter so the response is ~1-5 KB
+  // instead of 200 KB. Runs every ROOM_POLL_INTERVAL_MS
+  // (3s default) in loop(). See
+  // .claude/plans/greedy-discovering-koala.md.
+  // v1.22v: stuck-task recovery knob. When true, the
+  // detector also takes corrective action (drop httpd
+  // worker priority, then C6 reset). When false (default),
+  // the detector is pure observability. The user wants
+  // visibility first ("I am providing it as another 'knob'
+  // we can turn and monitor") so the default is OFF.
+  void set_enable_stuck_task_recovery(bool v) {
+    this->enable_stuck_task_recovery_ = v;
+  }
+  // v1.22v: WLED-pattern stuck-task MONITOR + KNOB. Polls the
+  // sdio_write task's eTaskGetState() every loop tick and
+  // logs the duration of any eBlocked state. The C6 SDIO
+  // task is at MAX priority (per the user's note: "I think
+  // you'll find the ESP Hosted tasks are max priority - but
+  // it's the blocking we are worried about") so priority-
+  // elevation checks don't apply; we just watch for blocks.
+  // The "knob" half is enable_stuck_task_recovery_ - a
+  // yaml knob that defaults to FALSE. When true, the
+  // detector ALSO takes graduated corrective action (log +
+  // httpd worker priority drop + C6 reset as last resort).
+  // When false (default), it's pure observability - the
+  // user can see the stuck state in the log without the
+  // detector doing anything destructive. Per the user's
+  // note: "I am providing it as another 'knob' we can turn
+  // and monitor" - the user wants visibility first, recovery
+  // second.
+  void check_stuck_tasks_();
+  // v1.22v: stuck-task detection threshold. The detector
+  // fires when the sdio_write task has been in eBlocked for
+  // longer than this. 5s matches the WLED-MM-P4 default.
+  static constexpr uint32_t STUCK_TASK_THRESHOLD_MS = 5 * 1000;
+  // (v1.22u removed: dedicated SDIO wedge detector task. The
+  // user correctly identified that the SDIO wedge is a
+  // SYMPTOM of a priority-inversion deadlock, not a root
+  // cause - see [[project_crowpanel_sdio_is_symptom]]. The
+  // detector task watched loopTask's heartbeat, but loopTask
+  // was never the wedged task (the httpd worker was). v1.22v
+  // fixes the cause (per-room poll + httpd hardening) instead
+  // of treating the symptom.)
  protected:
   // Local clock, populated by the SNTP time component (yaml id
   // `sntp_time`) and refreshed every loop() tick (~1Hz). Sits to
