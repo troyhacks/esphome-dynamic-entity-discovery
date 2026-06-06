@@ -34,9 +34,28 @@
 #include "esphome/components/api/api_server.h"
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/homeassistant_service.h"
+#include "http_client.h"  // v1.23: HttpClient consolidates the
+                          // get/post + read loop pattern that
+                          // was duplicated 8+ times in this file
 #include <lvgl.h>
 #include <climits>  // for INT_MAX in split_room_name_to_fit_
 #include <cmath>    // v1.22s: std::lround, std::isnan (weather temp parse)
+// v1.22y: re-introduce the C6 reset GPIO via driver/gpio.h.
+// v1.22u had this (it was the dedicated wedge_detector_task's
+// recovery action: drive GPIO32 low for 100ms then release).
+// v1.22v removed it on the theory that "the SDIO wedge is a
+// SYMPTOM not cause" and the httpd mutex contention was the
+// root issue - the per-room poll + httpd hardening in v1.22v
+// address the cause, but the wedge STILL happens and the
+// only software recovery is to reset the C6 co-processor
+// (a hardware power cycle is the alternative). The C6 reset
+// GPIO is shared with the esp32_hosted config's reset_pin
+// (GPIO32 per the YAML); driving it low for 100ms boots the
+// C6 cleanly on release. The driver/gpio.h header is
+// available in the esp-idf framework that's already on the
+// include path (framework: esp-idf in the YAML) - v1.22v's
+// concern about it being a "dependency" was misplaced.
+#include "driver/gpio.h"
 #include <cctype>   // v1.22s: std::toupper (weather state capitalization)
 #include "esp_task_wdt.h"  // v1.22p: IDF task watchdog (separate from App.feed_wdt)
 #include "freertos/FreeRTOS.h"  // v1.22p: xTaskGetCurrentTaskHandle()
@@ -159,6 +178,24 @@ static PsramAllocator s_psram_allocator;
 
 static const char* TAG = "ha_autopanel";
 
+// v1.23: helper to render HttpStatus as a string for log
+// messages. Defined here in the file's existing namespace
+// (the whole file is wrapped in `namespace esphome::ha_autopanel`,
+// see line 144). No additional namespace wrapper needed.
+const char* http_status_to_str(HttpStatus s) {
+  switch (s) {
+    case HttpStatus::OK:                 return "OK";
+    case HttpStatus::CONNECTION_FAILED:  return "connection_failed";
+    case HttpStatus::AUTH_FAILED:        return "auth_failed";
+    case HttpStatus::NOT_FOUND:          return "not_found";
+    case HttpStatus::HTTP_ERROR:         return "http_error";
+    case HttpStatus::OOM:                return "oom";
+    case HttpStatus::TIMEOUT:            return "timeout";
+    case HttpStatus::INTERNAL_ERROR:     return "internal_error";
+  }
+  return "unknown";
+}
+
 // v1.20: firmware version baked into the binary. The string is
 // also reported by /autopanel/test/state so the test harness
 // can sanity-check that the device is running the build the test
@@ -167,7 +204,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22w"
+#define FIRMWARE_VERSION "v1.23"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -405,6 +442,12 @@ void HaAutoPanel::trigger_auth_probe() {
 }
 
 void HaAutoPanel::fetch_areas_() {
+  // v1.23: migrated to HttpClient. The previous implementation
+  // was 80+ lines of status-code checks + a manual chunked
+  // read loop (duplicated 8+ times in this file). HttpClient
+  // handles both. The Jinja template + JSON parse logic
+  // (below) is unchanged - that's the part that's specific
+  // to this endpoint.
   if (this->http_request_ == nullptr) {
     ESP_LOGE(TAG, "http_request_ is null - cannot fetch areas");
     return;
@@ -514,74 +557,29 @@ void HaAutoPanel::fetch_areas_() {
 
   ESP_LOGD(TAG, "Template body length: %d", (int)body.size());
 
-  std::vector<http_request::Header> headers = {
-      {"Authorization", "Bearer " + this->ha_api_password_},
-      {"Content-Type", "application/json"},
-  };
-
-  auto container = this->http_request_->post(url, body, headers);
-
-  if (container == nullptr) {
-    ESP_LOGE(TAG, "Failed to get areas: container is null");
-    return;
-  }
-
-  if (container->status_code == 0) {
-    ESP_LOGE(TAG, "Failed to get areas: connection failed");
-    container->end();
-    return;
-  }
-
-  if (container->status_code == 401) {
+  // v1.23: HttpClient consolidates the get/post + read loop
+  // + status-code boilerplate. The result.body is the raw
+  // response (or empty on error). Auth failure transitions
+  // the panel state - same as before.
+  HttpClient http(this->http_request_);
+  auto auth = http.bearer_auth(this->ha_api_password_);
+  auth.push_back({"Content-Type", "application/json"});
+  HttpResult result = http.post(url, body, auth);
+  if (result.status == HttpStatus::AUTH_FAILED) {
     ESP_LOGE(TAG, "HA API auth failed - check your token");
-    container->end();
     this->set_panel_state_(PanelState::AUTH_FAILED);
     return;
   }
-
-  if (container->status_code == 404) {
-    ESP_LOGE(TAG, "HA API endpoint not found - check HA version");
-    container->end();
+  if (result.status != HttpStatus::OK) {
+    ESP_LOGW(TAG, "Areas fetch failed: %s (HTTP %d)",
+             http_status_to_str(result.status), result.http_code);
     return;
   }
-
-  if (container->status_code != 200) {
-    ESP_LOGW(TAG, "Failed to get areas: HTTP %d", container->status_code);
-    container->end();
+  std::string& response = result.body;
+  if (response.empty()) {
+    ESP_LOGW(TAG, "Areas response is empty");
     return;
   }
-
-  // Read response body - reserve to content_length to avoid reallocations
-  size_t expected = container->content_length;
-  std::string response;
-  response.reserve(expected > 0 ? expected : 16384);
-  uint8_t buf[512];
-  uint32_t last_data_time = millis();
-  const uint32_t timeout = 15000;
-  int iter_count = 0;
-
-  while (container->get_bytes_read() < container->content_length) {
-    App.feed_wdt();
-    yield();
-    int read = container->read(buf, sizeof(buf));
-    if (read > 0) {
-      response.append(reinterpret_cast<char*>(buf), read);
-      last_data_time = millis();
-      iter_count = 0;
-    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    } else {
-      iter_count++;
-      if (iter_count % 10 == 0) {
-        App.feed_wdt();
-      }
-    }
-    if (millis() - last_data_time > timeout) {
-      ESP_LOGW(TAG, "Timeout reading areas response");
-      break;
-    }
-  }
-  container->end();
 
   ESP_LOGI(TAG, "Areas response: %d bytes", (int)response.size());
   // Diagnostic: log first 200 chars (and last 50) to see actual format
@@ -679,6 +677,394 @@ void HaAutoPanel::fetch_areas_() {
       }
     }
   }
+}
+
+void HaAutoPanel::parse_states_response_(const char* response, size_t response_len) {
+  // v1.22aa: shared parser for the bulk /api/states response
+  // (fetch_entities_) and the new /api/template response
+  // (fetch_entities_template_()). Both produce the same
+  // JSON shape (a top-level array of state objects), so the
+  // parse logic is identical and lives here once.
+  //
+  // The caller is responsible for the `response` buffer's
+  // lifetime - this function takes ownership and frees it
+  // after the DOM is built (the parse keeps what it needs in
+  // PsramJsonDocument, which has its own PSRAM pool).
+  if (response == nullptr || response_len == 0) {
+    ESP_LOGW(TAG, "parse_states_response: empty response");
+    if (response) heap_caps_free((void*)response);
+    return;
+  }
+
+  // ArduinoJson 7.x: parse the states response. Use the PSRAM-backed
+  // allocator so the ~250KB JSON document lives in PSRAM. The default
+  // internal heap is too small and would abort().
+  PsramJsonDocument doc(&s_psram_allocator);
+
+  // v1.22p: TWDT unsubscribe during the parse. The state poll
+  // runs every 5s and the parse is the same 200KB /api/states
+  // response - if it takes >5s, the IDF TWDT fires and the
+  // panel reboots. The guard re-subscribes on exit.
+  TwdtGuard twdt_guard;
+  // v1.22n: feed the ESPHome loop watchdog (belt +
+  // suspenders alongside the IDF TWDT guard).
+  App.feed_wdt();
+
+  DeserializationError parse_err = deserializeJson(doc, response);
+  if (parse_err) {
+    ESP_LOGW(TAG, "Failed to parse states JSON: %s", parse_err.c_str());
+    heap_caps_free((void*)response);
+    return;
+  }
+
+  JsonArray arr = doc.as<JsonArray>();
+  if (arr.isNull()) {
+    JsonObject obj = doc.as<JsonObject>();
+    if (!obj.isNull()) {
+      ESP_LOGW(TAG, "States response is a JSON object, keys:");
+      for (JsonPair kv : obj) {
+        ESP_LOGW(TAG, "  key: %s", kv.key().c_str());
+      }
+    } else {
+      ESP_LOGW(TAG, "States response is neither array nor object");
+    }
+    heap_caps_free((void*)response);
+    return;
+  }
+  // v1.12: the PSRAM response buffer is no longer needed once the
+  // DOM is built. Free it now so the 220KB+ chunk goes back to
+  // the heap before we start allocating the per-area entity
+  // vectors (which can each be 20-100KB on a busy install).
+  // PsramJsonDocument's DOM lives in its own PSRAM-backed pool, so
+  // freeing this buffer doesn't affect the still-needed DOM.
+  heap_caps_free((void*)response);
+  response = nullptr;
+
+  // Build a lookup: entity_id -> area_id from discovered_areas_
+  // Since we already have entity_ids per area, match against that
+  std::map<std::string, std::string> entity_to_area;  // entity_id -> area_id
+  for (const auto& area : this->discovered_areas_) {
+    for (const auto& eid : area.entity_ids) {
+      entity_to_area[eid] = area.area_id;
+    }
+  }
+
+  for (JsonObject state : arr) {
+    const char* entity_id = state["entity_id"];
+    if (!entity_id) continue;
+
+    // Check if this entity belongs to one of our areas
+    auto it = entity_to_area.find(entity_id);
+    if (it == entity_to_area.end()) continue;  // Not in any discovered area
+
+    std::string area_id = it->second;
+
+    // v1.12: the state subscription (subscribe_to_all_entities_)
+    // also pushes entities on every state change. If we ran the
+    // bulk fetch first (now safe in PSRAM), the subscription's
+    // push would create a duplicate. Clear the bucket the first
+    // time we touch a given area so only the friendly_name-bearing
+    // entities remain.
+    if (this->seen_areas_during_bulk_fetch_.insert(area_id).second) {
+      this->entities_by_area_[area_id].clear();
+    }
+
+    // Check if excluded
+    if (this->is_entity_excluded_(entity_id)) continue;
+
+    // Extract domain from entity_id (e.g., "light.living_room" -> "light")
+    std::string eid(entity_id);
+    size_t dot = eid.find('.');
+    if (dot == std::string::npos) continue;
+    std::string domain = eid.substr(0, dot);
+
+    // Check if domain is included
+    if (!this->is_domain_included_(domain)) continue;
+
+    Entity entity;
+    entity.entity_id = entity_arena().intern(entity_id);
+    entity.domain = entity_arena().intern(domain);
+    entity.area_id = entity_arena().intern(area_id);
+
+    // Get attributes
+    JsonObject attributes = state["attributes"];
+
+    // Get friendly name from attributes, or derive from entity_id
+    if (!attributes["friendly_name"].isNull()) {
+      const char *fn = attributes["friendly_name"].as<const char*>();
+      entity.name = entity_arena().intern(fn == nullptr ? std::string_view() : std::string_view(fn));
+    } else {
+      entity.name = entity_arena().intern(std::string_view(eid.data() + dot + 1, eid.size() - dot - 1));
+    }
+
+    // Capture state string ("on" / "off" / etc.)
+    const char* state_str_c = state["state"];
+    if (state_str_c) {
+      entity.state = state_str_c;
+    }
+
+    // Check if entity has brightness (lights with brightness support)
+    if (domain == "light" && !attributes["brightness"].isNull()) {
+      entity.has_brightness = true;
+      entity.brightness = static_cast<uint8_t>(attributes["brightness"].as<int>());
+    }
+
+    // Hue group flag - skip these for room-level aggregations
+    if (!attributes["is_hue_group"].isNull()) {
+      entity.is_hue_group = attributes["is_hue_group"].as<bool>();
+    }
+
+    this->entities_by_area_[area_id].push_back(entity);
+  }
+  ESP_LOGI(TAG, "  Parsed %d entities into areas", (int)this->entities_by_area_.size());
+
+  // v1.22: also seed the title-bar clock from the response.
+  // Use the last_updated from the FIRST entity we processed
+  // (a reasonable proxy for "when HA served the response").
+  if (this->time_valid_) return;  // zone.home already seeded earlier
+  if (arr.isNull() || arr.size() == 0) return;
+  JsonObject first = arr[0];
+  if (first.isNull()) return;
+  if (first["last_updated"].isNull()) return;
+  const char* last_updated = first["last_updated"].as<const char*>();
+  if (last_updated == nullptr || last_updated[0] == '\0') return;
+  this->set_time_from_iso_(last_updated);
+}
+
+void HaAutoPanel::fetch_entities_template_() {
+  // v1.22aa: server-side-filtered entity-state fetch using
+  // HA's /api/template POST with a Jinja `in` test against
+  // the list of entity IDs we discovered from fetch_areas_().
+  // Replaces the 200KB+ bulk /api/states GET that triggered
+  // the SDIO NULL buffer assert at sdio_drv.c:896 (the C6's
+  // ring buffer pool empties when the host can't drain the
+  // 200KB+ burst fast enough - documented in
+  // [[project_crowpanel_sdio_is_symptom]]). The template
+  // response is much smaller: only entities in our
+  // configured areas, typically 20-50 KB for a 200-entity
+  // HA install (vs 200KB+ for the bulk). Same JSON shape
+  // as /api/states, so the parse path is shared via
+  // parse_states_response_().
+  if (this->http_request_ == nullptr) {
+    ESP_LOGE(TAG, "http_request_ is null - cannot fetch entities");
+    return;
+  }
+
+  // v1.12: reset the per-area dedup set so this fetch pass
+  // starts fresh (same as the bulk path).
+  this->seen_areas_during_bulk_fetch_.clear();
+
+  // v1.22ac: instead of an `in [list]` test (which is ~16 KB
+  // for a 419-entity HA install - over HA's /api/template
+  // body limit), use a `search <regex>` test against a
+  // domain regex. The regex is short (~150 chars for the
+  // common domains) and HA's Jinja `search` test does the
+  // substring/regex match on the server side. Combined with
+  // an area filter (entity_ids in discovered_areas_), this
+  // gives us the right entity set with a tiny body.
+  //
+  // Build the domain regex from this->entity_domains_. If
+  // the list is empty, default to the common interactive
+  // domains (light, switch, media_player, cover, climate,
+  // input_boolean, input_number, fan, humidifier, scene,
+  // automation, script, sensor, binary_sensor, button).
+  // The `search` test in Jinja is a substring/regex match
+  // - we wrap in ^(domain1|domain2|...)\\. so the regex
+  // matches "domain." at the start of the entity_id.
+  std::string domain_regex;
+  if (this->entity_domains_.empty()) {
+    // Default regex: common interactive + read-only domains.
+    // (entity_domains_ is empty in practice because the
+    // Python schema default of [] overrides the C++ default
+    // of {"light"}.)
+    domain_regex = "^(light|switch|media_player|cover|climate|"
+                   "input_boolean|input_number|input_select|input_text|"
+                   "fan|humidifier|vacuum|scene|automation|script|"
+                   "sensor|binary_sensor|button|lock|"
+                   "remote|select|water_heater|siren|number|date_time)\\.";
+  } else {
+    domain_regex = "^(";
+    for (size_t i = 0; i < this->entity_domains_.size(); i++) {
+      if (i > 0) domain_regex += "|";
+      domain_regex += this->entity_domains_[i];
+    }
+    domain_regex += ")\\.";
+  }
+
+  // Build the Jinja template. The `selectattr(..., 'match',
+  // <regex>)` test does the regex match on the HA side.
+  //
+  // IMPORTANT: do NOT use `tojson` or `to_json` on the
+  // `s` (state) objects - the TemplateState type is not
+  // directly JSON-serializable, AND its attributes dict
+  // contains datetime values (last_updated, last_changed)
+  // that are also not JSON-serializable. We build the JSON
+  // array MANUALLY using a namespace dict, converting the
+  // datetime values via `as_timestamp` (or `string`).
+  //
+  // The approach that works:
+  //   1. Filter states with selectattr + match (regex on entity_id)
+  //   2. For each state, manually construct a dict with
+  //      serializable values: entity_id (str), state (str),
+  //      last_updated (string), and a hand-picked subset of
+  //      attributes (friendly_name, brightness, is_hue_group)
+  //   3. Wrap in a namespace and tojson the result
+  //
+  // This is more verbose than the bulk response but the
+  // body is tiny (~500 bytes + per-entity ~100 bytes).
+  // The bulk path is the v1.22aa fallback for when /api/template
+  // returns a non-200 (e.g. when this template has a syntax
+  // error in some HA version).
+  std::string template_body =
+      "{% set ns = namespace(states=[]) %}"
+      "{% for s in states | selectattr('entity_id', 'match', '"
+      + domain_regex +
+      "') | list %}"
+      "{% set ns.states = ns.states + ["
+      "{'entity_id': s.entity_id, 'state': s.state, "
+      "'last_updated': s.last_updated | string, "
+      "'attributes': {"
+      "'friendly_name': s.attributes.friendly_name | default(''), "
+      "'brightness': s.attributes.brightness | default(0), "
+      "'is_hue_group': s.attributes.is_hue_group | default(false)"
+      "}}] %}"
+      "{% endfor %}"
+      "{{ ns.states | tojson }}";
+
+  ESP_LOGI(TAG, "[template] Fetching states via domain regex "
+                "(template body=%zu bytes, regex=%zu chars)",
+           template_body.size(), domain_regex.size());
+  size_t total_eids = 0;
+  for (const auto& area : this->discovered_areas_) {
+    (void)area;  // suppress unused-variable warning if not used below
+    for (const auto& eid : area.entity_ids) {
+      (void)eid;
+      total_eids++;
+    }
+  }
+
+  ESP_LOGI(TAG, "[template] Fetching states for %zu entity_ids "
+                "(template body=%zu bytes, regex=%zu chars)",
+           total_eids, template_body.size(), domain_regex.size());
+
+  std::string url = this->ha_api_url_ + "/api/template";
+  std::vector<http_request::Header> headers = {
+      {"Authorization", "Bearer " + this->ha_api_password_},
+      {"Content-Type", "application/json"},
+  };
+  // /api/template takes a JSON body: {"template": "..."}.
+  // Wrap the Jinja string in a tiny JSON envelope with
+  // backslash-escaping for the few characters Jinja uses.
+  std::string json_body;
+  json_body.reserve(template_body.size() + 32);
+  json_body += "{\"template\":\"";
+  for (const char* p = template_body.c_str(); *p; p++) {
+    if (*p == '"' || *p == '\\') json_body += '\\';
+    if (*p == '\n') { json_body += "\\n"; continue; }
+    if (*p == '\r') { json_body += "\\r"; continue; }
+    if (*p == '\t') { json_body += "\\t"; continue; }
+    json_body += *p;
+  }
+  json_body += "\"}";
+
+  auto container = this->http_request_->post(url, json_body, headers);
+  if (container == nullptr) {
+    ESP_LOGE(TAG, "[template] POST /api/template returned null container");
+    return;
+  }
+  if (container->status_code == 0) {
+    ESP_LOGE(TAG, "[template] connection failed");
+    container->end();
+    return;
+  }
+  if (container->status_code == 401) {
+    ESP_LOGE(TAG, "[template] HA API auth failed - check your token");
+    container->end();
+    this->set_panel_state_(PanelState::AUTH_FAILED);
+    return;
+  }
+  if (container->status_code != 200) {
+    ESP_LOGW(TAG, "[template] HTTP %d - falling back to bulk fetch. "
+                  "First 200 bytes of response:",
+             container->status_code);
+    // Capture and log the response body so we can see why
+    // HA rejected the template. Read up to 512 bytes.
+    char err_buf[513];
+    int err_n = container->read((uint8_t*)err_buf, sizeof(err_buf) - 1);
+    if (err_n > 0) {
+      err_buf[err_n] = '\0';
+      ESP_LOGW(TAG, "[template]   body: %s", err_buf);
+    }
+    container->end();
+    // Fall back to the bulk /api/states path. The bulk path
+    // does a 200KB+ transfer which can wedge the SDIO link
+    // on a C6 that just had a template error, but that's
+    // better than showing no entity states at all (the panel
+    // would be unusable). The WLED-pattern monitor
+    // (sdio_monitor in v1.23) handles the wedge recovery.
+    this->fetch_entities_();
+    return;
+  }
+
+  // Read response body. Same allocation strategy as
+  // fetch_entities_() - PSRAM first, internal heap fallback.
+  // The template response is typically 20-50 KB so a 32 KB
+  // initial allocation is fine; the buffer grows if needed.
+  size_t expected = container->content_length;
+  if (expected == 0) expected = 32768;
+  char* response = (char*)heap_caps_malloc_prefer(
+      expected + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (response == nullptr) {
+    ESP_LOGE(TAG, "[template] OOM allocating %u-byte response buffer",
+             (unsigned)(expected + 1));
+    container->end();
+    return;
+  }
+  size_t response_len = 0;
+  uint8_t buf[512];
+  uint32_t last_data_time = millis();
+  const uint32_t timeout = 20000;
+  while (container->get_bytes_read() < container->content_length) {
+    App.feed_wdt();
+    yield();
+    int read = container->read(buf, sizeof(buf));
+    if (read > 0) {
+      if (response_len + (size_t)read + 1 > expected + 1) {
+        size_t new_size = (expected + read + 1) * 2;
+        char* grown = (char*)heap_caps_malloc_prefer(
+            new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (grown == nullptr) {
+          ESP_LOGE(TAG, "[template] OOM growing buffer to %u bytes", (unsigned)new_size);
+          heap_caps_free(response);
+          container->end();
+          return;
+        }
+        memcpy(grown, response, response_len);
+        heap_caps_free(response);
+        response = grown;
+        expected = new_size - 1;
+      }
+      memcpy(response + response_len, buf, read);
+      response_len += read;
+      last_data_time = millis();
+    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
+      break;
+    }
+    if (millis() - last_data_time > timeout) {
+      ESP_LOGW(TAG, "[template] Timeout reading response");
+      break;
+    }
+  }
+  container->end();
+  response[response_len] = '\0';
+
+  ESP_LOGI(TAG, "[template] states response: %d bytes (vs 200KB+ for bulk)",
+           (int)response_len);
+  // Shared parse path - same JSON shape as the bulk response.
+  this->parse_states_response_(response, response_len);
+  // parse_states_response_ takes ownership of `response`.
 }
 
 void HaAutoPanel::fetch_entities_() {
@@ -792,6 +1178,17 @@ void HaAutoPanel::fetch_entities_() {
       response_len += read;
       last_data_time = millis();
       iter_count = 0;
+      // v1.22x: NO pacing here. vTaskDelay(1) every ~4KB
+      // caused a different failure mode - the SDIO driver
+      // task (sdio_process_rx_task) hit a TWDT "task not
+      // found" reset followed by an assert in copy_payload
+      // (sdio_drv.c:1260). The 1ms yield is fine in theory
+      // but the SDIO task's relationship with the IDF TWDT
+      // is more subtle than yield-to-lower-priority would
+      // suggest. Reverted - rely on the 10MHz SDIO clock
+      // (in the YAML) to keep the buffer pool from filling,
+      // and the stuck-task recovery (in the YAML) to log/
+      // reboot if it does.
     } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
       break;
     } else {
@@ -2001,18 +2398,21 @@ void HaAutoPanel::check_stuck_tasks_() {
           // cause and may persist after C6 reset. Hence the
           // recovery counter and the per-window limit.
           this->stuck_recovery_count_++;
-          ESP_LOGE(TAG, "[stuck] %u C6 resets triggered; this is reset #%u",
+          ESP_LOGE(TAG, "[stuck] %u ms BLOCKED - triggering C6 reset (count=%u)",
                    (unsigned)block_ms, (unsigned)this->stuck_recovery_count_);
-          // v1.22v: the actual C6 reset GPIO manipulation
-          // was removed with v1.22u. To avoid re-introducing
-          // the driver/gpio.h dependency, the recovery here
-          // is just a log line. The fallback to App.reboot()
-          // is gated on enable_stuck_task_recovery_ AND
-          // multiple consecutive failures to avoid boot loops.
+          // v1.22y: ACTUALLY reset the C6. v1.22v only logged
+          // here (it removed v1.22u's wedge_trigger_c6_reset_
+          // for "philosophical" reasons). The wedge is still
+          // a real failure mode, and the C6 reset is the
+          // cheapest software recovery. The fallback to
+          // App.reboot() after STUCK_RECOVERY_MAX_PER_WINDOW
+          // catches the case where the wedge persists after
+          // C6 reset (rare - usually a hardware issue).
+          this->wedge_trigger_c6_reset_();
           if (this->stuck_recovery_count_ >= STUCK_RECOVERY_MAX_PER_WINDOW) {
             ESP_LOGE(TAG, "[stuck] %u recoveries in this window; "
                           "scheduling App.reboot()", (unsigned)this->stuck_recovery_count_);
-            this->set_timeout(1000, []() {
+            this->set_timeout(2000, []() {
               ESP_LOGE("ha_autopanel", "[stuck] App.reboot() now");
               App.reboot();
             });
@@ -2030,6 +2430,57 @@ void HaAutoPanel::check_stuck_tasks_() {
       this->stuck_since_ms_ = 0;
     }
   }
+}
+
+void HaAutoPanel::wedge_trigger_c6_reset_() {
+  // v1.22y: actually reset the C6 co-processor. The C6 is
+  // the ESP32-C6 wifi/SDIO co-processor on the P4 module;
+  // it has its own firmware and its own SDIO link to the
+  // P4 host. The "wedge" is a state where the C6 is alive
+  // (the SDIO interrupt still fires) but the SDIO buffer
+  // pool is empty - host tasks aren't draining fast enough
+  // and sdio_rx_get_buffer() asserts in sdio_drv.c:896
+  // (*buf == NULL). The cheapest software recovery is a
+  // hard C6 reset via the GPIO32 reset line shared with
+  // the esp32_hosted config's reset_pin. Drive low for
+  // 100ms then release; the C6 boots cleanly on release
+  // and the SDIO link re-initializes on the P4 side.
+  //
+  // Implementation notes:
+  // - gpio_reset_pin() releases any previous driver hold
+  //   on the pin (the esp32_hosted component usually
+  //   claims it during its own init; calling reset here
+  //   ensures we have control).
+  // - gpio_set_direction(OUTPUT) before set_level() is
+  //   required - set_level on an input is a no-op.
+  // - Busy-wait instead of vTaskDelay: the wedge_detector
+  //   (or in v1.22y, check_stuck_tasks_) is running on the
+  //   main loopTask. vTaskDelay(100) would yield to other
+  //   tasks, including the wedged sdio_write task - which
+  //   can't help us, and would extend the recovery latency.
+  //   100ms is well under the IDF TWDT default of 30s (we
+  //   bumped to 30s in the sdkconfig too).
+  // - The GPIO_NUM_32 constant is the same pin declared in
+  //   the YAML's esp32_hosted.reset_pin: GPIO32. If the
+  //   user ever changes that pin, this hardcoded constant
+  //   needs to follow.
+  ESP_LOGE(TAG, "[stuck] driving GPIO32 low for %u ms (C6 reset)",
+           (unsigned)WEDGE_C6_RESET_LOW_MS);
+  gpio_reset_pin(GPIO_NUM_32);
+  gpio_set_direction(GPIO_NUM_32, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_32, 0);
+  // Busy-wait. 100ms is short enough that the TWDT (set
+  // to 30s in sdkconfig) doesn't care. We don't feed the
+  // watchdog here because the wedge has likely starved
+  // other tasks; the reset itself unblocks everything.
+  const uint32_t start_ms = millis();
+  while ((millis() - start_ms) < WEDGE_C6_RESET_LOW_MS) {
+    // Spin - no yield, no delay, no App.feed_wdt.
+  }
+  gpio_set_level(GPIO_NUM_32, 1);
+  ESP_LOGE(TAG, "[stuck] GPIO32 released (high) - C6 should reboot in ~200ms");
+  // The esp32_hosted component will re-claim the GPIO on
+  // its next link-up. We don't need to re-configure it.
 }
 
 void HaAutoPanel::maybe_refresh_time_baseline_() {
@@ -2135,19 +2586,13 @@ void HaAutoPanel::start_discovery_() {
     ESP_LOGW(TAG, "Aborting discovery: auth failed during area fetch");
     return;
   }
-  // v1.12: re-enable the bulk /api/states fetch. Previously disabled
-  // because the 220KB+ JSON response OOM'd the S3 (no PSRAM, 384KB
-  // internal heap). Now fetch_entities_() uses heap_caps_malloc_prefer
-  // to put the response body in PSRAM, falling back to internal heap
-  // if PSRAM is unavailable. On P4 (32MB PSRAM) the response lives
-  // off-heap. On S3, the heap_caps_malloc_prefer falls back to
-  // malloc() and we'd OOM again; fetch_entities_() bails with a
-  // clear ESP_LOGE in that case. The state subscription still runs
-  // as a fallback (per-entity deltas for state changes), so even
-  // an S3 that hits the bail-out still gets a working panel - just
-  // without friendly_name for entities whose state hasn't changed
-  // since boot.
-  fetch_entities_();
+  // v1.22aa: server-side-filtered /api/template POST replaces
+  // the 200KB+ bulk /api/states GET (which triggered the SDIO
+  // NULL buffer assert at sdio_drv.c:896). The template filters
+  // to entities in our configured areas so the response is
+  // 20-50 KB instead of 200KB+. Falls back to fetch_entities_()
+  // on HTTP non-200 (e.g. /api/template not enabled in HA).
+  fetch_entities_template_();
 
   if (discovered_areas_.empty()) {
     ESP_LOGW(TAG, "No areas discovered from HA - check API token and connectivity");

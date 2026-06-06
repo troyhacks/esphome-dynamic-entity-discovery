@@ -710,10 +710,35 @@ class HaAutoPanel : public Component {
   // and monitor" - the user wants visibility first, recovery
   // second.
   void check_stuck_tasks_();
-  // v1.22v: stuck-task detection threshold. The detector
-  // fires when the sdio_write task has been in eBlocked for
-  // longer than this. 5s matches the WLED-MM-P4 default.
-  static constexpr uint32_t STUCK_TASK_THRESHOLD_MS = 5 * 1000;
+  // v1.22y: C6 reset via GPIO32 (the esp32_hosted reset_pin).
+  // Re-introduces v1.22u's wedge_trigger_c6_reset_() that
+  // v1.22v removed on the theory that "the SDIO wedge is a
+  // symptom not cause". The per-room poll + httpd hardening
+  // in v1.22v address the cause but the wedge STILL happens
+  // (the sdio_rx_get_buffer assert at sdio_drv.c:896 fires
+  // when the host can't drain the SDIO ring buffer fast
+  // enough during a 200KB+ bulk /api/states transfer). The
+  // C6 reset is the cheapest software recovery: drive
+  // GPIO32 low for WEDGE_C6_RESET_LOW_MS (100ms), release,
+  // the C6 re-inits the SDIO link on its next boot.
+  // Called from check_stuck_tasks_() when block_ms >= 5000
+  // and enable_stuck_task_recovery_ is true.
+  void wedge_trigger_c6_reset_();
+  static constexpr uint32_t WEDGE_C6_RESET_LOW_MS = 100;
+  // v1.22z: stuck-task detection threshold. v1.22v had 5s,
+  // matching the WLED-MM-P4 default. But the C6 SDIO
+  // driver's init sequence blocks the sdio_write task for
+  // 5-10 seconds at EVERY boot - that's normal eBlocked
+  // time for the SDIO handshake + link training. With
+  // 5s threshold + enable_stuck_task_recovery: true (which
+  // v1.22y added), the C6 reset fires on every boot, the
+  // C6 reboots, wedges again, and we end up in a 6-second
+  // boot loop that trips ESPHome's safe_mode detector. The
+  // real wedge (the one that would cause the sdio_rx_get_buffer
+  // assert at sdio_drv.c:896) is a sustained >30s block.
+  // Bumped to 30s so normal boot-time eBlocked is observed
+  // but doesn't trigger the recovery.
+  static constexpr uint32_t STUCK_TASK_THRESHOLD_MS = 30 * 1000;
   // (v1.22u removed: dedicated SDIO wedge detector task. The
   // user correctly identified that the SDIO wedge is a
   // SYMPTOM of a priority-inversion deadlock, not a root
@@ -997,6 +1022,37 @@ class HaAutoPanel : public Component {
 
   void fetch_areas_();
   void fetch_entities_();
+  // v1.22aa: shared parser for both fetch_entities_() and
+  // fetch_entities_template_(). Takes the response body
+  // (already allocated, NUL-terminated) and walks the
+  // JSON array, building Entity records and seeding the
+  // time baseline from the first entity's last_updated.
+  // Extracted so the two fetch paths don't duplicate the
+  // ~140 lines of parse/seed code.
+  void parse_states_response_(const char* response, size_t response_len);
+  // v1.22aa: thin wrapper that wraps parse_states_response_
+  // in a TwdtGuard. Both fetch paths (bulk /api/states
+  // and the new /api/template POST) can take >5s on a
+  // busy install; without the guard the IDF TWDT fires
+  // and the panel reboots. The guard is RAII - re-
+  // subscribes the calling task to the TWDT on exit.
+  void parse_states_response_guarded_(const char* response, size_t response_len);
+  // v1.22aa: server-side-filtered entity-state fetch using
+  // /api/template with a Jinja `in` test against the list of
+  // entity IDs from discovered_areas_. Replaces the 200KB+
+  // bulk /api/states GET that triggered the SDIO NULL buffer
+  // assert at sdio_drv.c:896 (the C6's ring buffer pool
+  // empties when the host can't drain the 200KB+ burst fast
+  // enough - documented in [[project_crowpanel_sdio_is_symptom]]).
+  // The template response is much smaller (typically 20-50 KB
+  // for a 200-entity HA install) because it only includes
+  // entities in our configured areas. Same JSON shape as
+  // /api/states, so the parse path is shared with
+  // fetch_entities_(). Called from start_discovery_() in
+  // place of fetch_entities_() - the old bulk method is
+  // kept for reference + the rare case where the template
+  // approach needs to be bypassed.
+  void fetch_entities_template_();
   void fetch_entities_for_area_(const Area& area);
   void filter_and_build_room_cards_();
   // Predicate helpers take std::string_view so callers can pass
