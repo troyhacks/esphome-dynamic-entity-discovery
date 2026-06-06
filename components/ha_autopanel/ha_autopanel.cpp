@@ -155,7 +155,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22s"
+#define FIRMWARE_VERSION "v1.22t"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -1234,15 +1234,38 @@ void HaAutoPanel::fetch_weather_() {
     ESP_LOGW(TAG, "[weather] missing/invalid temperature");
     return;
   }
+  // v1.22t: read the unit from the HA weather entity's
+  // temperature_unit attribute instead of hardcoding °F.
+  // HA's weather provider sets this based on the user's
+  // unit system preference ("°C" for metric, "°F" for
+  // imperial). The previous v1.22s code always rendered
+  // °F which read "Rainy 20°F" when the user wanted
+  // "Rainy 20°C" - confusing and wrong. Default to °F
+  // when the attribute is missing (older HA versions /
+  // non-standard weather integrations).
+  //
+  // HA returns the unit as a UTF-8 string like "°C" which
+  // is the 3-byte sequence \xc2 \xb0 \x43 (C). The first
+  // byte of the UTF-8 encoding of ° (U+00B0) is \xc2 -
+  // NOT 0xb0 (which is what '°' becomes in a Latin-1
+  // source file). Comparing unit[0] to a literal '°'
+  // would always fail on a Latin-1 source. Instead, walk
+  // the string looking for 'C' or 'F' as ASCII.
+  const char* unit = obj["attributes"]["temperature_unit"].as<const char*>();
+  const char* unit_short = "°F";  // safe default
+  if (unit != nullptr) {
+    for (size_t k = 0; unit[k] != '\0' && k < 8; k++) {
+      if (unit[k] == 'C') { unit_short = "°C"; break; }
+      if (unit[k] == 'F') { unit_short = "°F"; break; }
+    }
+    // 'K' (Kelvin) or anything else falls through to °F
+    // default. Kelvin is rare for home weather displays.
+  }
 
   // Round temperature to nearest integer for the label. HA's
   // weather entity reports one decimal place; "72.3°F" reads
-  // awkwardly in a small label. We keep the unit as the
-  // unicode degree sign + "F" so the label is short and
-  // unambiguous (the entity's temperature_unit is always °F
-  // for the user's HA; if a future user has °C, they'd see
-  // "12 °C" - same length). v1.22r's reference used °C, but
-  // the user's HA is configured for °F.
+  // awkwardly in a small label. The unit is whatever HA
+  // reported (°C for metric users, °F for imperial).
   int temp_int = (int)std::lround(temperature);
 
   // Capitalize the first letter of the state for display.
@@ -1257,9 +1280,9 @@ void HaAutoPanel::fetch_weather_() {
   }
   state_buf[i] = '\0';
 
-  // Compose "{State} {temp}°F" and update the label.
+  // Compose "{State} {temp}{unit}" and update the label.
   char text_buf[48];
-  snprintf(text_buf, sizeof(text_buf), "%s %d°F", state_buf, temp_int);
+  snprintf(text_buf, sizeof(text_buf), "%s %d%s", state_buf, temp_int, unit_short);
   this->weather_text_ = text_buf;
   lv_label_set_text(this->title_weather_label_, text_buf);
   // Re-fit the label width to the new text. Same pattern
