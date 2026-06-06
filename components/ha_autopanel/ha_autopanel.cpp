@@ -2053,13 +2053,18 @@ void HaAutoPanel::maybe_poll_entity_states_() {
   // The fetch path is the same as fetch_entities_() up to
   // the JSON parse, then we use a side-by-side lookup.
   std::string url = this->ha_api_url_ + "/api/states";
-  std::vector<http_request::Header> headers = {
-      {"Authorization", "Bearer " + this->ha_api_password_},
-      {"Content-Type", "application/json"},
-  };
-  auto container = this->http_request_->get(url, headers);
-  if (container == nullptr || container->status_code != 200) {
-    if (container != nullptr) container->end();
+  // v1.23: HttpClient consolidates the get + read + status-
+  // code boilerplate. Was ~60 lines of duplicate code.
+  // Note: this is the bulk /api/states path (200KB+). The
+  // 200KB burst can wedge the C6 SDIO link on a flaky C6
+  // (see [[project_crowpanel_sdio_is_symptom]]). The
+  // HttpClient consolidation doesn't fix the wedge itself
+  // - the v1.24 WebSocket-native approach (using HA's
+  // 'get_states' message instead of bulk /api/states) is
+  // the real fix.
+  HttpClient http(this->http_request_);
+  HttpResult result = http.get(url, http.bearer_auth(this->ha_api_password_));
+  if (result.status != HttpStatus::OK) {
     return;
   }
   // Build a set of entity_ids in our discovered areas so
@@ -2072,41 +2077,11 @@ void HaAutoPanel::maybe_poll_entity_states_() {
       our_entity_ids.insert(std::string(e.entity_id));
     }
   }
-  // Read body into a 256KB PSRAM buffer (the bulk response
-  // is ~200KB; same allocation strategy as fetch_entities_).
-  size_t expected = container->content_length > 0 ? container->content_length : 32768;
-  if (expected > 256 * 1024) expected = 256 * 1024;
-  char* response = (char*)heap_caps_malloc_prefer(
-      expected + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (response == nullptr) {
-    container->end();
-    return;
-  }
-  size_t total = 0;
-  uint8_t chunk[512];
-  uint32_t last_data = millis();
-  while (container->get_bytes_read() < container->content_length && total < expected) {
-    int n = container->read(chunk, std::min<size_t>(sizeof(chunk), expected - total));
-    if (n > 0) {
-      memcpy(response + total, chunk, n);
-      total += n;
-      last_data = millis();
-    } else if (n == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    } else {
-      if (millis() - last_data > 20000) break;
-      App.feed_wdt();
-    }
-  }
-  container->end();
-  response[total] = '\0';
   // Parse the bulk response and update matching entities.
   // We use the PSRAM-preferring allocator for the DOM, same
   // as fetch_entities_().
   PsramJsonDocument doc(&s_psram_allocator);
-  if (deserializeJson(doc, response)) {
-    heap_caps_free(response);
+  if (deserializeJson(doc, result.body)) {
     return;
   }
   JsonArray arr = doc.as<JsonArray>();
@@ -2165,7 +2140,11 @@ void HaAutoPanel::maybe_poll_entity_states_() {
       }
     }
   }
-  heap_caps_free(response);
+  heap_caps_free((void*)result.body.c_str());
+  // (No-op: result.body is a std::string owned by HttpResult,
+  // freed when the result goes out of scope. The heap_caps_free
+  // was needed when 'response' was a raw buffer; now it's a
+  // std::string. Kept as a no-op cast for readability.)
   // Repaint the room cards for any room whose state
   // changed. update_room_card_visual_state_for_area_()
   // is idempotent - it re-reads entities_by_area_ and
