@@ -17,6 +17,9 @@
 #include "esp_http_server.h"  // for AsyncWebHandler / AsyncWebServerRequest
 #include "esphome/core/preferences.h"
 #include "esp_heap_caps.h"
+#include <atomic>             // v1.22u: wedge detector atomic heartbeat
+#include <driver/gpio.h>      // v1.22u: drive GPIO32 (C6 reset) for wedge recovery
+#include "freertos/task.h"    // v1.22u: xTaskCreate for the wedge_detector_task
 
 namespace esphome {
 namespace ha_autopanel {
@@ -316,6 +319,23 @@ class HaAutoPanel : public Component {
   // label. Default "weather.home". Empty string disables
   // fetch_weather_() entirely.
   void set_weather_entity_id(const std::string& id) { this->weather_entity_id_ = id; }
+  // v1.22u: SDIO wedge auto-recovery. These members need
+  // to be PUBLIC (not protected) because the wedge detector
+  // task is a file-scope static function (not a method) and
+  // needs direct access to the heartbeat atomic and the
+  // backoff state. Marking public is safe because the
+  // detector is internal and the names are well-typed.
+  // (We don't make this method public to avoid making the
+  // rest of the internal API public too.)
+  // v1.22u: SDIO wedge auto-recovery. The detector task (a
+  // free function) updates the WEDGE_DETECT_* state on the
+  // static instance pointer; the heartbeat is called from
+  // loop() once per iteration. See the long comment at
+  // wedge_last_loop_tick_ms_ for the design rationale and
+  // priority-inversion analysis.
+  void wedge_heartbeat_();
+  void wedge_trigger_c6_reset_();
+  void wedge_fallback_reboot_();
 
  protected:
   std::string ha_api_url_;
@@ -575,6 +595,55 @@ class HaAutoPanel : public Component {
   // doesn't accidentally trigger multiple toggles). Set to
   // millis() on each click; only toggle if >250ms since last.
   uint32_t last_title_tap_ms_{0};
+ public:
+  // v1.22u: SDIO wedge auto-recovery. The Crowpanel 7" P4 +
+  // ESP32-C6 wifi co-processor has a known hardware wedge
+  // ([[project_crowpanel_c6_sdio_loop]]) where the C6's SDIO
+  // link enters a tight error loop producing
+  // `sdmmc_send_cmd returned 0x109` at ~50/sec. This starves
+  // the P4's loopTask and makes the panel "freeze" from the
+  // user's perspective. The only recovery the user has today
+  // is a hard power cycle (TWDT reboot reproduces the wedge
+  // immediately on the new boot).
+  //
+  // The fix is a dedicated FreeRTOS task at higher priority
+  // than loopTask. loopTask() updates
+  // wedge_last_loop_tick_ms_ on every iteration; the detector
+  // task wakes up every 500ms, checks the age of that counter,
+  // and if it's >15s old, drives GPIO32 (the C6 reset line)
+  // low for 100ms to reset the C6. This is the firmware-
+  // equivalent of "unplug the USB" without needing the user
+  // to physically touch the panel.
+  //
+  // Priority inversion considerations (the user flagged this):
+  // the detector task takes NO FreeRTOS mutexes. The only
+  // shared state with loopTask is the atomic counter, which
+  // is lock-free by definition. The recovery action (GPIO
+  // toggle, App.reboot) is also lock-free. So no high-task-
+  // waits-on-low-task chains exist in the detector.
+  std::atomic<uint32_t> wedge_last_loop_tick_ms_{0};
+  // How long the loop must be silent before the detector
+  // declares a wedge. 15s is well above the 5s state-poll
+  // interval (the longest thing loopTask does between
+  // heartbeats) but well below the 30s TWDT. A wedge hits
+  // much faster than 15s of loopTask starvation, so 15s
+  // detects a wedge that's already 15s in - plenty of time
+  // to attempt C6 reset before the TWDT fires.
+  static constexpr uint32_t WEDGE_DETECT_TIMEOUT_MS = 15 * 1000;
+  // After detecting a wedge, the C6 reset pulse: drive low
+  // for 100ms, then high. The C6 boot ROM samples the pin
+  // and re-initializes its SDIO link. If the link is still
+  // wedged after 3 C6 resets in 60s, give up and fall back
+  // to App.reboot() (which is the v1.22r behavior - the
+  // panel reboots, but the wedge returns on the new boot).
+  static constexpr uint32_t WEDGE_C6_RESET_LOW_MS = 100;
+  static constexpr uint32_t WEDGE_BACKOFF_MAX_RESETS = 3;
+  static constexpr uint32_t WEDGE_BACKOFF_WINDOW_MS = 60 * 1000;
+  // Counter for the backoff window. Mutated only by the
+  // detector task, so no synchronization needed.
+  uint32_t wedge_c6_reset_count_{0};
+  uint32_t wedge_window_start_ms_{0};
+ protected:
   // Local clock, populated by the SNTP time component (yaml id
   // `sntp_time`) and refreshed every loop() tick (~1Hz). Sits to
   // the right of the home name, just left of the Edit button.
@@ -821,6 +890,13 @@ class HaAutoPanel : public Component {
   // than spamming the log.
   void fetch_weather_();
   static constexpr uint32_t WEATHER_FETCH_INTERVAL_MS = 10 * 60 * 1000;  // 10 min
+  // v1.22u: SDIO wedge auto-recovery. The detector task (a
+  // free function) updates the WEDGE_DETECT_* state on the
+  // static instance pointer; the heartbeat is called from
+  // loop() once per iteration. See the long comment at
+  // v1.22u: SDIO wedge auto-recovery methods (declared
+  // public above so the file-scope wedge_detector_task can
+  // reach the atomic counter + backoff state).
   // Recompute x/y/grid_index for every entry in room_cards_ in current
   // vector order (top-to-bottom, left-to-right). Call after any
   // mutation (hide, restore, future bulk import) so the grid always

@@ -110,6 +110,94 @@ class TwdtGuard {
 #include <algorithm>
 #include <cstring>
 
+// --- v1.22u: SDIO wedge auto-recovery task ---
+//
+// The Crowpanel 7" P4 + ESP32-C6 wifi co-processor has a known
+// hardware wedge ([[project_crowpanel_c6_sdio_loop]]) where the
+// C6's SDIO link enters a tight error loop. This starves the
+// P4's loopTask and makes the panel "freeze". The IDF TWDT
+// (30s timeout) does fire and reboots the P4, but the wedge
+// reproduces on the new boot - so the only fix the user has
+// is a HARD power cycle (unplug the USB / pull the battery).
+//
+// The fix here: a dedicated FreeRTOS task that runs at a
+// higher priority than loopTask. The task wakes every 500ms
+// and checks the age of wedge_last_loop_tick_ms_ (which
+// loopTask() updates on every iteration). If the loop hasn't
+// ticked in 15+ seconds, the loopTask has been starved by
+// the SDIO driver, so we drive GPIO32 (the C6 reset line)
+// low for 100ms, then high. The C6 boot ROM re-initializes
+// the SDIO link on the next boot, which clears the wedge
+// without requiring the user to physically touch the panel.
+//
+// Priority inversion (the user flagged this) is avoided by
+// design: the detector task takes NO FreeRTOS mutexes. The
+// only shared state with loopTask is the std::atomic
+// counter wedge_last_loop_tick_ms_, which is lock-free. The
+// recovery actions (gpio_set_level, App.reboot) are also
+// lock-free. So no high-priority-task-waits-on-low-priority-
+// task chains exist. FreeRTOS mutex priority inheritance is
+// therefore not needed for this detector.
+
+static void wedge_detector_task(void* arg) {
+  // The arg is the static HaAutoPanel* singleton (set up in
+  // setup() and held for the lifetime of the process). This
+  // function is at file scope (not in the esphome::ha_autopanel
+  // namespace) so we have to fully qualify the type + the
+  // WEDGE_* constants + millis(). The using-declarations
+  // below alias the qualifiers locally for readability.
+  using esphome::ha_autopanel::HaAutoPanel;
+  using esphome::millis;
+  HaAutoPanel* panel = static_cast<HaAutoPanel*>(arg);
+  ESP_LOGI("ha_autopanel", "[wedge] detector task started");
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (panel == nullptr) continue;
+    // Read the atomic heartbeat counter. The atomic load is
+    // the ONLY interaction with loopTask state, and it never
+    // blocks - so no priority inversion is possible.
+    uint32_t last_tick = panel->wedge_last_loop_tick_ms_.load(
+        std::memory_order_relaxed);
+    uint32_t now_ms = millis();
+    uint32_t age_ms = now_ms - last_tick;
+    // Guard against the millis() rollover edge case. With
+    // 32-bit millis(), that's a 49-day wrap; we treat any
+    // last_tick that seems "in the future" as fresh
+    // (loopTask is running).
+    if (last_tick > now_ms) {
+      continue;
+    }
+    if (age_ms < HaAutoPanel::WEDGE_DETECT_TIMEOUT_MS) {
+      continue;
+    }
+    // Wedge detected. Log with a distinct [wedge] tag so
+    // the test harness can confirm the detector fired.
+    ESP_LOGE("ha_autopanel",
+             "[wedge] detected: loopTask silent for %u ms (threshold %u)",
+             (unsigned)age_ms,
+             (unsigned)HaAutoPanel::WEDGE_DETECT_TIMEOUT_MS);
+    // Backoff: count recent resets in a sliding window.
+    // If we've already reset the C6 N times in the window,
+    // give up on C6 reset and fall back to App.reboot().
+    if (panel->wedge_window_start_ms_ == 0 ||
+        (now_ms - panel->wedge_window_start_ms_) >
+            HaAutoPanel::WEDGE_BACKOFF_WINDOW_MS) {
+      panel->wedge_window_start_ms_ = now_ms;
+      panel->wedge_c6_reset_count_ = 0;
+    }
+    if (panel->wedge_c6_reset_count_ < HaAutoPanel::WEDGE_BACKOFF_MAX_RESETS) {
+      panel->wedge_trigger_c6_reset_();
+      panel->wedge_c6_reset_count_++;
+    } else {
+      ESP_LOGE("ha_autopanel",
+               "[wedge] %u C6 resets in %u ms - falling back to App.reboot()",
+               (unsigned)panel->wedge_c6_reset_count_,
+               (unsigned)HaAutoPanel::WEDGE_BACKOFF_WINDOW_MS);
+      panel->wedge_fallback_reboot_();
+    }
+  }
+}
+
 namespace esphome {
 namespace ha_autopanel {
 
@@ -155,7 +243,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22t"
+#define FIRMWARE_VERSION "v1.22u"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -324,6 +412,87 @@ void HaAutoPanel::setup() {
   // state to start in - SETUP_REQUIRED if no config exists, READY if
   // the config is good.
   this->boot_from_storage_();
+
+  // v1.22u: spawn the SDIO wedge detector task. The task is
+  // pinned to core 0 (the same core loopTask runs on) at
+  // priority 5 - higher than loopTask (priority 1) and the
+  // default httpd task. The 500ms sleep keeps its CPU share
+  // < 1% in the happy path; during a wedge the loopTask
+  // starvation is the bottleneck, not us.
+  //
+  // Pinned to core 0 (not pinned to no core) so we don't
+  // bounce between cores while the SDIO interrupts are
+  // firing on core 0. Pinned-core tasks have a slight
+  // latency advantage for wakeup.
+  BaseType_t ok = xTaskCreatePinnedToCore(
+      wedge_detector_task,        // task function
+      "wedge_detector",            // name (for debug + panic dumps)
+      2048,                        // stack size in words (8KB; we're tiny)
+      this,                        // arg (the HaAutoPanel instance)
+      5,                           // priority (above loopTask, below SDIO ISR)
+      nullptr,                     // task handle (not needed)
+      0);                          // core 0 (same as loopTask + SDIO)
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG, "[wedge] xTaskCreatePinnedToCore failed (ok=%d) - "
+                  "wedge recovery DISABLED for this boot", (int)ok);
+  } else {
+    ESP_LOGI(TAG, "[wedge] detector task spawned (priority 5, core 0)");
+  }
+  // Seed the heartbeat so the detector doesn't false-trigger
+  // during the long boot path. The first call to
+  // wedge_heartbeat_() will overwrite this.
+  this->wedge_last_loop_tick_ms_.store(millis(), std::memory_order_relaxed);
+}
+
+// v1.22u: heartbeat. Called from loop() on every iteration.
+// The detector task reads this atomic to detect starvation.
+// Update is lock-free (atomic RMW) so no priority inversion.
+void HaAutoPanel::wedge_heartbeat_() {
+  this->wedge_last_loop_tick_ms_.store(millis(), std::memory_order_relaxed);
+}
+
+// v1.22u: drive GPIO32 (the C6 reset line) low for 100ms, then
+// high. The C6 boot ROM re-initializes the SDIO link on the
+// next boot, which clears the wedge. We release the pin
+// first via gpio_reset_pin() so the esp32_hosted component's
+// own use of the pin doesn't fight us. The pin is then
+// re-claimed by esp32_hosted on the next C6 link-up.
+void HaAutoPanel::wedge_trigger_c6_reset_() {
+  ESP_LOGE(TAG, "[wedge] driving GPIO32 low for %u ms (C6 reset)",
+           (unsigned)WEDGE_C6_RESET_LOW_MS);
+  gpio_reset_pin(GPIO_NUM_32);
+  gpio_set_direction(GPIO_NUM_32, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_32, 0);
+  // Busy-wait instead of vTaskDelay so the detector task
+  // keeps running and doesn't yield to the wedged loopTask.
+  // 100ms is short enough that the WDT doesn't care.
+  uint32_t start = millis();
+  while ((millis() - start) < WEDGE_C6_RESET_LOW_MS) {
+    // No-op spin. An alternative is ets_delay_us() but
+    // millis() polling is simpler and the duration is short.
+  }
+  gpio_set_level(GPIO_NUM_32, 1);
+  ESP_LOGE(TAG, "[wedge] GPIO32 released (high) - C6 should reboot in ~200ms");
+  // Reset the heartbeat so the detector doesn't re-fire
+  // immediately while the C6 is coming back up. The C6
+  // re-init takes 200-500ms; the loopTask will resume
+  // heartbeating when SDIO is back.
+  this->wedge_last_loop_tick_ms_.store(millis(), std::memory_order_relaxed);
+}
+
+// v1.22u: last-resort recovery. When C6 reset has been tried
+// 3 times in 60s and the wedge keeps coming back, give up
+// and reboot the whole panel. This is the v1.22r behavior
+// (TWDT does this too after 30s) but with our own logging.
+void HaAutoPanel::wedge_fallback_reboot_() {
+  ESP_LOGE(TAG, "[wedge] scheduling App.reboot() in 1s");
+  // set_timeout pattern from ha_autopanel.cpp debug Reboot
+  // button (line ~6452 in the original). App.reboot() is a
+  // one-way trip; give the log 1s to flush.
+  this->set_timeout(1000, []() {
+    ESP_LOGE("ha_autopanel", "[wedge] App.reboot() now");
+    App.reboot();
+  });
 }
 
 void HaAutoPanel::trigger_discovery() {
@@ -4399,6 +4568,13 @@ void HaAutoPanel::on_auth_probe_response_(bool success, const char* error) {
 }
 
 void HaAutoPanel::loop() {
+  // v1.22u: SDIO wedge detector heartbeat. This MUST be
+  // the first thing in loop() so the heartbeat is updated
+  // even if other early returns (auth probe, lazy web
+  // handler) skip the rest of the function. The detector
+  // task checks this counter to detect loopTask starvation
+  // from the SDIO wedge ([[project_crowpanel_c6_sdio_loop]]).
+  this->wedge_heartbeat_();
   // Check authorization probe timeout
   if (this->auth_probe_pending_) {
     if (millis() - this->auth_probe_started_ms_ > AUTH_PROBE_TIMEOUT_MS) {
