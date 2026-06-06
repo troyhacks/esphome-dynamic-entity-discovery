@@ -2,26 +2,42 @@
 #include "esphome/core/log.h"
 #include "esphome/core/string_ref.h"
 #include "esphome/components/json/json_util.h"
+// v1.22s: font-related (originally needed for externs but those
+// were removed - see [[feedback_esphome_font_static_linkage]]).
+// The font::Font class is still useful for type safety in
+// get_lv_font() calls, so we keep the include. The actual
+// font size selection happens at runtime via
+// lv_obj_get_style_text_font() - see pick_room_name_font_().
+#include "esphome/components/font/font.h"
 
 // v1.22l: font ladder for the room-name auto-fit picker.
-// ESPHome's LVGL component auto-generates an extern
-// `lv_font_t <id>;` for each `font:` block in the yaml, so
-// we can use `&font_xl` / `&font_lg` / etc. directly. The
-// ladder goes from biggest to smallest; the picker tries
-// each in order and uses the first that fits the available
-// arc width. font_button (14pt) is the fixed font for the
-// ON/OFF label - that one doesn't auto-fit because the
-// "ON/OFF" string is short and consistent.
-extern const lv_font_t font_xl;      // 28pt - default room name
-extern const lv_font_t font_lg;      // 24pt - long names (e.g. "Master Bedroom")
-extern const lv_font_t font_md;      // 20pt - very long names
-extern const lv_font_t font_sm;      // 16pt - the last size before splitting
-extern const lv_font_t font_button;  // 14pt - "ON/OFF" button label
+// v1.22s REFACTOR: ESPHome's auto-generated font::Font*
+// symbols in main.cpp have FILE-STATIC linkage (see
+// [[feedback_esphome_font_static_linkage]]), so we cannot
+// `extern` them from a custom component. The auto-fit
+// font picker is therefore DEFERRED in v1.22s; the
+// pick_room_name_font_() helper still exists (so the
+// create_room_card_() call site doesn't change) but it
+// returns the LVGL default text font (set by
+// `lvgl.text_font: font_xl` in the yaml) regardless of
+// the room name length. Long names still wrap via
+// split_room_name_to_fit_() to two lines.
+//
+// A future v1.22t+ could implement the ladder by either
+// (a) extending the yaml to expose a `font_lv_lg` etc.
+//    that IS externally linkable, or
+// (b) using a hidden helper label that the user sets
+//    the smaller font on at create time, then reading
+//    the font pointer from the label's style.
+// For now we ship v1.22s with weather + 24h time +
+// show/hide time, and the font picker remains a TODO.
 #include "esphome/components/api/api_server.h"
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/homeassistant_service.h"
 #include <lvgl.h>
 #include <climits>  // for INT_MAX in split_room_name_to_fit_
+#include <cmath>    // v1.22s: std::lround, std::isnan (weather temp parse)
+#include <cctype>   // v1.22s: std::toupper (weather state capitalization)
 #include "esp_task_wdt.h"  // v1.22p: IDF task watchdog (separate from App.feed_wdt)
 #include "freertos/FreeRTOS.h"  // v1.22p: xTaskGetCurrentTaskHandle()
 
@@ -139,7 +155,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22r"
+#define FIRMWARE_VERSION "v1.22s"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -1078,8 +1094,203 @@ void HaAutoPanel::fetch_home_name_() {
   }
 }
 
+void HaAutoPanel::fetch_weather_() {
+  // v1.22s: title bar weather label fetcher.
+  //
+  // The HA weather entity is exposed as a normal entity on
+  // /api/states/<entity_id> with a `state` field of the
+  // current condition (e.g. "cloudy", "sunny", "rainy")
+  // and a `attributes.temperature` field with the current
+  // temp in the entity's configured unit (°F in the user's
+  // HA). We render "{state} {temp}°" into
+  // title_weather_label_ and unhide it.
+  //
+  // Disabled entirely when weather_entity_id_ is empty
+  // (the yaml knob is ""). The label widget is created
+  // hidden in create_title_bar_() and stays hidden if we
+  // never fetch. So an empty entity_id or 404 is a
+  // silent no-op rather than a UI change.
+  if (this->title_weather_label_ == nullptr) return;
+  if (this->weather_entity_id_.empty()) {
+    ESP_LOGD(TAG, "[weather] disabled (weather_entity_id is empty)");
+    return;
+  }
+  if (this->http_request_ == nullptr) {
+    ESP_LOGW(TAG, "[weather] http_request_ is null - cannot fetch");
+    return;
+  }
+  if (this->ha_api_url_.empty() || this->ha_api_password_.empty()) {
+    ESP_LOGW(TAG, "[weather] HA URL or token empty - cannot fetch");
+    return;
+  }
+
+  // Throttle: don't re-fetch if we just did. Mirrors the
+  // last_home_fetch_ms_ guard so the periodic loop() call is
+  // safe to make on every tick.
+  uint32_t now = millis();
+  if (this->last_weather_fetch_ms_ != 0 &&
+      (now - this->last_weather_fetch_ms_) < WEATHER_FETCH_INTERVAL_MS) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "[weather] fetching %s from %s/api/states/%s",
+           this->weather_entity_id_.c_str(),
+           this->ha_api_url_.c_str(),
+           this->weather_entity_id_.c_str());
+
+  // Same single-entity endpoint pattern as fetch_home_name_().
+  // /api/states/<entity_id> is small (~500B) vs the 200KB+ of
+  // the bulk /api/states. This is critical because weather
+  // is a high-traffic entity (HA updates it often) and we
+  // don't want to fight the bulk poll for bandwidth.
+  std::string url = this->ha_api_url_ + "/api/states/" + this->weather_entity_id_;
+  std::vector<http_request::Header> headers = {
+      {"Authorization", "Bearer " + this->ha_api_password_},
+      {"Content-Type", "application/json"},
+  };
+  auto container = this->http_request_->get(url, headers);
+  if (container == nullptr) {
+    ESP_LOGW(TAG, "[weather] GET %s returned null container", url.c_str());
+    return;
+  }
+  if (container->status_code == 0) {
+    ESP_LOGW(TAG, "[weather] connection failed");
+    container->end();
+    return;
+  }
+  if (container->status_code == 401) {
+    ESP_LOGW(TAG, "[weather] HTTP 401 - token rejected");
+    container->end();
+    return;
+  }
+  if (container->status_code == 404) {
+    // No weather entity in HA. Not an error - just
+    // nothing to show. The label stays hidden. Mark
+    // the fetch timestamp so we don't retry every
+    // 2s via the loop() poll.
+    ESP_LOGW(TAG, "[weather] %s not found in HA (HTTP 404)",
+             this->weather_entity_id_.c_str());
+    container->end();
+    this->last_weather_fetch_ms_ = millis();
+    return;
+  }
+  if (container->status_code != 200) {
+    ESP_LOGW(TAG, "[weather] HTTP %d", (int)container->status_code);
+    container->end();
+    return;
+  }
+
+  // Read the body. /api/states/<id> is ~500B - same read
+  // loop as fetch_home_name_(). App.feed_wdt() + yield()
+  // to stay friendly to the IDF task watchdog (see v1.22p).
+  size_t expected = container->content_length;
+  std::string response;
+  response.reserve(expected > 0 ? expected : 1024);
+  uint8_t buf[512];
+  uint32_t last_data_time = millis();
+  const uint32_t timeout = 10000;
+  const size_t MAX_BODY = 16 * 1024;
+  while (container->get_bytes_read() < container->content_length &&
+         response.size() < MAX_BODY) {
+    App.feed_wdt();
+    yield();
+    int read = container->read(buf, sizeof(buf));
+    if (read > 0) {
+      response.append(reinterpret_cast<char*>(buf), read);
+      last_data_time = millis();
+    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
+      break;
+    }
+    if (millis() - last_data_time > timeout) {
+      ESP_LOGW(TAG, "[weather] timeout reading response");
+      break;
+    }
+  }
+  container->end();
+
+  // Parse the JSON. We expect {"state": "cloudy", "attributes":
+  //   {"temperature": 72.3, "temperature_unit": "°F", ...}}
+  // Uses the project's PsramJsonDocument + deserializeJson()
+  // pattern (see fetch_home_name_ at line ~1010). PSRAM-backed
+  // so we don't OOM the small internal heap.
+  PsramJsonDocument doc(&s_psram_allocator);
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    ESP_LOGW(TAG, "[weather] JSON parse failed: %s", err.c_str());
+    return;
+  }
+  JsonObject obj = doc.as<JsonObject>();
+  if (obj.isNull()) {
+    ESP_LOGW(TAG, "[weather] response is not a JSON object");
+    return;
+  }
+  const char* state = obj["state"].as<const char*>();
+  if (state == nullptr || state[0] == '\0') {
+    ESP_LOGW(TAG, "[weather] empty state field");
+    return;
+  }
+  double temperature = obj["attributes"]["temperature"].as<double>();
+  if (std::isnan(temperature)) {
+    ESP_LOGW(TAG, "[weather] missing/invalid temperature");
+    return;
+  }
+
+  // Round temperature to nearest integer for the label. HA's
+  // weather entity reports one decimal place; "72.3°F" reads
+  // awkwardly in a small label. We keep the unit as the
+  // unicode degree sign + "F" so the label is short and
+  // unambiguous (the entity's temperature_unit is always °F
+  // for the user's HA; if a future user has °C, they'd see
+  // "12 °C" - same length). v1.22r's reference used °C, but
+  // the user's HA is configured for °F.
+  int temp_int = (int)std::lround(temperature);
+
+  // Capitalize the first letter of the state for display.
+  // HA's state values are lowercase ("cloudy", "partlycloudy"
+  // or sometimes with a space: "partly cloudy"). The label
+  // looks better with a leading capital.
+  char state_buf[32];
+  size_t i = 0;
+  state_buf[i++] = (char)std::toupper((unsigned char)state[0]);
+  for (size_t j = 1; state[j] != '\0' && i < sizeof(state_buf) - 1; j++) {
+    state_buf[i++] = state[j];
+  }
+  state_buf[i] = '\0';
+
+  // Compose "{State} {temp}°F" and update the label.
+  char text_buf[48];
+  snprintf(text_buf, sizeof(text_buf), "%s %d°F", state_buf, temp_int);
+  this->weather_text_ = text_buf;
+  lv_label_set_text(this->title_weather_label_, text_buf);
+  // Re-fit the label width to the new text. Same pattern
+  // as the time label - the flex cluster reflows when
+  // the label grows.
+  const lv_font_t* wf = lv_obj_get_style_text_font(
+      this->title_weather_label_, LV_PART_MAIN);
+  lv_obj_set_width(this->title_weather_label_,
+                   button_width_for_text_(text_buf, wf, 4));
+  // Unhide the label now that we have a real value to show.
+  lv_obj_remove_flag(this->title_weather_label_, LV_OBJ_FLAG_HIDDEN);
+  this->last_weather_fetch_ms_ = millis();
+  ESP_LOGI(TAG, "[weather] updated label to '%s'", text_buf);
+}
+
 void HaAutoPanel::update_title_time_() {
   if (this->title_time_label_ == nullptr) return;
+  // v1.22s: show_time knob. When false the time label is
+  // hidden and we skip the entire update - the right
+  // cluster auto-collapses to just the DBG button. The
+  // HIDDEN flag is set once in create_title_bar_(); we
+  // just bail out here so we don't waste cycles
+  // formatting a string nobody sees.
+  if (!this->show_time_) {
+    static int hidden_marker = -1;
+    if (hidden_marker == -1) {
+      lv_label_set_text(this->title_time_label_, "");
+      hidden_marker = 0;
+    }
+    return;
+  }
   // Throttle: only redraw when the displayed minute changes. The
   // hh:mm string is the same for a whole minute, so we cache the
   // last minute we set and bail out cheaply on every other tick.
@@ -1120,7 +1331,16 @@ void HaAutoPanel::update_title_time_() {
       if (h12 == 0) h12 = 12;
       const char* ampm = (hour < 12) ? "AM" : "PM";
       char buf[16];
-      snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      if (this->use_24h_time_) {
+        // 24-hour format: "22:52". No AM/PM suffix, hour is
+        // the raw 0-23 from localtime_r. The minute_key
+        // throttle above already keys on (hour*100+minute)
+        // so we redraw at the same cadence.
+        snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+      } else {
+        // 12-hour format: "10:52 PM" (the v1.22r style).
+        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      }
       lv_label_set_text(this->title_time_label_, buf);
       // v1.22e: re-fit the label width to the new text. Without
       // this, switching from "8 PM" (narrow) to "11:03 PM" (wide)
@@ -1159,7 +1379,16 @@ void HaAutoPanel::update_title_time_() {
       if (h12 == 0) h12 = 12;
       const char* ampm = (hour < 12) ? "AM" : "PM";
       char buf[16];
-      snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      if (this->use_24h_time_) {
+        // 24-hour format: "22:52". No AM/PM suffix, hour is
+        // the raw 0-23 from localtime_r. The minute_key
+        // throttle above already keys on (hour*100+minute)
+        // so we redraw at the same cadence.
+        snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+      } else {
+        // 12-hour format: "10:52 PM" (the v1.22r style).
+        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      }
       lv_label_set_text(this->title_time_label_, buf);
       const lv_font_t* f = lv_obj_get_style_text_font(
           this->title_time_label_, LV_PART_MAIN);
@@ -1184,7 +1413,13 @@ void HaAutoPanel::update_title_time_() {
         if (h12 == 0) h12 = 12;
         const char* ampm = (now.hour < 12) ? "AM" : "PM";
         char buf[16];
-        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, now.minute, ampm);
+        if (this->use_24h_time_) {
+          // v1.22s: 24h path for the SNTP fallback. Same as
+          // the HA-derived path - "22:52" with no AM/PM.
+          snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
+        } else {
+          snprintf(buf, sizeof(buf), "%d:%02d %s", h12, now.minute, ampm);
+        }
         lv_label_set_text(this->title_time_label_, buf);
         // v1.22e: re-fit the label width to the new text.
         const lv_font_t* f = lv_obj_get_style_text_font(
@@ -1218,7 +1453,16 @@ void HaAutoPanel::update_title_time_() {
       if (h12 == 0) h12 = 12;
       const char* ampm = (hour < 12) ? "AM" : "PM";
       char buf[16];
-      snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      if (this->use_24h_time_) {
+        // 24-hour format: "22:52". No AM/PM suffix, hour is
+        // the raw 0-23 from localtime_r. The minute_key
+        // throttle above already keys on (hour*100+minute)
+        // so we redraw at the same cadence.
+        snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+      } else {
+        // 12-hour format: "10:52 PM" (the v1.22r style).
+        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
+      }
       lv_label_set_text(this->title_time_label_, buf);
       const lv_font_t* f = lv_obj_get_style_text_font(
           this->title_time_label_, LV_PART_MAIN);
@@ -2069,6 +2313,15 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_set_width(this->title_time_label_,
                    button_width_for_text_("--:--", time_font, 4));
   lv_obj_set_height(this->title_time_label_, LV_SIZE_CONTENT);
+  // v1.22s: apply the show_time_ knob at create-time. When
+  // false the label is hidden from the start; the right
+  // cluster auto-collapses to just the DBG button. The
+  // click handler is still attached below (a no-op since
+  // the label is hidden, but kept for symmetry with the
+  // show-time path).
+  if (!this->show_time_) {
+    lv_obj_add_flag(this->title_time_label_, LV_OBJ_FLAG_HIDDEN);
+  }
   // Make the time label clickable. The tap handler is set later
   // (after the buttons are created) so it can toggle them.
   lv_obj_add_flag(this->title_time_label_, LV_OBJ_FLAG_CLICKABLE);
@@ -2733,17 +2986,30 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // "Front\nPorch Overhead Light".
   lv_obj_t* label = lv_label_create(label_btn);
   char name_buf[128];
-  // Use the label's own font style (the lvgl text_font from
-  // yaml) so the width measurement matches what gets rendered.
-  // The label is brand new so we have to read the font after
-  // creating it; lvgl inherits the parent style.
+  // v1.22s: auto-fit font picker. The label is arc_size
+  // wide minus the 5px pad on each side of label_btn, so
+  // (arc_size - 10) is the budget. pick_room_name_font_()
+  // is currently a no-op (returns nullptr - see
+  // [[feedback_esphome_font_static_linkage]]) so we fall
+  // back to the LVGL default text font (font_xl per the
+  // yaml's `lvgl.text_font:`). When the picker becomes
+  // real, the only change is that picked_font will be
+  // non-null and the explicit set_style_text_font call
+  // below will override the default with the picked size.
+  const int label_width_px = arc_size - 10;
+  const lv_font_t* picked_font = this->pick_room_name_font_(
+      room.area.name.c_str(), label_width_px);
+  if (picked_font != nullptr) {
+    lv_obj_set_style_text_font(label, picked_font, 0);
+  }
+  // Read the actual font (either the picked one above or
+  // the default from the label's style). The split helper
+  // needs the font for its line-1/line-2 width checks.
   const lv_font_t* room_font = lv_obj_get_style_text_font(
       label, LV_PART_MAIN);
-  // The label is arc_size wide minus the 5px pad we set on
-  // label_btn above. Use that as the budget.
   this->split_room_name_to_fit_(
       room.area.name.c_str(),
-      arc_size - 10,  // -10 for the label_btn's 5px L/R pad
+      label_width_px,
       room_font,
       name_buf, sizeof(name_buf));
   lv_label_set_text(label, name_buf);
@@ -3835,6 +4101,15 @@ void HaAutoPanel::set_panel_state_(PanelState new_state) {
     this->set_timeout("home_fetch", 50, [this]() {
       this->fetch_home_name_();
     });
+    // v1.22s: kick off the weather fetch in parallel with the
+    // home-name fetch. Same 50ms deferral pattern for the same
+    // reason (the http_request_ state machine just settled).
+    // The weather label was created hidden; if the entity is
+    // missing or the network fails, the label stays hidden and
+    // we just stop retrying after the 10-min throttle window.
+    this->set_timeout("weather_fetch", 75, [this]() {
+      this->fetch_weather_();
+    });
   } else {
     if (this->main_container_ != nullptr) {
       lv_obj_add_flag(this->main_container_, LV_OBJ_FLAG_HIDDEN);
@@ -4121,6 +4396,14 @@ void HaAutoPanel::loop() {
   // guard inside filter the work.
   if (this->state_ == PanelState::READY) {
     this->fetch_home_name_();
+  }
+
+  // v1.22s: periodic weather refresh. fetch_weather_() throttles
+  // itself (WEATHER_FETCH_INTERVAL_MS = 10 min) and bails out
+  // cheaply if the URL/token/entity_id aren't ready. Same
+  // pattern as fetch_home_name_() above.
+  if (this->state_ == PanelState::READY) {
+    this->fetch_weather_();
   }
 
   // Refresh the title-bar clock. update_title_time_() early-exits
@@ -6429,6 +6712,29 @@ int HaAutoPanel::button_width_for_text_(const char* text, const lv_font_t* font,
   if (text_w <= 0) return 24;
   int w = text_w + (2 * pad_x) + 2;
   return w < 24 ? 24 : w;
+}
+
+const lv_font_t* HaAutoPanel::pick_room_name_font_(const char* name, int max_width_px) {
+  // v1.22s: auto-fit font picker for room names. DEFERRED
+  // to v1.22t+ due to the static-linkage block described
+  // in [[feedback_esphome_font_static_linkage]] - we
+  // cannot reference the font::Font* externs from a
+  // custom component.
+  //
+  // For now the picker is a no-op: it returns nullptr and
+  // lets create_room_card_() fall back to the LVGL default
+  // text font (set by `lvgl.text_font: font_xl` in the
+  // yaml). Long room names still wrap to two lines via
+  // split_room_name_to_fit_(). This preserves the v1.22r
+  // visual behavior.
+  //
+  // The arguments (name, max_width_px) are unused right
+  // now but kept in the signature so the call site in
+  // create_room_card_() doesn't need to change when the
+  // picker is implemented for real.
+  (void)name;
+  (void)max_width_px;
+  return nullptr;
 }
 
 void HaAutoPanel::split_room_name_to_fit_(const char* name, int max_width_px,

@@ -82,6 +82,23 @@ CONFIG_SCHEMA = cv.Schema(
         # the security bar meaningfully (an attacker on the LAN with
         # the same WiFi key can already see the panel's full state).
         cv.Optional("agent_debug", default=False): cv.boolean,
+        # v1.22s: title bar time format. False (default) keeps the
+        # 12-hour "10:52 PM" style; True renders 24-hour "22:52".
+        # The 12-hour default matches the v1.22r screenshot the user
+        # signed off on; 24h is opt-in.
+        cv.Optional("use_24h_time", default=False): cv.boolean,
+        # v1.22s: show/hide the title bar time label entirely. Default
+        # True (visible). Set False to keep the title bar minimal -
+        # useful for digital photo-frame / kiosk style deployments
+        # where the wall-clock isn't relevant.
+        cv.Optional("show_time", default=True): cv.boolean,
+        # v1.22s: HA weather entity id to fetch for the title bar
+        # weather label. Default "weather.home" matches HA's
+        # auto-created weather entity. Set to "" to disable the
+        # weather label entirely (the label is hidden until a
+        # successful fetch anyway, so a bad/missing entity_id is
+        # silently no-op rather than an error spam).
+        cv.Optional("weather_entity_id", default="weather.home"): cv.string,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -152,3 +169,7 @@ async def to_code(config):
     # AGENT_DEBUG: see schema comment. Off by default for production
     # safety. Test yaml flips it on.
     cg.add(var.set_agent_debug(config["agent_debug"]))
+    # v1.22s: title bar time + weather knobs.
+    cg.add(var.set_use_24h_time(config["use_24h_time"]))
+    cg.add(var.set_show_time(config["show_time"]))
+    cg.add(var.set_weather_entity_id(config["weather_entity_id"]))

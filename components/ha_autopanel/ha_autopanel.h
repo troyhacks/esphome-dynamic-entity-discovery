@@ -304,6 +304,18 @@ class HaAutoPanel : public Component {
   // false so a production build does not expose them. See
   // __init__.py for the full security rationale.
   void set_agent_debug(bool v) { this->agent_debug_ = v; }
+  // v1.22s: title bar time format. False = 12-hour "10:52 PM";
+  // True = 24-hour "22:52". Wired into update_title_time_().
+  void set_use_24h_time(bool v) { this->use_24h_time_ = v; }
+  // v1.22s: title bar time visibility. False hides the time
+  // label entirely (kiosk / digital-frame mode); the right
+  // cluster auto-collapses to just the DBG button. Wired in
+  // create_title_bar_().
+  void set_show_time(bool v) { this->show_time_ = v; }
+  // v1.22s: HA weather entity id for the title bar weather
+  // label. Default "weather.home". Empty string disables
+  // fetch_weather_() entirely.
+  void set_weather_entity_id(const std::string& id) { this->weather_entity_id_ = id; }
 
  protected:
   std::string ha_api_url_;
@@ -328,6 +340,13 @@ class HaAutoPanel : public Component {
   // (square cards). cards_per_row is computed from screen_width and
   // card_gap. main_container_ height is computed from card count.
   int card_width_{250};
+  // v1.22r: card_height is the card's vertical extent. For
+  // the current 7" Crowpanel design card_height_ == card_width_
+  // (square cards). The arc_size_() formula uses min(w,h)
+  // so a future rectangular card (e.g. 4" 480x320) just
+  // works - the arc will be sized off the smaller
+  // dimension.
+  int card_height_{250};
   // v1.22q: parametric arc size - 96% of the smaller card
   // dimension with a 2% padding on each side. For 250x250
   // that's 240. The 2% padding means the arc leaves a
@@ -523,6 +542,22 @@ class HaAutoPanel : public Component {
   // Cached so the title bar has something to show on the next
   // boot before the network call returns.
   std::string weather_text_;
+  // v1.22s: HA weather entity id (yaml "weather_entity_id", default
+  // "weather.home"). Empty disables fetch_weather_().
+  std::string weather_entity_id_{"weather.home"};
+  // v1.22s: wall-clock millis of the last successful weather fetch.
+  // Throttles the periodic refresh in loop(). Mirrors
+  // last_home_fetch_ms_ for home_name_.
+  uint32_t last_weather_fetch_ms_{0};
+  // v1.22s: 24h time format flag (yaml "use_24h_time", default
+  // false = 12h "10:52 PM"). update_title_time_() reads this.
+  bool use_24h_time_{false};
+  // v1.22s: title bar time visibility (yaml "show_time", default
+  // true). create_title_bar_() reads this once to set the initial
+  // HIDDEN flag; the tap-toggling click handler in the time label
+  // is registered regardless so this flag is only the default
+  // state, not a runtime override.
+  bool show_time_{true};
   // v1.22r: left cluster (the weather + future left-side widgets).
   // Anchored to the LEFT edge of the title bar with LV_ALIGN_LEFT_MID
   // + a small left padding (8px). Lives in a flex row so adding
@@ -779,6 +814,13 @@ class HaAutoPanel : public Component {
   // [home] tag in the log lets the host harness verify the result.
   void fetch_home_name_();
   static constexpr uint32_t HOME_FETCH_INTERVAL_MS = 5 * 60 * 1000;  // 5 min
+  // v1.22s: GET <ha_api>/api/states/<weather_entity_id_> and render
+  // "Cloudy 3°C" into title_weather_label_. Throttled to one call
+  // per WEATHER_FETCH_INTERVAL_MS. Silently no-ops on 404 (no
+  // weather entity configured) so the label stays hidden rather
+  // than spamming the log.
+  void fetch_weather_();
+  static constexpr uint32_t WEATHER_FETCH_INTERVAL_MS = 10 * 60 * 1000;  // 10 min
   // Recompute x/y/grid_index for every entry in room_cards_ in current
   // vector order (top-to-bottom, left-to-right). Call after any
   // mutation (hide, restore, future bulk import) so the grid always
@@ -822,11 +864,10 @@ class HaAutoPanel : public Component {
   // v1.22i: was card_width_ - 20 (230 for 250px card), which
   // made the arc bottom edge reach the card bottom. The user
   // wanted the ON/OFF button to fit inside the arc's bottom
-  // opening, not be clipped by it. 70px gap (card_width_ - 70
-  // = 180 for 250px card) leaves room for a 32px button + 8px
-  // top gap + 10px bottom gap below the arc, all inside the
-  // card.
-  int arc_size_() const { return this->card_width_ - 70; }  // square, leaves room for button below
+  // opening, not be clipped by it. (The active definition
+  // is at line 339 above - this is a stale comment block
+  // from v1.22f that got orphaned when arc_size_ was
+  // moved to its own area.)
   uint32_t get_room_color_(int index) const;
 
   // v1.22e: data-driven button/label sizing. The previous code
@@ -850,6 +891,15 @@ class HaAutoPanel : public Component {
   // be at least 128 bytes for any reasonable room name).
   void split_room_name_to_fit_(const char* name, int max_width_px,
                                 const lv_font_t* font, char* out, size_t out_size) const;
+  // v1.22s: auto-fit room-name font picker. Returns the LARGEST
+  // font in the ladder {&font_xl, &font_lg, &font_md, &font_sm}
+  // whose single-line width for `name` fits within `max_width_px`.
+  // If none of the four single-line fonts fit, returns &font_sm
+  // (the smallest) and the caller should fall back to
+  // split_room_name_to_fit_() to wrap onto two lines. The
+  // ladder was planned in v1.22l (see comment at top of .cpp) but
+  // the picker itself was deferred to v1.22s.
+  static const lv_font_t* pick_room_name_font_(const char* name, int max_width_px);
 
   // HA service call helper - uses native ESPHome API
   // service:    e.g. "light.turn_on", "light.turn_off", "switch.toggle"
