@@ -1393,76 +1393,25 @@ void HaAutoPanel::fetch_home_name_() {
   // is a small JSON object ~500 bytes. Same shape as an entry in the
   // /api/states array, so we parse it the same way.
   std::string url = this->ha_api_url_ + "/api/states/zone.home";
-  std::vector<http_request::Header> headers = {
-      {"Authorization", "Bearer " + this->ha_api_password_},
-      {"Content-Type", "application/json"},
-  };
-  auto container = this->http_request_->get(url, headers);
-  if (container == nullptr) {
-    ESP_LOGW(TAG, "[home] GET /api/states/zone.home returned null container");
-    return;
-  }
-  if (container->status_code == 0) {
-    ESP_LOGW(TAG, "[home] connection failed");
-    container->end();
-    return;
-  }
-  if (container->status_code == 401) {
-    // Auth failure here is interesting - the rest of the system
-    // already proved the token works (we passed the auth probe).
-    // Could be a transient token rotation, just log and let the
-    // next periodic refresh retry.
-    ESP_LOGW(TAG, "[home] HTTP 401 - token rejected");
-    container->end();
-    return;
-  }
-  if (container->status_code == 404) {
+  // v1.23: HttpClient consolidates the get + read + status-
+  // code boilerplate (was ~80 lines of duplicate code).
+  HttpClient http(this->http_request_);
+  HttpResult result = http.get(url, http.bearer_auth(this->ha_api_password_));
+  if (result.status == HttpStatus::NOT_FOUND) {
     // zone.home doesn't exist (user hasn't set up a Home zone in
     // HA, or renamed it to something else). Not an error - just
     // nothing to display. Clear the cache and return.
     ESP_LOGW(TAG, "[home] zone.home not found in HA (HTTP 404)");
-    container->end();
     this->home_name_.clear();
     this->last_home_fetch_ms_ = millis();
     return;
   }
-  if (container->status_code != 200) {
-    ESP_LOGW(TAG, "[home] HTTP %d", (int)container->status_code);
-    container->end();
+  if (result.status != HttpStatus::OK) {
+    ESP_LOGW(TAG, "[home] fetch failed: %s (HTTP %d)",
+             http_status_to_str(result.status), result.http_code);
     return;
   }
-
-  // Read the body. /api/states/zone.home is ~500 bytes - reserve a
-  // small buffer and cap at 16KB as a safety net.
-  size_t expected = container->content_length;
-  std::string response;
-  response.reserve(expected > 0 ? expected : 1024);
-  uint8_t buf[512];
-  uint32_t last_data_time = millis();
-  const uint32_t timeout = 10000;
-  int iter = 0;
-  const size_t MAX_BODY = 16 * 1024;
-  while (container->get_bytes_read() < container->content_length &&
-         response.size() < MAX_BODY) {
-    App.feed_wdt();
-    yield();
-    int read = container->read(buf, sizeof(buf));
-    if (read > 0) {
-      response.append(reinterpret_cast<char*>(buf), read);
-      last_data_time = millis();
-      iter = 0;
-    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    } else {
-      iter++;
-      if (iter % 10 == 0) App.feed_wdt();
-    }
-    if (millis() - last_data_time > timeout) {
-      ESP_LOGW(TAG, "[home] timeout reading response");
-      break;
-    }
-  }
-  container->end();
+  const std::string& response = result.body;
 
   // Parse with ArduinoJson. The response is a JSON object (not an
   // array) since we used the /api/states/<id> endpoint. Using the
