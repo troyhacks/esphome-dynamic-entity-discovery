@@ -99,19 +99,32 @@ CONFIG_SCHEMA = cv.Schema(
         # successful fetch anyway, so a bad/missing entity_id is
         # silently no-op rather than an error spam).
         cv.Optional("weather_entity_id", default="weather.home"): cv.string,
-        # v1.22v: subscription scope. The "all" mode (default) is
-        # the v1.22u behavior - subscribe to every entity + 5s bulk
-        # poll. "none" disables all subscriptions (rely on the bulk
+        # v1.22w: subscription scope. The "all" mode subscribes
+        # to every entity + 5s bulk poll - the v1.22u behavior.
+        # "none" disables all subscriptions (rely on the bulk
         # poll). "per_room" subscribes only to entities in the
         # currently-displayed room + global media_players, with
         # maybe_poll_current_room_states_() running a 3s per-room
-        # poll. The per-room mode eliminates the O(N*E) full-scan
-        # work that was the trigger condition for the priority-
-        # inversion deadlock documented in
-        # [[project_crowpanel_sdio_is_symptom]]. See
+        # poll.
+        #
+        # v1.22w: default CHANGED from "all" to "per_room". The
+        # v1.22v "all" default allocates ~200+ std::function
+        # callbacks in a row (one per subscribe_home_assistant_state
+        # call) during a single trigger_subscription() invocation.
+        # When the C6 SDIO is wedged (the priority-inversion
+        # deadlock documented in
+        # [[project_crowpanel_sdio_is_symptom]]), the heap is
+        # too fragmented to hold all of them and one allocation
+        # throws std::bad_alloc. -fno-exceptions turns the throw
+        # into a direct abort() at PC 0x480dbxxx. The first live
+        # evidence was at 12:21:05.762 on the user's panel -
+        # see [[feedback_yaml_lambda_std_function_throw]].
+        # "per_room" caps the count at ~5 callbacks (the lights
+        # in the visible room + media_players), so the abort
+        # path is closed for typical use. See
         # .claude/plans/greedy-discovering-koala.md for the
         # full v1.22v plan.
-        cv.Optional("subscribe_mode", default="all"): cv.one_of(
+        cv.Optional("subscribe_mode", default="per_room"): cv.one_of(
             "all", "none", "per_room"
         ),
         # v1.22v: WLED-pattern stuck-task recovery knob. When

@@ -599,7 +599,52 @@ class HaAutoPanel : public Component {
   // subscription at all). 2=per_room (subscribe only to entities
   // in current_room_area_id_ plus global media_players; per-room
   // poll supplements at 3s).
-  uint8_t subscribe_mode_{0};
+  // v1.22w: default is now 2 (per_room) - see __init__.py for why.
+  uint8_t subscribe_mode_{2};
+  // v1.22w: deferred-trigger flags. Set by the YAML
+  // trigger_subscription / trigger_auth_probe lambdas (or by
+  // the C++ auto-trigger on HA connect), processed in loop() at
+  // the panel's own pace. This decouples the httpd worker task
+  // (where the YAML std::function lambdas fire) from the heavy
+  // std::function-allocation work in subscribe_to_all_entities_()
+  // and probe_authorization_(). Without the deferral, a throw
+  // from one of those allocs lands in the httpd worker context,
+  // which -fno-exceptions turns into abort() at PC 0x480dbxxx
+  // and brings the whole panel down.
+  //
+  // The flag-setter path (the YAML lambdas calling
+  // trigger_subscription / trigger_auth_probe) is allocation-
+  // free: it's a member function setting a bool. The actual
+  // work happens later, in loop() on the main task, where
+  // memory pressure is the panel's own heap budget rather than
+  // the httpd worker's transient working set.
+  bool pending_subscription_{false};
+  bool pending_auth_probe_{false};
+  // v1.22w: chunked subscription state. Build the
+  // (entity_id, attribute, area_id) list once, then drain it
+  // N entries per loop tick. Caps the per-tick std::function
+  // allocation burst at SUBSCRIBE_CHUNK_PER_TICK, so even
+  // subscribe_mode="all" (200+ subs) doesn't blow up the heap
+  // in a single tick. The std::string members in
+  // PendingSubscription are owned (not arena-backed) because
+  // the list lives across multiple ticks - the arena's
+  // string_views are valid for the component's lifetime, but
+  // we want a stable, owned copy here.
+  struct PendingSubscription {
+    std::string entity_id;
+    std::string area_id;            // empty for global media_players
+    bool want_brightness{false};
+  };
+  std::vector<PendingSubscription> pending_subs_;
+  size_t pending_sub_next_idx_{0};
+  bool subscription_in_progress_{false};
+  static constexpr size_t SUBSCRIBE_CHUNK_PER_TICK = 8;
+  // Heap guard threshold. Below this, we defer the next chunk
+  // to a future tick rather than risk an std::function throw.
+  // 16 KB is conservative: a single std::function with
+  // captured string_view + a small lambda body is ~80-120
+  // bytes, so 16 KB gives ~130-200 headroom per chunk.
+  static constexpr size_t SUBSCRIBE_HEAP_GUARD_BYTES = 16 * 1024;
   // v1.22v: current room's area_id (or empty for grid view).
   // Set in show_entity_detail_(); cleared in show_room_grid_().
   // Used as the fast-fail filter for state pushes in per_room
@@ -1031,6 +1076,33 @@ class HaAutoPanel : public Component {
 
   // Native API state subscription
   void subscribe_to_all_entities_();
+  // v1.22w: chunked subscription machinery. Replaces the
+  // single-shot 200+ std::function allocation burst in
+  // subscribe_to_all_entities_() with a state-machine that
+  // does at most SUBSCRIBE_CHUNK_PER_TICK callbacks per
+  // loop tick. The list is built once in
+  // build_pending_subs_list_() (called from start_discovery_()
+  // once we know entities_by_area_ is populated), then drained
+  // in chunks by process_chunked_subscription_() in loop().
+  // See the v1.22w comment block above pending_subs_ for the
+  // rationale (PC 0x480dbxxx abort path - the std::function
+  // throw that fires when the C6 is wedged and the heap
+  // can't hold 200+ callbacks in a row).
+  void build_pending_subs_list_();
+  void process_chunked_subscription_();
+  // True if HA API has ever been connected since boot. The
+  // loop() polls this to auto-trigger the auth probe on
+  // first connect (replaces the YAML on_client_connected
+  // lambdas, which allocated std::function each invocation).
+  bool ha_connected_once_{false};
+  // True if subscription has been queued at least once since
+  // boot. The subscription depends on entities_by_area_ready_
+  // (i.e. discovery complete), so it's a SEPARATE one-shot
+  // from ha_connected_once_. Together they replace the
+  // YAML's auth-probe + subscription lambdas - the C++ side
+  // now self-triggers without going through the YAML
+  // std::function path.
+  bool ha_subscribed_once_{false};
   // Callbacks fired by the api server when HA pushes a state change
   // or attribute change. Take string_view because the const char*
   // overload of subscribe_home_assistant_state is zero-allocation

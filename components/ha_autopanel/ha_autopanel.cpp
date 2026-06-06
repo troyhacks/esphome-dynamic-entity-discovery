@@ -167,7 +167,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22v"
+#define FIRMWARE_VERSION "v1.22w"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -370,24 +370,38 @@ void HaAutoPanel::trigger_discovery() {
 }
 
 void HaAutoPanel::trigger_subscription() {
-  ESP_LOGI(TAG, "trigger_subscription() called");
+  // v1.22w: trigger_subscription is now a flag-setter. The
+  // actual work (chunked subscription via
+  // process_chunked_subscription_()) happens in loop() at the
+  // panel's own pace. This decouples the httpd worker task
+  // (where the YAML std::function lambda fires) from the
+  // heavy 200+ std::function allocation burst that triggered
+  // the v1.22v abort at PC 0x480dbxxx. See
+  // [[feedback_yaml_lambda_std_function_throw]] and the
+  // long comment block above pending_subs_ in ha_autopanel.h.
+  ESP_LOGI(TAG, "trigger_subscription() called (deferred to loop)");
   if (s_instance == nullptr) {
     ESP_LOGE(TAG, "Instance not set!");
     return;
   }
-  // If discovery hasn't happened yet, there's nothing to subscribe to -
-  // the lambda will fire again when the API reconnects post-discovery.
   if (s_instance->entities_by_area_.empty()) {
     ESP_LOGW(TAG, "No entities discovered yet; subscription will retry on next API connect");
     return;
   }
-  s_instance->subscribe_to_all_entities_();
+  s_instance->pending_subscription_ = true;
 }
 
 void HaAutoPanel::trigger_auth_probe() {
-  ESP_LOGI(TAG, "trigger_auth_probe() called");
+  // v1.22w: same deferral pattern as trigger_subscription().
+  // The YAML lambda allocates a std::function ONCE at parse
+  // time, but if the httpd worker invokes it and probe_authorization_()
+  // throws (it can, on a wedged C6 with a fragmented heap),
+  // the abort lands in the worker context. Setting a flag
+  // here and doing the probe in loop() means the heavy
+  // service-call construction happens on the main task.
+  ESP_LOGI(TAG, "trigger_auth_probe() called (deferred to loop)");
   if (s_instance == nullptr) return;
-  s_instance->probe_authorization_();
+  s_instance->pending_auth_probe_ = true;
 }
 
 void HaAutoPanel::fetch_areas_() {
@@ -4245,6 +4259,25 @@ uint8_t HaAutoPanel::compute_room_brightness_pct_(const std::string& area_id) co
 // --- Native API state subscription ---
 
 void HaAutoPanel::subscribe_to_all_entities_() {
+  // v1.22w: this is now the LIST-BUILDING + CHUNKED-START
+  // entry point, not the all-at-once subscription path. The
+  // 200+ std::function allocation burst that the v1.22v
+  // "subscribe_mode=all" path took in a single tick is what
+  // triggered the PC 0x480dbxxx abort (see
+  // [[feedback_yaml_lambda_std_function_throw]]). The new flow
+  // is:
+  //
+  //   1. build_pending_subs_list_()  - walks entities_by_area_
+  //      and populates pending_subs_ with one PendingSubscription
+  //      per (entity, attribute) tuple to register.
+  //   2. Set subscription_in_progress_ = true, pending_sub_next_idx_ = 0.
+  //   3. loop() calls process_chunked_subscription_() each tick
+  //      and drains SUBSCRIBE_CHUNK_PER_TICK entries.
+  //
+  // The actual subscribe_home_assistant_state() calls (and their
+  // std::function callbacks) live in process_chunked_subscription_().
+  // This way the per-tick allocation burst is bounded at
+  // SUBSCRIBE_CHUNK_PER_TICK * 2 callbacks (entity + brightness).
 #ifdef USE_API_HOMEASSISTANT_STATES
   if (api::global_api_server == nullptr) {
     ESP_LOGW(TAG, "api::global_api_server is null; skipping state subscriptions");
@@ -4255,121 +4288,161 @@ void HaAutoPanel::subscribe_to_all_entities_() {
     return;
   }
 
-  // v1.22v: subscribe_mode_ == 1 (none) skips all subscriptions;
-  // the 5s bulk poll (and per-room poll, if active) carry the
-  // load. This is the lightest-weight mode and eliminates the
-  // state-push firehose that contributes to the priority-
-  // inversion deadlock documented in
-  // [[project_crowpanel_sdio_is_symptom]].
+  // v1.22v: subscribe_mode_ == 1 (none) skips all subscriptions.
   if (this->subscribe_mode_ == 1) {
     ESP_LOGI(TAG, "subscribe_mode=none; skipping all subscriptions");
     return;
   }
 
-  // v1.22v: subscribe_mode_ == 2 (per_room) subscribes only to
-  // LIGHT entities in the currently-displayed room. The room
-  // cards only use light.* entities (on/off + brightness); we
-  // don't need climate, sensor, switch, or other-domain pushes
-  // for invisible rooms. This is the single biggest activity
-  // reducer: a 15-entity room subscribes to ~3-5 lights instead
-  // of all 200+ entities in HA. Plus global media_player
-  // entities (for the "Now Playing" banner across rooms).
+  // v1.22v: subscribe_mode_ == 2 (per_room) only enqueues
+  // lights in the visible room + media_players. ~5 callbacks
+  // total - fits in one tick.
   if (this->subscribe_mode_ == 2) {
     if (this->current_room_area_id_.empty()) {
       ESP_LOGI(TAG, "subscribe_mode=per_room; no current room — skipping");
       return;
     }
-    ESP_LOGI(TAG, "subscribe_mode=per_room; subscribing to lights in %s + media_players",
+    ESP_LOGI(TAG, "subscribe_mode=per_room; building subs list for %s + media_players",
              this->current_room_area_id_.c_str());
-    int subscribed_this_run = 0;
+  } else {
+    ESP_LOGI(TAG, "subscribe_mode=all; building full subs list (%zu areas)",
+             this->entities_by_area_.size());
+  }
+
+  this->build_pending_subs_list_();
+#else
+  ESP_LOGW(TAG, "API homeassistant_states disabled in YAML; live updates disabled");
+#endif
+}
+
+void HaAutoPanel::build_pending_subs_list_() {
+  // v1.22w: walk entities_by_area_ and append to pending_subs_
+  // one entry per (entity, attribute) pair to subscribe. The
+  // actual subscribe_home_assistant_state() calls happen later
+  // in process_chunked_subscription_(), SUBSCRIBE_CHUNK_PER_TICK
+  // per tick. The arena-backed e.entity_id views are copied
+  // into owned std::string here so the list is stable across
+  // ticks (the arena is fine, but using owned strings means
+  // the chunked logic doesn't reach back into entity_arena()
+  // to dereference string_views, and it survives any future
+  // arena-reset).
+  this->pending_subs_.clear();
+  this->pending_sub_next_idx_ = 0;
+
+  if (this->subscribe_mode_ == 2) {
+    // per_room: lights in the visible room only, plus global
+    // media_players for the "Now Playing" banner.
     auto it = this->entities_by_area_.find(this->current_room_area_id_);
     if (it != this->entities_by_area_.end()) {
       for (const auto& e : it->second) {
         if (e.domain != "light") continue;
         if (this->subscribed_entity_ids_.count(e.entity_id)) continue;
-        const char *eid_cstr = e.entity_id.data();
-        std::string_view eid_view = e.entity_id;
-        api::global_api_server->subscribe_home_assistant_state(
-            eid_cstr, nullptr,
-            [this, eid_view](StringRef state) {
-              this->on_entity_state_changed_(eid_view, state.c_str());
-            });
-        this->subscribed_entity_ids_.insert(std::string(eid_view));
-        api::global_api_server->subscribe_home_assistant_state(
-            eid_cstr, "brightness",
-            [this, eid_view](StringRef value) {
-              this->on_entity_attribute_changed_(eid_view, value.c_str());
-            });
-        subscribed_this_run++;
+        PendingSubscription ps;
+        ps.entity_id = std::string(e.entity_id);
+        ps.area_id = std::string(e.area_id);
+        ps.want_brightness = e.has_brightness;
+        this->pending_subs_.push_back(std::move(ps));
       }
     }
-    // Also subscribe to media_player entities (global, for the
-    // "Now Playing" banner that shows across rooms).
     for (auto& kv : this->entities_by_area_) {
       for (const auto& e : kv.second) {
         if (e.domain != "media_player") continue;
         if (this->subscribed_entity_ids_.count(e.entity_id)) continue;
-        const char *eid_cstr = e.entity_id.data();
-        std::string_view eid_view = e.entity_id;
-        api::global_api_server->subscribe_home_assistant_state(
-            eid_cstr, nullptr,
-            [this, eid_view](StringRef state) {
-              this->on_entity_state_changed_(eid_view, state.c_str());
-            });
-        this->subscribed_entity_ids_.insert(std::string(eid_view));
-        subscribed_this_run++;
+        PendingSubscription ps;
+        ps.entity_id = std::string(e.entity_id);
+        ps.area_id = "";  // global
+        ps.want_brightness = false;
+        this->pending_subs_.push_back(std::move(ps));
       }
     }
-    ESP_LOGI(TAG, "subscribe_mode=per_room: subscribed to %d light/media_player streams",
-             subscribed_this_run);
+  } else {
+    // all: every entity in every area, plus brightness for
+    // dimmable lights. This is the 200+ std::function path
+    // the v1.22w chunking is designed to protect.
+    for (auto& kv : this->entities_by_area_) {
+      for (const auto& e : kv.second) {
+        if (this->subscribed_entity_ids_.count(e.entity_id)) continue;
+        PendingSubscription ps;
+        ps.entity_id = std::string(e.entity_id);
+        ps.area_id = std::string(e.area_id);
+        ps.want_brightness = e.has_brightness;
+        this->pending_subs_.push_back(std::move(ps));
+      }
+    }
+  }
+
+  this->subscription_in_progress_ = (this->pending_subs_.size() > 0);
+  ESP_LOGI(TAG, "build_pending_subs_list_: %zu subs queued, drain at %zu/tick",
+           this->pending_subs_.size(), SUBSCRIBE_CHUNK_PER_TICK);
+}
+
+void HaAutoPanel::process_chunked_subscription_() {
+  // v1.22w: drain up to SUBSCRIBE_CHUNK_PER_TICK entries from
+  // pending_subs_ each tick. Bails early on low heap so a
+  // single std::function throw doesn't take the panel down -
+  // we just retry on the next tick when more memory is free.
+  if (!this->subscription_in_progress_) return;
+  if (this->pending_sub_next_idx_ >= this->pending_subs_.size()) {
+    ESP_LOGI(TAG, "process_chunked_subscription_: all %zu subs done",
+             this->pending_subs_.size());
+    this->subscription_in_progress_ = false;
+    this->pending_subs_.clear();
+    this->pending_sub_next_idx_ = 0;
+    return;
+  }
+  if (api::global_api_server == nullptr ||
+      !api::global_api_server->is_connected()) {
+    ESP_LOGW(TAG, "process_chunked_subscription_: api disconnected, pausing");
+    return;  // try again next tick
+  }
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  if (free_internal < SUBSCRIBE_HEAP_GUARD_BYTES) {
+    // v1.22w heap guard: don't even attempt the chunk if
+    // internal heap is below the guard. process_chunked_subscription_
+    // is called from loop(), so we'll get another shot in a
+    // millisecond or two - by then the httpd task or the wifi
+    // task will have released its working set.
+    ESP_LOGW(TAG, "process_chunked_subscription_: low heap (%u bytes), deferring chunk",
+             (unsigned) free_internal);
     return;
   }
 
-  // subscribe_mode_ == 0 (all): the v1.22u behavior - subscribe
-  // to every entity in every area. Kept as the default for
-  // backward compat with existing setups.
-  int subscribed_this_run = 0;
-  for (auto& kv : this->entities_by_area_) {
-    for (const auto& e : kv.second) {
-      if (this->subscribed_entity_ids_.count(e.entity_id)) continue;
-
-      // Use the const char* overload of subscribe_home_assistant_state
-      // for zero allocation: the entity_id pointer is stored directly
-      // in the subscription struct (api_server.cpp:434), and the
-      // attribute is nullptr for state-itself. The arena-backed
-      // e.entity_id is null-terminated because std::string::data() is
-      // since C++11, and it lives for the component's lifetime which
-      // bounds the subscription's lifetime. The lambda captures a
-      // string_view (8 bytes ptr+len) by value - no std::string copy.
-      const char *eid_cstr = e.entity_id.data();
-      std::string_view eid_view = e.entity_id;
-
-      // Subscribe to the entity's state itself.
+  size_t end = std::min(this->pending_sub_next_idx_ + SUBSCRIBE_CHUNK_PER_TICK,
+                        this->pending_subs_.size());
+  int processed_this_tick = 0;
+  for (size_t i = this->pending_sub_next_idx_; i < end; i++) {
+    const auto& sub = this->pending_subs_[i];
+    const char* eid_cstr = sub.entity_id.c_str();
+    // entity state callback
+    api::global_api_server->subscribe_home_assistant_state(
+        eid_cstr, nullptr,
+        [this, eid = sub.entity_id](StringRef state) {
+          this->on_entity_state_changed_(eid, state.c_str());
+        });
+    // brightness attribute callback (only for dimmable lights)
+    if (sub.want_brightness) {
       api::global_api_server->subscribe_home_assistant_state(
-          eid_cstr,
-          nullptr,
-          [this, eid_view](StringRef state) {
-            this->on_entity_state_changed_(eid_view, state.c_str());
-          });
-      this->subscribed_entity_ids_.insert(std::string(eid_view));
-      subscribed_this_run++;
-
-      // Also subscribe to the "brightness" attribute (only meaningful
-      // for dimmable lights; HA will still send updates if the
-      // attribute is missing, but it just becomes a no-op).
-      api::global_api_server->subscribe_home_assistant_state(
-          eid_cstr,
-          "brightness",
-          [this, eid_view](StringRef value) {
-            this->on_entity_attribute_changed_(eid_view, value.c_str());
+          eid_cstr, "brightness",
+          [this, eid = sub.entity_id](StringRef value) {
+            this->on_entity_attribute_changed_(eid, value.c_str());
           });
     }
+    this->subscribed_entity_ids_.insert(sub.entity_id);
+    processed_this_tick++;
   }
-  ESP_LOGI(TAG, "Subscribed to %d entity state streams (%d new this run)",
-           (int)this->subscribed_entity_ids_.size(), subscribed_this_run);
-#else
-  ESP_LOGW(TAG, "API homeassistant_states disabled in YAML; live updates disabled");
-#endif
+  this->pending_sub_next_idx_ = end;
+
+  if (end < this->pending_subs_.size()) {
+    ESP_LOGI(TAG, "process_chunked_subscription_: %d subs this tick, %zu/%zu remaining",
+             processed_this_tick, this->pending_subs_.size() - end,
+             this->pending_subs_.size());
+  } else {
+    ESP_LOGI(TAG, "process_chunked_subscription_: %d subs this tick, DONE (total %zu)",
+             processed_this_tick, this->pending_subs_.size());
+    this->subscription_in_progress_ = false;
+    this->pending_subs_.clear();
+    this->pending_sub_next_idx_ = 0;
+  }
 }
 
 void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const char* state) {
@@ -4825,6 +4898,53 @@ void HaAutoPanel::loop() {
   // the WLED pattern style - see
   // [[feedback_wled_mm_p4_stuck_task_pattern]] for the
   // design.
+  // v1.22w: process deferred triggers first. Doing these
+  // BEFORE the auth-probe timeout check keeps the flags
+  // fresh - the httpd worker set them; we honor them
+  // before doing any other heavy work.
+  if (this->pending_auth_probe_) {
+    this->pending_auth_probe_ = false;
+    this->probe_authorization_();
+  }
+  if (this->pending_subscription_) {
+    this->pending_subscription_ = false;
+    this->subscribe_to_all_entities_();
+  }
+  // Drain chunked subscription work, even when no new
+  // trigger arrived (the in-progress state survives across
+  // ticks). process_chunked_subscription_() no-ops if
+  // subscription_in_progress_ is false.
+  this->process_chunked_subscription_();
+
+  // v1.22w: auto-trigger on first HA connect. Replaces the
+  // YAML on_client_connected lambdas (which allocated
+  // std::function each invocation). Polling
+  // api::global_api_server->is_connected() each tick is
+  // cheap (a single bool read) and lets us fire the auth
+  // probe + subscription without going through the YAML
+  // automation path.
+  //
+  // The auth probe fires as soon as the API connects (no
+  // need to wait for discovery - we want to know if
+  // service-calls are allowed BEFORE we do all the work
+  // of fetching areas + entities). The subscription fires
+  // later, after discovery completes, when there's
+  // something to subscribe to. Both are one-shots per
+  // boot.
+  if (!this->ha_connected_once_ &&
+      api::global_api_server != nullptr &&
+      api::global_api_server->is_connected()) {
+    ESP_LOGI(TAG, "HA API connected (auto-detected); queuing auth probe");
+    this->ha_connected_once_ = true;
+    this->pending_auth_probe_ = true;
+  }
+  if (this->ha_connected_once_ && !this->ha_subscribed_once_ &&
+      this->entities_by_area_ready_ && !this->entities_by_area_.empty()) {
+    ESP_LOGI(TAG, "Discovery complete; queuing subscription (deferred to loop)");
+    this->ha_subscribed_once_ = true;
+    this->pending_subscription_ = true;
+  }
+
   // Check authorization probe timeout
   if (this->auth_probe_pending_) {
     if (millis() - this->auth_probe_started_ms_ > AUTH_PROBE_TIMEOUT_MS) {
