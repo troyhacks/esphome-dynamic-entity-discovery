@@ -1536,69 +1536,27 @@ void HaAutoPanel::fetch_weather_() {
   // is a high-traffic entity (HA updates it often) and we
   // don't want to fight the bulk poll for bandwidth.
   std::string url = this->ha_api_url_ + "/api/states/" + this->weather_entity_id_;
-  std::vector<http_request::Header> headers = {
-      {"Authorization", "Bearer " + this->ha_api_password_},
-      {"Content-Type", "application/json"},
-  };
-  auto container = this->http_request_->get(url, headers);
-  if (container == nullptr) {
-    ESP_LOGW(TAG, "[weather] GET %s returned null container", url.c_str());
-    return;
-  }
-  if (container->status_code == 0) {
-    ESP_LOGW(TAG, "[weather] connection failed");
-    container->end();
-    return;
-  }
-  if (container->status_code == 401) {
-    ESP_LOGW(TAG, "[weather] HTTP 401 - token rejected");
-    container->end();
-    return;
-  }
-  if (container->status_code == 404) {
+  // v1.23: HttpClient consolidates the get + read + status-
+  // code boilerplate. Was ~80 lines of duplicate code; now
+  // ~15 lines of HttpClient call + parse-specific logic.
+  HttpClient http(this->http_request_);
+  HttpResult result = http.get(url, http.bearer_auth(this->ha_api_password_));
+  if (result.status == HttpStatus::NOT_FOUND) {
     // No weather entity in HA. Not an error - just
     // nothing to show. The label stays hidden. Mark
     // the fetch timestamp so we don't retry every
     // 2s via the loop() poll.
     ESP_LOGW(TAG, "[weather] %s not found in HA (HTTP 404)",
              this->weather_entity_id_.c_str());
-    container->end();
     this->last_weather_fetch_ms_ = millis();
     return;
   }
-  if (container->status_code != 200) {
-    ESP_LOGW(TAG, "[weather] HTTP %d", (int)container->status_code);
-    container->end();
+  if (result.status != HttpStatus::OK) {
+    ESP_LOGW(TAG, "[weather] fetch failed: %s (HTTP %d)",
+             http_status_to_str(result.status), result.http_code);
     return;
   }
-
-  // Read the body. /api/states/<id> is ~500B - same read
-  // loop as fetch_home_name_(). App.feed_wdt() + yield()
-  // to stay friendly to the IDF task watchdog (see v1.22p).
-  size_t expected = container->content_length;
-  std::string response;
-  response.reserve(expected > 0 ? expected : 1024);
-  uint8_t buf[512];
-  uint32_t last_data_time = millis();
-  const uint32_t timeout = 10000;
-  const size_t MAX_BODY = 16 * 1024;
-  while (container->get_bytes_read() < container->content_length &&
-         response.size() < MAX_BODY) {
-    App.feed_wdt();
-    yield();
-    int read = container->read(buf, sizeof(buf));
-    if (read > 0) {
-      response.append(reinterpret_cast<char*>(buf), read);
-      last_data_time = millis();
-    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    }
-    if (millis() - last_data_time > timeout) {
-      ESP_LOGW(TAG, "[weather] timeout reading response");
-      break;
-    }
-  }
-  container->end();
+  const std::string& response = result.body;
 
   // Parse the JSON. We expect {"state": "cloudy", "attributes":
   //   {"temperature": 72.3, "temperature_unit": "°F", ...}}
@@ -2006,43 +1964,18 @@ void HaAutoPanel::maybe_poll_current_room_states_() {
   std::string body = "{\"template\":\"" + template_str + "\"}";
   // POST /api/template (server-side Jinja render).
   std::string url = this->ha_api_url_ + "/api/template";
-  std::vector<http_request::Header> headers = {
-      {"Authorization", "Bearer " + this->ha_api_password_},
-      {"Content-Type", "application/json"},
-  };
-  auto container = this->http_request_->post(url, body, headers);
-  if (container == nullptr || container->status_code != 200) {
-    ESP_LOGW(TAG, "[room_poll] POST /api/template failed (status=%d)",
-             container ? (int)container->status_code : 0);
-    if (container != nullptr) container->end();
+  // v1.23: HttpClient consolidates the post + read + status-
+  // code boilerplate. Was ~50 lines of duplicate code.
+  HttpClient http(this->http_request_);
+  auto auth = http.bearer_auth(this->ha_api_password_);
+  auth.push_back({"Content-Type", "application/json"});
+  HttpResult result = http.post(url, body, auth);
+  if (result.status != HttpStatus::OK) {
+    ESP_LOGW(TAG, "[room_poll] POST /api/template failed: %s (HTTP %d)",
+             http_status_to_str(result.status), result.http_code);
     return;
   }
-  // Read body. Reuses the read loop from fetch_areas_() (the
-  // body is small - typically 1-5 KB - so 16 KB cap is plenty).
-  size_t expected = container->content_length;
-  std::string response;
-  response.reserve(expected > 0 ? expected : 1024);
-  uint8_t buf[512];
-  uint32_t last_data_time = millis();
-  const uint32_t timeout = 10000;
-  const size_t MAX_BODY = 16 * 1024;
-  while (container->get_bytes_read() < container->content_length &&
-         response.size() < MAX_BODY) {
-    App.feed_wdt();
-    yield();
-    int read = container->read(buf, sizeof(buf));
-    if (read > 0) {
-      response.append(reinterpret_cast<char*>(buf), read);
-      last_data_time = millis();
-    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    }
-    if (millis() - last_data_time > timeout) {
-      ESP_LOGW(TAG, "[room_poll] timeout reading response");
-      break;
-    }
-  }
-  container->end();
+  const std::string& response = result.body;
   // Parse. The response is a JSON array of state objects.
   PsramJsonDocument doc(&s_psram_allocator);
   DeserializationError err = deserializeJson(doc, response);
@@ -2451,45 +2384,23 @@ void HaAutoPanel::maybe_refresh_time_baseline_() {
   // bulk call), so we can reuse the same parse path. zone.home
   // is always present in HA and has a current last_updated.
   std::string url = this->ha_api_url_ + "/api/states/zone.home";
-  std::vector<http_request::Header> headers = {
-      {"Authorization", "Bearer " + this->ha_api_password_},
-      {"Content-Type", "application/json"},
-  };
-  auto container = this->http_request_->get(url, headers);
-  if (container == nullptr || container->status_code != 200) {
-    if (container != nullptr) container->end();
-    return;  // try again in 5 minutes
-  }
-  // The body is a single-element JSON array. Pull out the
-  // last_updated field and feed it to set_time_from_iso_().
-  size_t expected = container->content_length > 0 ? container->content_length : 512;
-  char* buf = (char*)heap_caps_malloc(expected + 1, MALLOC_CAP_SPIRAM);
-  if (buf == nullptr) {
-    buf = (char*)malloc(expected + 1);
-  }
-  if (buf == nullptr) {
-    container->end();
+  // v1.23: HttpClient consolidates the get + read + status-
+  // code boilerplate. Was ~50 lines of duplicate code.
+  HttpClient http(this->http_request_);
+  HttpResult result = http.get(url, http.bearer_auth(this->ha_api_password_));
+  if (result.status != HttpStatus::OK) {
+    // try again in 5 minutes (the throttle at the top of
+    // this function is what enforces that)
     return;
   }
-  size_t total = 0;
-  uint8_t chunk[256];
-  while (container->get_bytes_read() < container->content_length && total < expected) {
-    int n = container->read(chunk, std::min<size_t>(sizeof(chunk), expected - total));
-    if (n > 0) {
-      memcpy(buf + total, chunk, n);
-      total += n;
-    } else if (n == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    } else {
-      App.feed_wdt();
-    }
+  const std::string& body = result.body;
+  if (body.empty()) {
+    return;
   }
-  container->end();
-  buf[total] = '\0';
   // The response is a JSON array. Use a tiny StaticJsonDocument
   // (the body is ~400 bytes for a single zone.home state).
   StaticJsonDocument<1024> doc;
-  if (!deserializeJson(doc, buf)) {
+  if (!deserializeJson(doc, body)) {
     JsonArray arr = doc.as<JsonArray>();
     if (!arr.isNull() && arr.size() > 0) {
       JsonObject first = arr[0];
@@ -2500,12 +2411,6 @@ void HaAutoPanel::maybe_refresh_time_baseline_() {
         }
       }
     }
-  }
-  heap_caps_free(buf);
-  if (buf != nullptr && total > 0) {
-    // already freed above via heap_caps_free; this branch
-    // exists to silence the unused-variable warning on
-    // platforms where heap_caps_free is a no-op.
   }
 }
 
