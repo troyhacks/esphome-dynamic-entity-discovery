@@ -22,6 +22,71 @@ extern const lv_font_t font_button;  // 14pt - "ON/OFF" button label
 #include "esphome/components/api/homeassistant_service.h"
 #include <lvgl.h>
 #include <climits>  // for INT_MAX in split_room_name_to_fit_
+#include "esp_task_wdt.h"  // v1.22p: IDF task watchdog (separate from App.feed_wdt)
+#include "freertos/FreeRTOS.h"  // v1.22p: xTaskGetCurrentTaskHandle()
+
+// --- v1.22p: IDF task watchdog RAII guard ---
+//
+// The IDF freeRTOS task watchdog (TWDT) is SEPARATE from
+// ESPHome's main loop watchdog (App.feed_wdt). v1.22o
+// added App.feed_wdt() before the long blocking parse
+// calls, but the user reported the panel was still
+// resetting:
+//
+//   E (25159) task_wdt: Task watchdog got triggered.
+//   E (25159) task_wdt:  - loopTask (CPU 1)
+//
+// The IDF TWDT fires when a subscribed task doesn't call
+// esp_task_wdt_reset() within the timeout (~5s default).
+// The main loop task is subscribed by ESPHome. App.feed_wdt
+// only feeds the ESPHome loop watchdog, NOT the IDF TWDT.
+//
+// The fix: a tiny RAII guard that unsubscribes the current
+// task from the TWDT for the duration of the scope, then
+// re-subscribes on destruction. The deserializeJson() call
+// is one big blocking operation that we can't yield
+// through, so unsubscribing is the cleanest way to prevent
+// the TWDT from firing while we're parsing.
+//
+// IMPORTANT: this disables the watchdog protection for
+// the duration of the parse. If the parse truly hangs
+// (e.g. infinite loop, runaway allocation), the panel
+// will NOT reboot. We accept that trade-off because:
+//   1. The parses have a hard 20s timeout (see the
+//      millis() - last_data check in the http reader loop)
+//   2. The HTTP layer has its own connection timeout
+//   3. A runaway JSON parser is much less likely than a
+//      slow parse triggering a spurious watchdog reset
+//
+// Usage: declare TwdtGuard g; at the top of any function
+// that does a long blocking parse. The destructor handles
+// the re-subscribe automatically even on early return.
+class TwdtGuard {
+ public:
+  TwdtGuard() {
+    this->task_ = xTaskGetCurrentTaskHandle();
+    // Unsubscribe the current task from the TWDT. If the
+    // task isn't subscribed (or unsubscribe fails for
+    // any reason), we set task_ = nullptr so the
+    // destructor doesn't try to re-subscribe.
+    esp_err_t err = esp_task_wdt_delete(this->task_);
+    if (err != ESP_OK) {
+      this->task_ = nullptr;
+    }
+  }
+  ~TwdtGuard() {
+    if (this->task_ != nullptr) {
+      // Best-effort re-subscribe. If this fails (e.g. the
+      // task has been deleted) there's nothing to do.
+      esp_task_wdt_add(this->task_);
+    }
+  }
+  TwdtGuard(const TwdtGuard&) = delete;
+  TwdtGuard& operator=(const TwdtGuard&) = delete;
+
+ private:
+  TaskHandle_t task_{nullptr};
+};
 #include "esphome/components/lvgl/lvgl_proxy.h"
 #include "esp_heap_caps.h"
 #include "driver/uart.h"
@@ -74,7 +139,7 @@ static const char* TAG = "ha_autopanel";
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.22o"
+#define FIRMWARE_VERSION "v1.22p"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -472,13 +537,17 @@ void HaAutoPanel::fetch_areas_() {
   // array in some configurations and was previously discarding all data.
   PsramJsonDocument doc(&s_psram_allocator);
 
-  // v1.22n: feed the task watchdog BEFORE the long blocking
-  // deserializeJson call. The bulk /api/states response is
-  // ~200KB and the parse can take >5s on first boot when
-  // WiFi + httpd + LVGL are all initing. Without this
-  // refresh, the IDF freeRTOS task watchdog fires and
-  // the panel reboots itself (rst:0xc SW_CPU_RESET, boot
-  // #N+1 with reset_reason=DEEPSLEEP).
+  // v1.22p: unsubscribe the loopTask from the IDF TWDT
+  // for the duration of the bulk parse. App.feed_wdt()
+  // (the v1.22n fix) only feeds the ESPHome main loop
+  // watchdog, not the IDF freeRTOS task watchdog. The
+  // TWDT still fires on the long deserializeJson call.
+  // The guard re-subscribes on scope exit, so an early
+  // return from a parse error still cleans up.
+  TwdtGuard twdt_guard;
+  // v1.22n: feed the ESPHome loop watchdog too (belt +
+  // suspenders). The TwdtGuard handles the IDF TWDT;
+  // this handles the ESPHome one.
   App.feed_wdt();
 
   DeserializationError parse_err = deserializeJson(doc, response);
@@ -694,10 +763,13 @@ void HaAutoPanel::fetch_entities_() {
   // internal heap is too small and would abort().
   PsramJsonDocument doc(&s_psram_allocator);
 
-  // v1.22n: feed the task watchdog BEFORE the long blocking
-  // deserializeJson call. Same reason as the bulk fetch in
-  // fetch_entities_() - the 200KB parse can take >5s and
-  // trip the IDF freeRTOS task watchdog.
+  // v1.22p: same TWDT unsubscribe as the bulk fetch. The
+  // state poll runs every 5s and the parse is the same
+  // 200KB /api/states response - if it takes >5s, the
+  // IDF TWDT fires. The guard re-subscribes on exit.
+  TwdtGuard twdt_guard;
+  // v1.22n: feed the ESPHome loop watchdog (belt +
+  // suspenders alongside the IDF TWDT guard).
   App.feed_wdt();
 
   DeserializationError parse_err = deserializeJson(doc, response);
@@ -6206,7 +6278,6 @@ void HaAutoPanel::simulate_scroll_(int x1, int y1, int x2, int y2) {
 }
 
 // --- v1.22e data-driven sizing helpers ---
-
 // Internal: measure the rendered pixel width of `text` using
 // the given font. Uses a one-shot hidden label widget because
 // that's the portable LVGL 9 API - lv_txt_get_width() /
