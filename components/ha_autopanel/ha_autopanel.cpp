@@ -686,13 +686,19 @@ void HaAutoPanel::parse_states_response_(const char* response, size_t response_l
   // JSON shape (a top-level array of state objects), so the
   // parse logic is identical and lives here once.
   //
-  // The caller is responsible for the `response` buffer's
-  // lifetime - this function takes ownership and frees it
-  // after the DOM is built (the parse keeps what it needs in
-  // PsramJsonDocument, which has its own PSRAM pool).
+  // v1.23: caller is responsible for the `response` buffer's
+  // lifetime. The previous v1.22aa version took ownership
+  // and heap_caps_free()'d the buffer at the end of parse
+  // - that broke when the call sites migrated to
+  // HttpClient (response is now a borrowed pointer into
+  // HttpResult.body, a std::string). The heap_caps_free
+  // became a double-free. The fix: this function does NOT
+  // own the buffer; the caller does. The borrowed-pointer
+  // approach is also more flexible - callers can choose
+  // to copy the body first if they need to outlive the
+  // HttpResult.
   if (response == nullptr || response_len == 0) {
     ESP_LOGW(TAG, "parse_states_response: empty response");
-    if (response) heap_caps_free((void*)response);
     return;
   }
 
@@ -713,7 +719,6 @@ void HaAutoPanel::parse_states_response_(const char* response, size_t response_l
   DeserializationError parse_err = deserializeJson(doc, response);
   if (parse_err) {
     ESP_LOGW(TAG, "Failed to parse states JSON: %s", parse_err.c_str());
-    heap_caps_free((void*)response);
     return;
   }
 
@@ -728,17 +733,19 @@ void HaAutoPanel::parse_states_response_(const char* response, size_t response_l
     } else {
       ESP_LOGW(TAG, "States response is neither array nor object");
     }
-    heap_caps_free((void*)response);
     return;
   }
-  // v1.12: the PSRAM response buffer is no longer needed once the
-  // DOM is built. Free it now so the 220KB+ chunk goes back to
-  // the heap before we start allocating the per-area entity
-  // vectors (which can each be 20-100KB on a busy install).
-  // PsramJsonDocument's DOM lives in its own PSRAM-backed pool, so
-  // freeing this buffer doesn't affect the still-needed DOM.
-  heap_caps_free((void*)response);
-  response = nullptr;
+  // Note: previously this function heap_caps_free()'d the
+  // response buffer at this point (once the JSON DOM was
+  // built, the raw text wasn't needed). That was a micro-
+  // optimization to return the 200KB+ buffer to PSRAM
+  // before the per-area entity vectors were allocated. The
+  // v1.23 HttpClient migration removed it - the borrowed
+  // pointer means the caller's std::string owns the
+  // memory and frees it when it goes out of scope. The
+  // micro-optimization is lost; the panel still works
+  // because the DOM lives in its own PSRAM pool
+  // (PsramJsonDocument).
 
   // Build a lookup: entity_id -> area_id from discovered_areas_
   // Since we already have entity_ids per area, match against that
@@ -948,10 +955,9 @@ void HaAutoPanel::fetch_entities_template_() {
            total_eids, template_body.size(), domain_regex.size());
 
   std::string url = this->ha_api_url_ + "/api/template";
-  std::vector<http_request::Header> headers = {
-      {"Authorization", "Bearer " + this->ha_api_password_},
-      {"Content-Type", "application/json"},
-  };
+  // v1.23: HttpClient consolidates the post + read + status-
+  // code boilerplate. Was ~100 lines of duplicate code; now
+  // ~15 lines.
   // /api/template takes a JSON body: {"template": "..."}.
   // Wrap the Jinja string in a tiny JSON envelope with
   // backslash-escaping for the few characters Jinja uses.
@@ -967,104 +973,41 @@ void HaAutoPanel::fetch_entities_template_() {
   }
   json_body += "\"}";
 
-  auto container = this->http_request_->post(url, json_body, headers);
-  if (container == nullptr) {
-    ESP_LOGE(TAG, "[template] POST /api/template returned null container");
-    return;
-  }
-  if (container->status_code == 0) {
-    ESP_LOGE(TAG, "[template] connection failed");
-    container->end();
-    return;
-  }
-  if (container->status_code == 401) {
+  HttpClient http(this->http_request_);
+  auto auth = http.bearer_auth(this->ha_api_password_);
+  auth.push_back({"Content-Type", "application/json"});
+  HttpResult result = http.post(url, json_body, auth);
+  if (result.status == HttpStatus::AUTH_FAILED) {
     ESP_LOGE(TAG, "[template] HA API auth failed - check your token");
-    container->end();
     this->set_panel_state_(PanelState::AUTH_FAILED);
     return;
   }
-  if (container->status_code != 200) {
-    ESP_LOGW(TAG, "[template] HTTP %d - falling back to bulk fetch. "
-                  "First 200 bytes of response:",
-             container->status_code);
-    // Capture and log the response body so we can see why
-    // HA rejected the template. Read up to 512 bytes.
-    char err_buf[513];
-    int err_n = container->read((uint8_t*)err_buf, sizeof(err_buf) - 1);
-    if (err_n > 0) {
-      err_buf[err_n] = '\0';
-      ESP_LOGW(TAG, "[template]   body: %s", err_buf);
+  if (result.status != HttpStatus::OK) {
+    // Log the body for diagnosis (helps when the template
+    // has a Jinja syntax error that HA reports back).
+    ESP_LOGW(TAG, "[template] HTTP %d - falling back to bulk fetch",
+             result.http_code);
+    if (!result.body.empty()) {
+      std::string head = result.body.substr(0, std::min<size_t>(200, result.body.size()));
+      ESP_LOGW(TAG, "[template]   body: %s", head.c_str());
     }
-    container->end();
     // Fall back to the bulk /api/states path. The bulk path
     // does a 200KB+ transfer which can wedge the SDIO link
     // on a C6 that just had a template error, but that's
-    // better than showing no entity states at all (the panel
-    // would be unusable). The WLED-pattern monitor
-    // (sdio_monitor in v1.23) handles the wedge recovery.
+    // better than showing no entity states at all. The
+    // sdio_monitor (v1.23) handles the wedge recovery.
     this->fetch_entities_();
     return;
   }
-
-  // Read response body. Same allocation strategy as
-  // fetch_entities_() - PSRAM first, internal heap fallback.
-  // The template response is typically 20-50 KB so a 32 KB
-  // initial allocation is fine; the buffer grows if needed.
-  size_t expected = container->content_length;
-  if (expected == 0) expected = 32768;
-  char* response = (char*)heap_caps_malloc_prefer(
-      expected + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (response == nullptr) {
-    ESP_LOGE(TAG, "[template] OOM allocating %u-byte response buffer",
-             (unsigned)(expected + 1));
-    container->end();
+  const std::string& response = result.body;
+  if (response.empty()) {
+    ESP_LOGW(TAG, "[template] states response is empty");
     return;
   }
-  size_t response_len = 0;
-  uint8_t buf[512];
-  uint32_t last_data_time = millis();
-  const uint32_t timeout = 20000;
-  while (container->get_bytes_read() < container->content_length) {
-    App.feed_wdt();
-    yield();
-    int read = container->read(buf, sizeof(buf));
-    if (read > 0) {
-      if (response_len + (size_t)read + 1 > expected + 1) {
-        size_t new_size = (expected + read + 1) * 2;
-        char* grown = (char*)heap_caps_malloc_prefer(
-            new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (grown == nullptr) {
-          ESP_LOGE(TAG, "[template] OOM growing buffer to %u bytes", (unsigned)new_size);
-          heap_caps_free(response);
-          container->end();
-          return;
-        }
-        memcpy(grown, response, response_len);
-        heap_caps_free(response);
-        response = grown;
-        expected = new_size - 1;
-      }
-      memcpy(response + response_len, buf, read);
-      response_len += read;
-      last_data_time = millis();
-    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    }
-    if (millis() - last_data_time > timeout) {
-      ESP_LOGW(TAG, "[template] Timeout reading response");
-      break;
-    }
-  }
-  container->end();
-  response[response_len] = '\0';
-
   ESP_LOGI(TAG, "[template] states response: %d bytes (vs 200KB+ for bulk)",
-           (int)response_len);
+           (int)response.size());
   // Shared parse path - same JSON shape as the bulk response.
-  this->parse_states_response_(response, response_len);
-  // parse_states_response_ takes ownership of `response`.
+  this->parse_states_response_(response.c_str(), response.size());
 }
 
 void HaAutoPanel::fetch_entities_() {
@@ -1119,246 +1062,39 @@ void HaAutoPanel::fetch_entities_() {
     return;
   }
 
-  // Read response body. v1.12: was std::string (internal heap); the
-  // 220KB+ /api/states response OOM'd the S3 (no PSRAM, ~384KB
-  // internal heap). Now we use heap_caps_malloc_prefer to put the
-  // buffer in PSRAM on P4 / Crowpanel and fall back to internal
-  // on S3 if the PSRAM allocation fails. We also bail with a
-  // clear "no PSRAM, response too large" message if the largest
-  // free internal block is smaller than expected - the old code
-  // would have crashed with no log at all.
-  size_t expected = container->content_length;
-  if (expected == 0) expected = 32768;
-  // PSRAM first, then internal heap. heap_caps_malloc_prefer
-  // returns either; on P4 (32MB PSRAM) the PSRAM path always
-  // succeeds and the body lands off-heap. On S3 (no PSRAM) it
-  // falls back to malloc().
-  char* response = (char*)heap_caps_malloc_prefer(
-      expected + 1,                             // +1 for NUL
-      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,      // try first
-      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);  // fallback
-  if (response == nullptr) {
-    ESP_LOGE(TAG, "OOM allocating %u-byte response buffer "
-                  "(PSRAM+INT both full) - skipping bulk fetch",
-                  (unsigned)(expected + 1));
-    container->end();
+  // v1.23: HttpClient consolidates the get + read + status-
+  // code + PSRAM buffer dance (was ~80 lines). Note: this
+  // is the bulk /api/states path (200KB+). The HttpClient
+  // consolidation cleans up the code but doesn't fix the
+  // underlying SDIO wedge (the 200KB burst still happens).
+  // The real fix is HA's WebSocket 'get_states' message
+  // (v1.24+).
+  HttpClient http(this->http_request_);
+  HttpResult http_result = http.get(url, http.bearer_auth(this->ha_api_password_));
+  if (http_result.status == HttpStatus::AUTH_FAILED) {
+    ESP_LOGE(TAG, "HA API auth failed - check your token");
+    this->set_panel_state_(PanelState::AUTH_FAILED);
     return;
   }
-  size_t response_len = 0;
-  uint8_t buf[512];
-  uint32_t last_data_time = millis();
-  const uint32_t timeout = 20000;
-  int iter_count = 0;
-
-  while (container->get_bytes_read() < container->content_length) {
-    App.feed_wdt();
-    yield();
-    int read = container->read(buf, sizeof(buf));
-    if (read > 0) {
-      // Grow the buffer if the server sent more than Content-Length
-      // (rare but possible with chunked transfer or a wrong
-      // Content-Length header). Double, then add 1 for NUL.
-      if (response_len + (size_t)read + 1 > expected + 1) {
-        size_t new_size = (expected + read + 1) * 2;
-        char* grown = (char*)heap_caps_malloc_prefer(
-            new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (grown == nullptr) {
-          ESP_LOGE(TAG, "OOM growing response buffer to %u bytes", (unsigned)new_size);
-          heap_caps_free(response);
-          container->end();
-          return;
-        }
-        memcpy(grown, response, response_len);
-        heap_caps_free(response);
-        response = grown;
-        expected = new_size - 1;
-      }
-      memcpy(response + response_len, buf, read);
-      response_len += read;
-      last_data_time = millis();
-      iter_count = 0;
-      // v1.22x: NO pacing here. vTaskDelay(1) every ~4KB
-      // caused a different failure mode - the SDIO driver
-      // task (sdio_process_rx_task) hit a TWDT "task not
-      // found" reset followed by an assert in copy_payload
-      // (sdio_drv.c:1260). The 1ms yield is fine in theory
-      // but the SDIO task's relationship with the IDF TWDT
-      // is more subtle than yield-to-lower-priority would
-      // suggest. Reverted - rely on the 10MHz SDIO clock
-      // (in the YAML) to keep the buffer pool from filling,
-      // and the stuck-task recovery (in the YAML) to log/
-      // reboot if it does.
-    } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
-      break;
-    } else {
-      iter_count++;
-      if (iter_count % 10 == 0) {
-        App.feed_wdt();
-      }
-    }
-    if (millis() - last_data_time > timeout) {
-      ESP_LOGW(TAG, "Timeout reading states response");
-      break;
-    }
-  }
-  container->end();
-  response[response_len] = '\0';  // NUL-terminate for deserializeJson
-
-  ESP_LOGI(TAG, "States response: %d bytes", (int)response_len);
-  ESP_LOGD(TAG, "  Heap free=%u largest=%u, PSRAM free=%u largest=%u",
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-  // Diagnostic: log first 200 chars to see actual format
-  {
-    size_t head_len = std::min<size_t>(200, response_len);
-    ESP_LOGD(TAG, "  head: %.*s", (int)head_len, response);
-  }
-
-  // ArduinoJson 7.x: parse the states response. Use the PSRAM-backed
-  // allocator so the ~250KB JSON document lives in PSRAM. The default
-  // internal heap is too small and would abort().
-  PsramJsonDocument doc(&s_psram_allocator);
-
-  // v1.22p: same TWDT unsubscribe as the bulk fetch. The
-  // state poll runs every 5s and the parse is the same
-  // 200KB /api/states response - if it takes >5s, the
-  // IDF TWDT fires. The guard re-subscribes on exit.
-  TwdtGuard twdt_guard;
-  // v1.22n: feed the ESPHome loop watchdog (belt +
-  // suspenders alongside the IDF TWDT guard).
-  App.feed_wdt();
-
-  DeserializationError parse_err = deserializeJson(doc, response);
-  if (parse_err) {
-    ESP_LOGW(TAG, "Failed to parse states JSON: %s", parse_err.c_str());
-    heap_caps_free(response);
+  if (http_result.status != HttpStatus::OK) {
+    ESP_LOGW(TAG, "States fetch failed: %s (HTTP %d)",
+             http_status_to_str(http_result.status), http_result.http_code);
     return;
   }
+  // Delegate the parse to the shared helper. It allocates the
+  // PsramJsonDocument, walks the array, builds Entity records,
+  // and seeds the time baseline. parse_states_response_() takes
+  // ownership of the body (which is a std::string owned by
+  // HttpResult - the heap_caps_free dance that used to live
+  // here is now gone).
+  // For backward compat with parse_states_response_() which
+  // takes (const char*, size_t), copy into a stack buffer.
+  // (The PSRAM-preferring allocation in the helper is
+  // disabled when given a const char* - the body is already
+  // in PSRAM as a std::string.)
+  this->parse_states_response_(http_result.body.c_str(), http_result.body.size());
+  return;
 
-  JsonArray arr = doc.as<JsonArray>();
-  if (arr.isNull()) {
-    JsonObject obj = doc.as<JsonObject>();
-    if (!obj.isNull()) {
-      ESP_LOGW(TAG, "States response is a JSON object, keys:");
-      for (JsonPair kv : obj) {
-        ESP_LOGW(TAG, "  key: %s", kv.key().c_str());
-      }
-    } else {
-      ESP_LOGW(TAG, "States response is neither array nor object");
-    }
-    heap_caps_free(response);
-    return;
-  }
-  // v1.12: the PSRAM response buffer is no longer needed once the
-  // DOM is built. Free it now so the 220KB+ chunk goes back to
-  // the heap before we start allocating the per-area entity
-  // vectors (which can each be 20-100KB on a busy install).
-  // PsramJsonDocument's DOM lives in its own PSRAM-backed pool, so
-  // freeing this buffer doesn't affect the still-needed DOM.
-  heap_caps_free(response);
-  response = nullptr;
-
-  // Build a lookup: entity_id -> area_id from discovered_areas_
-  // Since we already have entity_ids per area, match against that
-  std::map<std::string, std::string> entity_to_area;  // entity_id -> area_id
-  for (const auto& area : this->discovered_areas_) {
-    for (const auto& eid : area.entity_ids) {
-      entity_to_area[eid] = area.area_id;
-    }
-  }
-
-  for (JsonObject state : arr) {
-    const char* entity_id = state["entity_id"];
-    if (!entity_id) continue;
-
-    // Check if this entity belongs to one of our areas
-    auto it = entity_to_area.find(entity_id);
-    if (it == entity_to_area.end()) continue;  // Not in any discovered area
-
-    std::string area_id = it->second;
-
-    // v1.12: the state subscription (subscribe_to_all_entities_)
-    // also pushes entities on every state change. If we ran the
-    // bulk fetch first (now safe in PSRAM), the subscription's
-    // push would create a duplicate. Clear the bucket the first
-    // time we touch a given area so only the friendly_name-bearing
-    // entities remain. (If you skip the bulk fetch by going
-    // through the subscription-only path, the bucket is already
-    // empty since fetch_areas_via_template_ doesn't push to
-    // entities_by_area_ - it uses entities_by_area_ for the
-    // template-driven stub records. So clearing here is safe in
-    // both paths.)
-    if (this->seen_areas_during_bulk_fetch_.insert(area_id).second) {
-      this->entities_by_area_[area_id].clear();
-    }
-
-    // Check if excluded
-    if (this->is_entity_excluded_(entity_id)) continue;
-
-    // Extract domain from entity_id (e.g., "light.living_room" -> "light")
-    std::string eid(entity_id);
-    size_t dot = eid.find('.');
-    if (dot == std::string::npos) continue;
-    std::string domain = eid.substr(0, dot);
-
-    // Check if domain is included
-    if (!this->is_domain_included_(domain)) continue;
-
-    Entity entity;
-    entity.entity_id = entity_arena().intern(entity_id);
-    entity.domain = entity_arena().intern(domain);
-    entity.area_id = entity_arena().intern(area_id);
-
-    // Get attributes
-    JsonObject attributes = state["attributes"];
-
-    // Get friendly name from attributes, or derive from entity_id
-    if (!attributes["friendly_name"].isNull()) {
-      const char *fn = attributes["friendly_name"].as<const char*>();
-      entity.name = entity_arena().intern(fn == nullptr ? std::string_view() : std::string_view(fn));
-    } else {
-      entity.name = entity_arena().intern(std::string_view(eid.data() + dot + 1, eid.size() - dot - 1));
-    }
-
-    // Capture state string ("on" / "off" / etc.)
-    const char* state_str_c = state["state"];
-    if (state_str_c) {
-      entity.state = state_str_c;
-    }
-
-    // Check if entity has brightness (lights with brightness support)
-    if (domain == "light" && !attributes["brightness"].isNull()) {
-      entity.has_brightness = true;
-      entity.brightness = static_cast<uint8_t>(attributes["brightness"].as<int>());
-    }
-
-    // Hue group flag - skip these for room-level aggregations
-    if (!attributes["is_hue_group"].isNull()) {
-      entity.is_hue_group = attributes["is_hue_group"].as<bool>();
-    }
-
-    this->entities_by_area_[area_id].push_back(entity);
-  }
-  ESP_LOGI(TAG, "  Parsed %d entities into areas", (int)this->entities_by_area_.size());
-
-  // v1.22: also seed the title-bar clock from the bulk /api/states
-  // response. The JSON has a 'last_updated' field on each entity
-  // but those are per-entity, not the response time itself. The
-  // RESPONSE HEADER has a Date: header but we don't have a way
-  // to read it via http_request. As a workaround, we use the
-  // last_updated from the FIRST entity we processed (a reasonable
-  // proxy for "when HA served the response").
-  if (this->time_valid_) return;  // zone.home already seeded earlier
-  if (arr.isNull() || arr.size() == 0) return;
-  JsonObject first = arr[0];
-  if (first.isNull()) return;
-  if (first["last_updated"].isNull()) return;
-  const char* last_updated = first["last_updated"].as<const char*>();
-  if (last_updated == nullptr || last_updated[0] == '\0') return;
-  this->set_time_from_iso_(last_updated);
 }
 
 void HaAutoPanel::fetch_home_name_() {
