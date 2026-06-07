@@ -2170,13 +2170,15 @@ void HaAutoPanel::start_discovery_() {
     ESP_LOGW(TAG, "Aborting discovery: auth failed during area fetch");
     return;
   }
-  // v1.22aa: server-side-filtered /api/template POST replaces
-  // the 200KB+ bulk /api/states GET (which triggered the SDIO
-  // NULL buffer assert at sdio_drv.c:896). The template filters
-  // to entities in our configured areas so the response is
-  // 20-50 KB instead of 200KB+. Falls back to fetch_entities_()
-  // on HTTP non-200 (e.g. /api/template not enabled in HA).
-  fetch_entities_template_();
+  // v1.24: removed the v1.22aa fetch_entities_template_() call
+  // (and its fallback fetch_entities_()). The 200KB+ /api/states
+  // burst has been replaced by HaWsClient::get_states over a
+  // raw WebSocket (opened below), which returns the same state
+  // data without the SDIO wedge trigger. Stub Entity records
+  // are still populated by fetch_areas_() (entity_id, domain,
+  // name, area_id); the WebSocket path fills in state +
+  // brightness via the get_states response and the
+  // subscribe_events stream.
 
   if (discovered_areas_.empty()) {
     ESP_LOGW(TAG, "No areas discovered from HA - check API token and connectivity");
