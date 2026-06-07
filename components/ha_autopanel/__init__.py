@@ -171,6 +171,19 @@ async def to_code(config):
         repo="https://github.com/joltwallet/esp_littlefs.git",
     )
 
+    # v1.24: ESP-IDF's esp_websocket_client. We open a raw WebSocket
+    # to Home Assistant at <api_url> converted to ws:// + /api/websocket,
+    # authenticate with the long-lived access token, and use HA's
+    # get_states + subscribe_events messages for state sync. This
+    # REPLACES the v1.22w esphome-native-API subscribe_home_assistant_state
+    # path (which triggered PC 0x480dxxxx abort ~300ms after Panel READY
+    # due to std::function allocation under heap pressure). The WS path
+    # does no std::function allocations in the httpd worker.
+    add_idf_component(
+        name="espressif/esp_websocket_client",
+        ref="~1.4.0",
+    )
+
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
