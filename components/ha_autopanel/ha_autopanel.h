@@ -23,9 +23,16 @@
 // v1.24: raw WebSocket-to-Home-Assistant client. Replaces the
 // v1.22w esphome-native-API subscribe_home_assistant_state path
 // that triggered PC 0x480dxxxx abort ~300ms after Panel READY
-// due to std::function allocation under heap pressure. See the
-// file header in ha_ws_client.h for the full architecture.
-#include "ha_ws_client.h"
+// due to std::function allocation under heap pressure. The
+// full definition is in ha_ws_client.h, which is included from
+// ha_autopanel.cpp (NOT this header) because the .h-inline
+// method bodies need HaAutoPanel to be complete. Forward-
+// declared here so unique_ptr<HaWsClient> ws_client_ can be
+// declared. ~HaAutoPanel() is also declared here and defined
+// in the .cpp where HaWsClient is complete (PIMPL idiom).
+namespace esphome::ha_autopanel {
+class HaWsClient;  // forward decl
+}
 
 namespace esphome {
 namespace ha_autopanel {
@@ -263,6 +270,19 @@ enum class PanelState {
 };
 
 class HaAutoPanel : public Component {
+ public:
+  // v1.24: declared here (defaulted in ha_autopanel.cpp) so
+  // unique_ptr<HaWsClient> ws_client_ is destructed where the
+  // full HaWsClient type is visible (PIMPL idiom for
+  // forward-declared unique_ptr members).
+  ~HaAutoPanel();
+  // v1.24: HaWsClient (the raw WebSocket-to-HA client) needs
+  // access to entities_by_area_, on_entity_state_changed_, and
+  // on_entity_attribute_changed_, all of which are protected
+  // below. Friend is the surgical way to expose them without
+  // making them public to the rest of the codebase.
+  friend class HaWsClient;
+
  public:
   void setup() override;
   void dump_config() override;

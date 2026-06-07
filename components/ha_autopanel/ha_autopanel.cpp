@@ -1,4 +1,13 @@
 #include "ha_autopanel.h"
+// v1.24: include ha_ws_client.h AFTER ha_autopanel.h so the
+// .h-inline method bodies (which reference HaAutoPanel's
+// members directly) see the full HaAutoPanel definition. The
+// unique_ptr<HaWsClient> ws_client_ member is also valid here
+// because ~HaAutoPanel() in this .cpp is the first point where
+// the full HaWsClient is visible (PIMPL: declared in
+// ha_autopanel.h, defined here as defaulted).
+#include "ha_ws_client.h"
+
 #include "esphome/core/log.h"
 #include "esphome/core/string_ref.h"
 #include "esphome/components/json/json_util.h"
@@ -143,6 +152,12 @@ class TwdtGuard {
 
 namespace esphome {
 namespace ha_autopanel {
+
+// v1.24: PIMPL destructor. Declared in ha_autopanel.h so the
+// unique_ptr<HaWsClient> ws_client_ member has a complete
+// type at the point of destruction. Defaulted here where
+// HaWsClient is complete (via the include above).
+HaAutoPanel::~HaAutoPanel() = default;
 
 // ArduinoJson 7.x: Custom PSRAM allocator. The default JsonDocument uses
 // internal-RAM malloc, which is too small for a 220KB+ states response.
@@ -2184,6 +2199,22 @@ void HaAutoPanel::start_discovery_() {
   // after the API is ready and is the right place to subscribe.
 
   ESP_LOGI(TAG, "=== Discovery Complete ===");
+
+  // v1.24: kick off the raw WebSocket-to-HA client. It opens
+  // a connection, authenticates, fetches all current states
+  // via get_states, and subscribes to live state_changed events
+  // via subscribe_events. State updates flow through the
+  // event_queue_ and are drained in loop() via
+  // drain_state_events(). This REPLACES the v1.22w
+  // subscribe_home_assistant_state path. In commit 3 the HTTP
+  // bulk fetches still run in parallel (race is benign, last
+  // writer wins); commit 4 removes the HTTP fetches.
+  if (!this->ws_client_) {
+    this->ws_client_ = std::make_unique<HaWsClient>(this);
+    this->ws_client_->set_url(this->ha_api_url_);
+    this->ws_client_->set_token(this->ha_api_password_);
+  }
+  this->ws_client_->start();
 
   // v1.22l: gate the periodic state poll on this. Set AFTER
   // fetch_entities_() has populated entities_by_area_ for
@@ -4929,6 +4960,20 @@ void HaAutoPanel::loop() {
   // ticks). process_chunked_subscription_() no-ops if
   // subscription_in_progress_ is false.
   this->process_chunked_subscription_();
+
+  // v1.24: drain the per-entity state events queued by the
+  // raw WebSocket-to-HA client (HaWsClient). The
+  // ha_ws_parse task pushes StateEvents into
+  // ws_client_->state_queue_; we pop up to
+  // STATE_DRAIN_PER_TICK per tick and call the existing
+  // on_entity_state_changed_ / on_entity_attribute_changed_
+  // handlers. Replaces the v1.22w chunked subscription path
+  // (which triggered PC 0x480dxxxx abort ~300ms after
+  // READY). The ws_client_ is a no-op until
+  // start_discovery_() constructs it.
+  if (this->ws_client_) {
+    this->ws_client_->drain_state_events();
+  }
 
   // v1.22w: auto-trigger on first HA connect. Replaces the
   // YAML on_client_connected lambdas (which allocated
