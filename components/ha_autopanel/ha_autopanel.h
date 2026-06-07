@@ -20,6 +20,13 @@
 #include "freertos/task.h"   // v1.22v: uxTaskPriorityGet + eTaskGetState for stuck-task detector
 #include "esp_task.h"        // v1.22v: pcTaskGetHandle for the sdio_write task lookup
 
+// v1.24: raw WebSocket-to-Home-Assistant client. Replaces the
+// v1.22w esphome-native-API subscribe_home_assistant_state path
+// that triggered PC 0x480dxxxx abort ~300ms after Panel READY
+// due to std::function allocation under heap pressure. See the
+// file header in ha_ws_client.h for the full architecture.
+#include "ha_ws_client.h"
+
 namespace esphome {
 namespace ha_autopanel {
 
@@ -419,6 +426,15 @@ class HaAutoPanel : public Component {
   // lookup so we can call .count(e.entity_id) where e.entity_id is
   // a std::string_view without allocating a std::string first.
   std::set<std::string, std::less<>> subscribed_entity_ids_;
+
+  // v1.24: raw WebSocket-to-HA client. Constructed lazily in
+  // start_discovery_() after fetch_areas_() populates the
+  // entity_id set; the WS client then opens, authenticates,
+  // fetches all current states via get_states, and subscribes
+  // to live state_changed events via subscribe_events. This
+  // REPLACES the v1.22w esphome-native-API subscribe path
+  // that was aborting at PC 0x480dxxxx.
+  std::unique_ptr<HaWsClient> ws_client_;
 
   // Panel state machine
   PanelState state_{PanelState::BOOTING};
