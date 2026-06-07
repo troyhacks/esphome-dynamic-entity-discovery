@@ -4953,15 +4953,13 @@ void HaAutoPanel::loop() {
     this->pending_auth_probe_ = false;
     this->probe_authorization_();
   }
-  if (this->pending_subscription_) {
-    this->pending_subscription_ = false;
-    this->subscribe_to_all_entities_();
-  }
-  // Drain chunked subscription work, even when no new
-  // trigger arrived (the in-progress state survives across
-  // ticks). process_chunked_subscription_() no-ops if
-  // subscription_in_progress_ is false.
-  this->process_chunked_subscription_();
+  // v1.24: removed the v1.22w pending_subscription_ drain
+  // and process_chunked_subscription_() call. The chunked
+  // subscription path triggered PC 0x480dxxxx abort ~300ms
+  // after Panel READY due to std::function allocation under
+  // heap pressure. The new path is HaWsClient's
+  // subscribe_events (server-side subscription) + the
+  // drain_state_events() call below.
 
   // v1.24: drain the per-entity state events queued by the
   // raw WebSocket-to-HA client (HaWsClient). The
@@ -4977,33 +4975,18 @@ void HaAutoPanel::loop() {
     this->ws_client_->drain_state_events();
   }
 
-  // v1.22w: auto-trigger on first HA connect. Replaces the
-  // YAML on_client_connected lambdas (which allocated
-  // std::function each invocation). Polling
-  // api::global_api_server->is_connected() each tick is
-  // cheap (a single bool read) and lets us fire the auth
-  // probe + subscription without going through the YAML
-  // automation path.
-  //
-  // The auth probe fires as soon as the API connects (no
-  // need to wait for discovery - we want to know if
-  // service-calls are allowed BEFORE we do all the work
-  // of fetching areas + entities). The subscription fires
-  // later, after discovery completes, when there's
-  // something to subscribe to. Both are one-shots per
-  // boot.
+  // v1.24: auth-probe auto-trigger kept (probe uses
+  // esphome-native-API, not the v1.22w subscribe path that
+  // crashed). Removed the ha_subscribed_once_ / subscription
+  // auto-trigger - the WebSocket subscribe_events is fired
+  // once after get_states completes, and there's no per-tick
+  // work to do.
   if (!this->ha_connected_once_ &&
       api::global_api_server != nullptr &&
       api::global_api_server->is_connected()) {
     ESP_LOGI(TAG, "HA API connected (auto-detected); queuing auth probe");
     this->ha_connected_once_ = true;
     this->pending_auth_probe_ = true;
-  }
-  if (this->ha_connected_once_ && !this->ha_subscribed_once_ &&
-      this->entities_by_area_ready_ && !this->entities_by_area_.empty()) {
-    ESP_LOGI(TAG, "Discovery complete; queuing subscription (deferred to loop)");
-    this->ha_subscribed_once_ = true;
-    this->pending_subscription_ = true;
   }
 
   // Check authorization probe timeout
@@ -5058,32 +5041,14 @@ void HaAutoPanel::loop() {
     this->maybe_refresh_time_baseline_();
   }
 
-  // v1.22l: periodic entity-state poll for real-time sync
-  // (Fix #11). The native API state subscription pushes
-  // changes to us, but if a push is dropped the panel
-  // would stay stale until the next user action. A
-  // 2-second poll re-fetches the bulk /api/states and
-  // updates the entity model. Throttled by a member
-  // timestamp so the network cost is bounded.
-  if (this->state_ == PanelState::READY && this->entities_by_area_ready_) {
-    this->maybe_poll_entity_states_();
-  }
-
-  // v1.22v: per-room state poll. Fires only when subscribe_mode
-  // is "per_room" or "none" AND the user is on a detail page
-  // (current_room_area_id_ set). The poll itself is a server-
-  // side-filtered /api/template POST that returns just the
-  // visible room's lights (~1-5 KB vs 200 KB for the bulk
-  // poll). This is the activity-reducer that prevents the
-  // priority-inversion deadlock documented in
-  // [[project_crowpanel_sdio_is_symptom]] - in per_room mode
-  // we no longer subscribe to all 200+ entities, and the
-  // poll's response is small enough that httpd and loopTask
-  // don't fight over PSRAM allocator mutexes.
-  if (this->subscribe_mode_ != 0 && !this->current_room_area_id_.empty() &&
-      this->state_ == PanelState::READY && this->entities_by_area_ready_) {
-    this->maybe_poll_current_room_states_();
-  }
+  // v1.24: removed the v1.22l bulk entity-state poll
+  // (maybe_poll_entity_states_) and the v1.22v per-room poll
+  // (maybe_poll_current_room_states_). Both were workarounds
+  // for the dropped-push risk in the v1.22w subscription
+  // path. The WebSocket subscribe_events stream is
+  // server-pushed and has no dropped-push risk; the
+  // get_states response on connect covers any initial
+  // freshness. We don't need a periodic poll anymore.
 
   // v1.22v: WLED-pattern stuck-task monitor + recovery
   // (only does something if enable_stuck_task_recovery_ is
