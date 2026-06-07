@@ -134,6 +134,118 @@ static inline char* psram_strdup_(size_t cap) {
   return p;
 }
 
+// Pre-allocated PSRAM pool for the 229KB get_states JSON parse.
+// Allocated once at HaWsClient::start(), reused for every
+// subsequent get_states result. ArduinoJson's deserializer
+// calls our allocate()/reallocate() to grow its internal pool;
+// since we just bump pos_ in a 1MB PSRAM buffer, no heap
+// lock is taken during the parse. The SDIO RX task on
+// core 0 can drain its wifi buffer without contending for
+// the heap. v1.24 fix for sdio_drv.c:1260 copy_payload assert.
+//
+// The user confirmed 32MB PSRAM is available, so 1MB for the
+// pool is cheap.
+class HaWsPreallocPool : public ArduinoJson::Allocator {
+ public:
+  static constexpr size_t CAPACITY = 1024 * 1024;  // 1 MB
+
+  void init() {
+    if (buf_ == nullptr) {
+      buf_ = (char*) heap_caps_malloc_prefer(
+          CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      if (buf_ != nullptr) {
+        ESP_LOGI(HA_WS_TAG, "init: pre-allocated 1MB PSRAM pool for JSON parse");
+      } else {
+        ESP_LOGE(HA_WS_TAG, "init: failed to pre-allocate 1MB PSRAM");
+      }
+    }
+    this->reset_();
+  }
+
+  void reset_() { pos_ = 0; }
+
+  void* allocate(size_t n) override {
+    if (n == 0) return nullptr;
+    if (buf_ == nullptr || pos_ + n > CAPACITY) return nullptr;  // OOM
+    void* p = buf_ + pos_;
+    pos_ += n;
+    return p;
+  }
+
+  void* reallocate(void* p, size_t n) override {
+    if (n == 0) return nullptr;
+    if (buf_ == nullptr || pos_ + n > CAPACITY) return nullptr;
+    void* np = buf_ + pos_;
+    pos_ += n;
+    if (p != nullptr) {
+      memcpy(np, p, n);
+    }
+    return np;
+  }
+
+  void deallocate(void* p) override { /* no-op */ }
+
+  size_t used() const { return pos_; }
+
+ private:
+  char* buf_{nullptr};
+  size_t pos_{0};
+};
+
+// ChunkedJsonReader: wraps a const char* + size_t and yields
+// to the FreeRTOS scheduler every CHUNK_YIELD_BYTES bytes
+// during the 200 KB+ get_states parse. Without the yields,
+// the parse_task hogs core 0 for >1s and the SDIO RX task
+// can't drain its buffer - sdio_drv.c:1260 copy_payload
+// asserts. The yields give the SDIO task (and any other
+// core-0 task) a chance to run. The TWDT is fed by
+// esp_task_wdt_reset() between yields.
+//
+// ArduinoJson 7.x's deserializeJson takes any class that
+// duck-types read() + readBytes() (no inheritance required
+// - the template deduces the interface). We pass a reference
+// to this class to deserializeJson.
+class ChunkedJsonReader {
+ public:
+  ChunkedJsonReader(const char* data, size_t len)
+      : data_(data), len_(len), pos_(0) {}
+
+  int read() {
+    if (pos_ >= len_) return -1;
+    char c = this->data_[this->pos_++];
+    this->maybe_yield_(1);
+    return static_cast<unsigned char>(c);
+  }
+
+  size_t readBytes(char* buffer, size_t length) {
+    size_t avail = this->len_ - this->pos_;
+    size_t to_read = (length < avail) ? length : avail;
+    if (to_read > 0) {
+      memcpy(buffer, this->data_ + this->pos_, to_read);
+      this->pos_ += to_read;
+      this->maybe_yield_(to_read);
+    }
+    return to_read;
+  }
+
+ private:
+  void maybe_yield_(size_t n) {
+    this->bytes_since_yield_ += n;
+    if (this->bytes_since_yield_ >= CHUNK_YIELD_BYTES) {
+      this->bytes_since_yield_ = 0;
+      esp_task_wdt_reset();
+      vTaskDelay(1);
+    }
+  }
+
+  const char* data_;
+  size_t len_;
+  size_t pos_;
+  size_t bytes_since_yield_{0};
+  static constexpr size_t CHUNK_YIELD_BYTES = 4096;
+};
+
 class HaWsClient {
  public:
   explicit HaWsClient(HaAutoPanel* parent) : parent_(parent) {}
@@ -187,7 +299,19 @@ class HaWsClient {
   static constexpr int    WS_TASK_STACK      = 6144;     // bytes
   static constexpr int    PARSE_TASK_PRIO    = 3;        // our parse task
   static constexpr int    PARSE_TASK_STACK   = 16384;    // bytes; 200 KB JSON parse needs headroom
-  static constexpr int    PARSE_TASK_CORE    = 0;        // off loopTask's core 1
+  // v1.24 fix: was 0. The SDIO RX task (which drains the wifi
+  // C6's data into the host) runs on core 0. When our parse_task
+  // was also on core 0, the 200KB get_states parse hogged the
+  // core for >1s and the SDIO ring buffer overflowed
+  // (sdio_drv.c:1260 copy_payload assert). Moving the parse
+  // to core 1 lets the SDIO task on core 0 drain in real time
+  // as the 200KB response streams in. loopTask also runs on
+  // core 1 but is preempted by the parse_task (prio 3 vs 1)
+  // for the duration of the parse. The chunked-parse
+  // ChunkedJsonReader is kept as a safety net (helps if per-
+  // entity processing is the bottleneck rather than the
+  // deserializeJson itself).
+  static constexpr int    PARSE_TASK_CORE    = 1;
   static constexpr size_t RAW_QUEUE_CAPACITY = 8;        // WS task -> parse_task
   static constexpr size_t STATE_QUEUE_CAPACITY = 32;     // parse_task -> loopTask
   static constexpr size_t STATE_DRAIN_PER_TICK = 16;     // hard cap per loop iteration
@@ -284,6 +408,14 @@ class HaWsClient {
   bool push_state_event_(const std::string& eid, const char* state,
                          int brightness, bool has_brightness);
   bool send_text_(const char* body, size_t body_len);
+
+  // v1.24: pre-allocated 1MB PSRAM pool for the ArduinoJson
+  // deserializer. Allocated once at start() and reused for
+  // every get_states response. Eliminates heap lock
+  // contention with the SDIO RX task (which was the
+  // sdio_drv.c:1260 copy_payload assert trigger). With 32MB
+  // PSRAM on the P4, 1MB for the pool is cheap.
+  HaWsPreallocPool psram_pool_;
 };
 
 // =====================================================================
@@ -319,8 +451,10 @@ class HaWsTwdtGuard {
   TaskHandle_t task_{nullptr};
 };
 
-// PSRAM-preferring JSON document allocator (used for both the
-// large get_states parse and small event messages).
+// PSRAM-preferring JSON document allocator (used for small event
+// messages, where heap allocation is fine). For the large
+// get_states parse we use a pre-allocated pool (see below) to
+// avoid contending with the SDIO RX task for the heap lock.
 class HaWsPsramAllocator : public ArduinoJson::Allocator {
  public:
   void* allocate(size_t n) override {
@@ -333,6 +467,13 @@ class HaWsPsramAllocator : public ArduinoJson::Allocator {
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   }
 };
+
+// Pre-allocated PSRAM pool for the 229KB get_states JSON parse.
+// Allocated once at HaWsClient::start(), reused for every
+// subsequent get_states result. ArduinoJson's deserializer
+// calls our allocate()/reallocate() to grow its internal pool;
+// (Duplicates removed - HaWsPreallocPool and ChunkedJsonReader
+// are now defined before the HaWsClient class above.)
 
 }  // namespace
 
@@ -382,6 +523,12 @@ inline void HaWsClient::start() {
   }
   esp_websocket_register_events(this->client_, WEBSOCKET_EVENT_ANY,
                                 HaWsClient::ws_event_handler_, this);
+
+  // v1.24: pre-allocate the 1MB PSRAM pool for the
+  // ArduinoJson deserializer. Done here, in start(), so the
+  // SDIO RX task isn't competing for the heap lock during
+  // the 229KB get_states parse.
+  this->psram_pool_.init();
 
   // Create parse_task. It subscribes itself to the TWDT at the
   // top of parse_task_loop_().
@@ -689,11 +836,23 @@ inline void HaWsClient::parse_get_states_result_(const char* json, size_t len) {
   ESP_LOGI(HA_WS_TAG, "get_states result: %u bytes, parsing...", (unsigned) len);
   uint32_t t0 = (uint32_t) (esp_timer_get_time() / 1000);
 
-  ArduinoJson::JsonDocument doc(new HaWsPsramAllocator());
+  // v1.24: use the pre-allocated 1MB PSRAM pool. No heap
+  // lock contention with the SDIO RX task during the
+  // parse. Reset the pool position before each parse so
+  // the same buffer is reused.
+  this->psram_pool_.reset_();
+  ArduinoJson::JsonDocument doc(&this->psram_pool_);
 
   {
     HaWsTwdtGuard g;  // unsubscribe from TWDT for the long parse
-    DeserializationError err = deserializeJson(doc, json, len);
+    // ChunkedJsonReader yields to the scheduler every 4 KB
+    // during the parse. This gives the SDIO RX task on
+    // core 0 a chance to drain its buffer, preventing the
+    // sdio_drv.c:1260 copy_payload assert that fires when
+    // the parse_task hogs the core for >1s with a 200 KB+
+    // get_states response.
+    ChunkedJsonReader reader(json, len);
+    DeserializationError err = deserializeJson(doc, reader);
     if (err) {
       ESP_LOGE(HA_WS_TAG, "get_states parse failed: %s", err.c_str());
       return;
