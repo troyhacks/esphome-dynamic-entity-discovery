@@ -219,7 +219,7 @@ const char* http_status_to_str(HttpStatus s) {
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.23"
+#define FIRMWARE_VERSION "v1.24"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {

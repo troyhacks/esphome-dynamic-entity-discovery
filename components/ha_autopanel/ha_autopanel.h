@@ -345,28 +345,11 @@ class HaAutoPanel : public Component {
   // label. Default "weather.home". Empty string disables
   // fetch_weather_() entirely.
   void set_weather_entity_id(const std::string& id) { this->weather_entity_id_ = id; }
-  // v1.22v: subscription scope. The "all" mode (default) is
-  // the v1.22u behavior. "none" disables all HA subscriptions
-  // (rely entirely on the 5s bulk poll). "per_room" subscribes
-  // only to entities in current_room_area_id_ + global
-  // media_player entities, with maybe_poll_current_room_states_()
-  // running a 3s per-room poll. The per-room mode eliminates
-  // the O(N*E) full-scan work that was the trigger condition
-  // for the priority-inversion deadlock documented in
-  // [[project_crowpanel_sdio_is_symptom]].
-  void set_subscribe_mode(const std::string& mode) {
-    if      (mode == "none")     this->subscribe_mode_ = 1;
-    else if (mode == "per_room") this->subscribe_mode_ = 2;
-    else                         this->subscribe_mode_ = 0;
-  }
-  // v1.22v: per-room state poll. Gated on subscribe_mode_ != 0
-  // and !current_room_area_id_.empty() (i.e. only fires while
-  // the user is on a detail page). Uses HA's /api/template
-  // endpoint with a Jinja filter so the response is ~1-5 KB
-  // instead of 200 KB. Runs every ROOM_POLL_INTERVAL_MS
-  // (3s default) in loop(). See
-  // .claude/plans/greedy-discovering-koala.md.
-  void maybe_poll_current_room_states_();
+  // v1.24: subscribe_mode_ and maybe_poll_current_room_states_()
+  // removed. The WebSocket path subscribes to ALL state_changed
+  // events server-side (one subscription, no per-entity
+  // std::function allocations). The per-room and bulk polls are
+  // no longer needed.
 
  protected:
   std::string ha_api_url_;
