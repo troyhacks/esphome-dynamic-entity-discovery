@@ -300,7 +300,6 @@ class HaAutoPanel : public Component {
   // Called from YAML lambda to (re-)subscribe to state changes. Safe to call
   // multiple times. No-op if the API isn't connected yet or if there's
   // nothing to subscribe to.
-  void trigger_subscription();
 
   // Called from YAML on_client_connected to fire a single probe that
   // checks whether HA is allowing this device to call services. If the
@@ -428,7 +427,6 @@ class HaAutoPanel : public Component {
   // std::less<> (transparent comparator) enables heterogeneous
   // lookup so we can call .count(e.entity_id) where e.entity_id is
   // a std::string_view without allocating a std::string first.
-  std::set<std::string, std::less<>> subscribed_entity_ids_;
 
   // v1.24: raw WebSocket-to-HA client. Constructed lazily in
   // start_discovery_() after fetch_areas_() populates the
@@ -567,7 +565,6 @@ class HaAutoPanel : public Component {
   // The visual state (arc, ON/OFF) is repainted via
   // update_room_card_visual_state_for_area_() for any room
   // whose state changed.
-  void maybe_poll_entity_states_();
   // HA zone.home friendly_name, fetched at runtime and shown in the
   // center of the title bar on the main grid page. Hidden on the
   // detail page (where title_room_label_ takes that spot) and during
@@ -613,57 +610,6 @@ class HaAutoPanel : public Component {
   // is hidden so the title bar stays tidy (user request: "the
   // edit and reboot buttons should be hidden").
   bool title_chrome_visible_{false};
-  // v1.22v: subscription scope. 0=all (v1.22u default; full bulk
-  // subscription + 5s bulk poll). 1=none (per-room poll only; no
-  // subscription at all). 2=per_room (subscribe only to entities
-  // in current_room_area_id_ plus global media_players; per-room
-  // poll supplements at 3s).
-  // v1.22w: default is now 2 (per_room) - see __init__.py for why.
-  uint8_t subscribe_mode_{2};
-  // v1.22w: deferred-trigger flags. Set by the YAML
-  // trigger_subscription / trigger_auth_probe lambdas (or by
-  // the C++ auto-trigger on HA connect), processed in loop() at
-  // the panel's own pace. This decouples the httpd worker task
-  // (where the YAML std::function lambdas fire) from the heavy
-  // std::function-allocation work in subscribe_to_all_entities_()
-  // and probe_authorization_(). Without the deferral, a throw
-  // from one of those allocs lands in the httpd worker context,
-  // which -fno-exceptions turns into abort() at PC 0x480dbxxx
-  // and brings the whole panel down.
-  //
-  // The flag-setter path (the YAML lambdas calling
-  // trigger_subscription / trigger_auth_probe) is allocation-
-  // free: it's a member function setting a bool. The actual
-  // work happens later, in loop() on the main task, where
-  // memory pressure is the panel's own heap budget rather than
-  // the httpd worker's transient working set.
-  bool pending_subscription_{false};
-  bool pending_auth_probe_{false};
-  // v1.22w: chunked subscription state. Build the
-  // (entity_id, attribute, area_id) list once, then drain it
-  // N entries per loop tick. Caps the per-tick std::function
-  // allocation burst at SUBSCRIBE_CHUNK_PER_TICK, so even
-  // subscribe_mode="all" (200+ subs) doesn't blow up the heap
-  // in a single tick. The std::string members in
-  // PendingSubscription are owned (not arena-backed) because
-  // the list lives across multiple ticks - the arena's
-  // string_views are valid for the component's lifetime, but
-  // we want a stable, owned copy here.
-  struct PendingSubscription {
-    std::string entity_id;
-    std::string area_id;            // empty for global media_players
-    bool want_brightness{false};
-  };
-  std::vector<PendingSubscription> pending_subs_;
-  size_t pending_sub_next_idx_{0};
-  bool subscription_in_progress_{false};
-  static constexpr size_t SUBSCRIBE_CHUNK_PER_TICK = 8;
-  // Heap guard threshold. Below this, we defer the next chunk
-  // to a future tick rather than risk an std::function throw.
-  // 16 KB is conservative: a single std::function with
-  // captured string_view + a small lambda body is ~80-120
-  // bytes, so 16 KB gives ~130-200 headroom per chunk.
-  static constexpr size_t SUBSCRIBE_HEAP_GUARD_BYTES = 16 * 1024;
   // v1.22v: current room's area_id (or empty for grid view).
   // Set in show_entity_detail_(); cleared in show_room_grid_().
   // Used as the fast-fail filter for state pushes in per_room
@@ -887,7 +833,6 @@ class HaAutoPanel : public Component {
   // on_entity_state_changed_() would otherwise append a duplicate
   // copy of every entity. Reset at the start of each fetch pass
   // (top of fetch_entities_()).
-  std::set<std::string> seen_areas_during_bulk_fetch_;
 
   // Web UI handler
   bool web_handler_registered_{false};
@@ -1055,39 +1000,6 @@ class HaAutoPanel : public Component {
   static const int MAX_ROOM_COLORS_ = 8;
 
   void fetch_areas_();
-  void fetch_entities_();
-  // v1.22aa: shared parser for both fetch_entities_() and
-  // fetch_entities_template_(). Takes the response body
-  // (already allocated, NUL-terminated) and walks the
-  // JSON array, building Entity records and seeding the
-  // time baseline from the first entity's last_updated.
-  // Extracted so the two fetch paths don't duplicate the
-  // ~140 lines of parse/seed code.
-  void parse_states_response_(const char* response, size_t response_len);
-  // v1.22aa: thin wrapper that wraps parse_states_response_
-  // in a TwdtGuard. Both fetch paths (bulk /api/states
-  // and the new /api/template POST) can take >5s on a
-  // busy install; without the guard the IDF TWDT fires
-  // and the panel reboots. The guard is RAII - re-
-  // subscribes the calling task to the TWDT on exit.
-  void parse_states_response_guarded_(const char* response, size_t response_len);
-  // v1.22aa: server-side-filtered entity-state fetch using
-  // /api/template with a Jinja `in` test against the list of
-  // entity IDs from discovered_areas_. Replaces the 200KB+
-  // bulk /api/states GET that triggered the SDIO NULL buffer
-  // assert at sdio_drv.c:896 (the C6's ring buffer pool
-  // empties when the host can't drain the 200KB+ burst fast
-  // enough - documented in [[project_crowpanel_sdio_is_symptom]]).
-  // The template response is much smaller (typically 20-50 KB
-  // for a 200-entity HA install) because it only includes
-  // entities in our configured areas. Same JSON shape as
-  // /api/states, so the parse path is shared with
-  // fetch_entities_(). Called from start_discovery_() in
-  // place of fetch_entities_() - the old bulk method is
-  // kept for reference + the rare case where the template
-  // approach needs to be bypassed.
-  void fetch_entities_template_();
-  void fetch_entities_for_area_(const Area& area);
   void filter_and_build_room_cards_();
   // Predicate helpers take std::string_view so callers can pass
   // either an Entity field (now string_view) or a std::string from
@@ -1165,7 +1077,6 @@ class HaAutoPanel : public Component {
   uint8_t compute_room_brightness_pct_(const std::string& area_id) const;
 
   // Native API state subscription
-  void subscribe_to_all_entities_();
   // v1.22w: chunked subscription machinery. Replaces the
   // single-shot 200+ std::function allocation burst in
   // subscribe_to_all_entities_() with a state-machine that
@@ -1178,8 +1089,6 @@ class HaAutoPanel : public Component {
   // rationale (PC 0x480dbxxx abort path - the std::function
   // throw that fires when the C6 is wedged and the heap
   // can't hold 200+ callbacks in a row).
-  void build_pending_subs_list_();
-  void process_chunked_subscription_();
   // True if HA API has ever been connected since boot. The
   // loop() polls this to auto-trigger the auth probe on
   // first connect (replaces the YAML on_client_connected
@@ -1192,7 +1101,6 @@ class HaAutoPanel : public Component {
   // YAML's auth-probe + subscription lambdas - the C++ side
   // now self-triggers without going through the YAML
   // std::function path.
-  bool ha_subscribed_once_{false};
   // Callbacks fired by the api server when HA pushes a state change
   // or attribute change. Take string_view because the const char*
   // overload of subscribe_home_assistant_state is zero-allocation
