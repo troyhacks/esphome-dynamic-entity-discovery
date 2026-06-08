@@ -799,6 +799,13 @@ class HaAutoPanel : public Component {
 
   // Authorization probe state
   bool auth_probe_pending_{false};
+  // v1.24: trigger_auth_probe() sets this flag from the
+  // httpd worker; loop() consumes it. The deferred-trigger
+  // pattern avoids calling probe_authorization_() (which
+  // allocates a std::function for the response callback)
+  // from the httpd worker context where a throw would
+  // land in the worker and -fno-exceptions would abort().
+  bool pending_auth_probe_{false};
   uint32_t auth_probe_started_ms_{0};
   // v1.24: bumped from 5s -> 15s. On cold boot the HA native
   // API encryption handshake + first service call can take

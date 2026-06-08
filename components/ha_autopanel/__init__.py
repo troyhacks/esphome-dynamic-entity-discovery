@@ -121,12 +121,10 @@ CONFIG_SCHEMA = cv.Schema(
         # see [[feedback_yaml_lambda_std_function_throw]].
         # "per_room" caps the count at ~5 callbacks (the lights
         # in the visible room + media_players), so the abort
-        # path is closed for typical use. See
-        # .claude/plans/greedy-discovering-koala.md for the
-        # full v1.22v plan.
-        cv.Optional("subscribe_mode", default="per_room"): cv.one_of(
-            "all", "none", "per_room"
-        ),
+        # path is closed for typical use. v1.24: removed -
+        # the WebSocket subscribe_events stream delivers all
+        # state changes server-side, no per-room filter
+        # needed (and no PC 0x480dxxxx allocation either).
         # v1.22v: WLED-pattern stuck-task recovery knob. When
         # true, the stuck-task detector also takes corrective
         # action (drop httpd worker priority, then C6 reset).
@@ -224,8 +222,10 @@ async def to_code(config):
     cg.add(var.set_use_24h_time(config["use_24h_time"]))
     cg.add(var.set_show_time(config["show_time"]))
     cg.add(var.set_weather_entity_id(config["weather_entity_id"]))
-    # v1.22v: subscription scope (per-room poll opt-in).
-    cg.add(var.set_subscribe_mode(config["subscribe_mode"]))
+    # v1.24: removed set_subscribe_mode() - the v1.22v
+    # per-room subscription scope is gone (the WebSocket
+    # subscribe_events stream delivers all state changes
+    # server-side, no per-room filter needed).
     # v1.22v: stuck-task recovery knob (default OFF - the user
     # wants visibility first, recovery second).
     cg.add(var.set_enable_stuck_task_recovery(config["enable_stuck_task_recovery"]))

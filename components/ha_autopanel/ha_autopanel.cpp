@@ -3629,29 +3629,17 @@ uint8_t HaAutoPanel::compute_room_brightness_pct_(const std::string& area_id) co
 
 
 void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const char* state) {
-  // v1.22v: per_room fast-fail. When the user is on a room
-  // detail page AND we're subscribed to only that room's lights
-  // (subscribe_mode == 2), drop pushes for entities outside the
-  // visible room. The fast-fail is an O(N) hash lookup by
-  // area_id (the std::map key) + an inner scan bounded to the
-  // visible room's entities (typically 3-20). This eliminates
-  // the O(N*E) full-scan work that was the trigger condition
-  // for the priority-inversion deadlock documented in
-  // [[project_crowpanel_sdio_is_symptom]].
-  //
-  // The (subscribe_mode == 2) check is on the hot path of every
-  // state push. The branch is well-predicted (always false
-  // except in per_room mode) and cheap (compare + branch).
-  if (this->subscribe_mode_ == 2 && !this->current_room_area_id_.empty()) {
-    auto it = this->entities_by_area_.find(this->current_room_area_id_);
-    if (it == this->entities_by_area_.end()) return;
-    bool in_visible_room = false;
-    for (const auto& e : it->second) {
-      if (e.entity_id == entity_id) { in_visible_room = true; break; }
-    }
-    if (!in_visible_room) return;
-  }
-
+  // v1.24: removed v1.22v per-room fast-fail. The v1.22w
+  // subscription was scoped to a single room (subscribe_mode=2)
+  // to avoid the 200+ std::function allocation burst, which
+  // meant pushes for entities outside the visible room were
+  // never received. The WebSocket subscribe_events path
+  // delivers ALL state_changed events server-side, so the
+  // per-room filter is unnecessary and would just silently
+  // drop updates for entities the user can't currently see.
+  // (The full-scan below is O(N*E) over ~419 entities, which
+  // is sub-millisecond on the P4 and well below the 50ms
+  // loop-warn threshold.)
   std::string new_state = state ? state : "";
   // LOGI (not LOGD) so we can verify the state-sync path is firing
   // when a light is toggled in HA. The previous LOGD was invisible at
