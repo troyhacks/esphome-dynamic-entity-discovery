@@ -135,6 +135,13 @@ CONFIG_SCHEMA = cv.Schema(
         # it as another 'knob' we can turn and monitor" - the
         # user wants visibility first, recovery second.
         cv.Optional("enable_stuck_task_recovery", default=False): cv.boolean,
+        # v1.25c7: WLED-style task state monitor. When true
+        # (default), the component polls uxTaskGetSystemState()
+        # once per second and logs state/priority/HWM changes
+        # for every task. Pure observability - the monitor
+        # never takes corrective action. Set false to disable
+        # the polling entirely (zero overhead).
+        cv.Optional("enable_task_monitor", default=True): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -229,3 +236,5 @@ async def to_code(config):
     # v1.22v: stuck-task recovery knob (default OFF - the user
     # wants visibility first, recovery second).
     cg.add(var.set_enable_stuck_task_recovery(config["enable_stuck_task_recovery"]))
+    # v1.25c7: WLED-style task monitor. Default true.
+    cg.add(var.set_enable_task_monitor(config["enable_task_monitor"]))

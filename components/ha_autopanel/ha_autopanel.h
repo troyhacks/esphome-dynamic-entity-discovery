@@ -619,18 +619,31 @@ class HaAutoPanel : public Component {
   // v1.22v: per-room poll throttle + last success ms.
   uint32_t last_room_poll_ms_{0};
   static constexpr uint32_t ROOM_POLL_INTERVAL_MS = 3 * 1000;  // 3s
-  // v1.22v: stuck-task detector state. sdio_write task handle
-  // is captured lazily via pcTaskGetHandle("sdio_write") on
-  // the first call to check_stuck_tasks_(). enable_stuck_task_recovery_
-  // is the yaml knob (default false) - when false, the
-  // detector is pure observability; when true, it ALSO takes
-  // graduated corrective action.
-  TaskHandle_t sdio_write_task_handle_{nullptr};
-  TaskHandle_t httpd_worker_handle_{nullptr};
+  // v1.25c7: WLED-style task monitor state. Replaces the v1.22v
+  // sdio_write-specific stuck-task check. The monitor polls
+  // uxTaskGetSystemState() once per second, diffs against the
+  // previous snapshot, and logs only meaningful changes
+  // (state transitions to/from eBlocked, priority changes,
+  // stack HWM drain below 512). High-frequency Ready↔Running
+  // flips are filtered to DEBUG. enable_task_monitor_ defaults
+  // to true; enable_stuck_task_recovery_ keeps the v1.22v name
+  // but no longer auto-fires from the monitor (it's available
+  // for future use or for manual triggering).
+  bool enable_task_monitor_{true};
   bool enable_stuck_task_recovery_{false};
-  uint32_t stuck_since_ms_{0};
-  uint8_t stuck_recovery_count_{0};
-  uint32_t last_stuck_check_ms_{0};
+  uint32_t last_task_monitor_ms_{0};
+  // v1.25c7: per-task snapshot. std::string name would be
+  // simpler but adds heap allocation; the pcTaskName pointer
+  // is only safe to use while the task is alive, so we look
+  // it up fresh from TaskStatus_t each pass.
+  struct TaskSnapshot {
+    eTaskState state{eBlocked};      // sentinel so first pass always logs
+    UBaseType_t priority{0};
+    uint16_t stack_hwm{0};
+    uint32_t blocked_since_ms{0};
+    TaskSnapshot() = default;
+  };
+  std::map<TaskHandle_t, TaskSnapshot> task_snapshots_;
   // v1.22v: max recoveries per window before falling back to
   // App.reboot(). 3 is enough to give the C6 a fair chance
   // to re-init the SDIO link without looping forever.
@@ -648,33 +661,31 @@ class HaAutoPanel : public Component {
   // instead of 200 KB. Runs every ROOM_POLL_INTERVAL_MS
   // (3s default) in loop(). See
   // .claude/plans/greedy-discovering-koala.md.
-  // v1.22v: stuck-task recovery knob. When true, the
-  // detector also takes corrective action (drop httpd
-  // worker priority, then C6 reset). When false (default),
-  // the detector is pure observability. The user wants
-  // visibility first ("I am providing it as another 'knob'
-  // we can turn and monitor") so the default is OFF.
+  // v1.22v: stuck-task recovery knob. When true, future code
+  // can call wedge_trigger_c6_reset_() to recover from a
+  // C6 wedge. v1.25c7: no longer auto-fired by the task
+  // monitor (the monitor is pure observability now). Kept
+  // as a callable for future use. Default OFF.
   void set_enable_stuck_task_recovery(bool v) {
     this->enable_stuck_task_recovery_ = v;
   }
-  // v1.22v: WLED-pattern stuck-task MONITOR + KNOB. Polls the
-  // sdio_write task's eTaskGetState() every loop tick and
-  // logs the duration of any eBlocked state. The C6 SDIO
-  // task is at MAX priority (per the user's note: "I think
-  // you'll find the ESP Hosted tasks are max priority - but
-  // it's the blocking we are worried about") so priority-
-  // elevation checks don't apply; we just watch for blocks.
-  // The "knob" half is enable_stuck_task_recovery_ - a
-  // yaml knob that defaults to FALSE. When true, the
-  // detector ALSO takes graduated corrective action (log +
-  // httpd worker priority drop + C6 reset as last resort).
-  // When false (default), it's pure observability - the
-  // user can see the stuck state in the log without the
-  // detector doing anything destructive. Per the user's
-  // note: "I am providing it as another 'knob' we can turn
-  // and monitor" - the user wants visibility first, recovery
-  // second.
-  void check_stuck_tasks_();
+  // v1.25c7: task-monitor enable knob. Default true. When
+  // false, the monitor stops polling entirely (zero overhead).
+  void set_enable_task_monitor(bool v) {
+    this->enable_task_monitor_ = v;
+  }
+  // v1.25c7: WLED-style task state monitor. Polls
+  // uxTaskGetSystemState() once per second, diffs against
+  // the previous snapshot, and logs only meaningful changes
+  // (state transitions to/from eBlocked, priority changes,
+  // stack HWM drain below 512). High-frequency Ready↔Running
+  // flips are filtered to DEBUG. This is the WLED-MM-P4
+  // pattern the user shared - it gives priority-inversion
+  // visibility (high-prio task in eBlocked while mid-prio
+  // task is eRunning) without the sdio_write "blocked for
+  // X ms" noise the v1.22v stuck-task check generated.
+  // Called from loop(), throttled to 1 Hz internally.
+  void monitor_task_states_();
   // v1.22y: C6 reset via GPIO32 (the esp32_hosted reset_pin).
   // Re-introduces v1.22u's wedge_trigger_c6_reset_() that
   // v1.22v removed on the theory that "the SDIO wedge is a
@@ -686,15 +697,11 @@ class HaAutoPanel : public Component {
   // C6 reset is the cheapest software recovery: drive
   // GPIO32 low for WEDGE_C6_RESET_LOW_MS (100ms), release,
   // the C6 re-inits the SDIO link on its next boot.
-  // Called from check_stuck_tasks_() when block_ms >= 5000
-  // and enable_stuck_task_recovery_ is true.
+  // v1.25c7: no longer auto-called from monitor_task_states_();
+  // the monitor is pure observation. Kept as a callable
+  // for future use or manual recovery.
   void wedge_trigger_c6_reset_();
   static constexpr uint32_t WEDGE_C6_RESET_LOW_MS = 100;
-  // v1.22z: stuck-task detection threshold. v1.22v had 5s,
-  // matching the WLED-MM-P4 default. But the C6 SDIO
-  // driver's init sequence blocks the sdio_write task for
-  // 5-10 seconds at EVERY boot - that's normal eBlocked
-  // time for the SDIO handshake + link training. With
   // 5s threshold + enable_stuck_task_recovery: true (which
   // v1.22y added), the C6 reset fires on every boot, the
   // C6 reboots, wedges again, and we end up in a 6-second
@@ -703,6 +710,11 @@ class HaAutoPanel : public Component {
   // assert at sdio_drv.c:896) is a sustained >30s block.
   // Bumped to 30s so normal boot-time eBlocked is observed
   // but doesn't trigger the recovery.
+  // v1.25c7: kept for reference. The sdio-specific check
+  // that used this threshold is gone (the new monitor doesn't
+  // auto-fire recovery). If a future code path wants to
+  // call wedge_trigger_c6_reset_() with the 30s semantic,
+  // this constant is the canonical threshold.
   static constexpr uint32_t STUCK_TASK_THRESHOLD_MS = 30 * 1000;
   // (v1.22u removed: dedicated SDIO wedge detector task. The
   // user correctly identified that the SDIO wedge is a

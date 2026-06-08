@@ -1229,14 +1229,134 @@ void HaAutoPanel::set_time_from_iso_(const char* iso) {
 
 
 
-void HaAutoPanel::check_stuck_tasks_() {
-  // v1.22v: WLED-pattern stuck-task monitor + recovery knob.
-  // Polls eTaskGetState() for the sdio_write task every
-  // second. If it's in eBlocked for >STUCK_TASK_THRESHOLD_MS
-  // (5s), logs the stuck state. If enable_stuck_task_recovery_
-  // is true (yaml knob), ALSO takes graduated corrective
-  // action: drop the httpd worker's priority to IDLE (so it
-  // doesn't get CPU), then C6 reset as a last resort.
+void HaAutoPanel::monitor_task_states_() {
+  // v1.25c7: WLED-style task state monitor. Replaces the v1.22v
+  // check_stuck_tasks_() which only watched sdio_write and
+  // spammed "[stuck] sdio_write BLOCKED for X ms" every 30s
+  // (the sdio_write task is in eBlocked whenever idle, so
+  // the log was pure noise). The new monitor walks every
+  // task via uxTaskGetSystemState, diffs against the previous
+  // snapshot, and logs only meaningful changes.
+  //
+  // What it logs (at INFO by default):
+  //   - First sighting of a task: "tracking <name> state=X
+  //     prio=Y hwm=Z"
+  //   - State transition to/from eBlocked or eDeleted
+  //   - State transition Ready↔Running (DEBUG, off by default)
+  //   - Priority change
+  //   - Stack HWM drop below 512 (WARN) or 256 (ERROR)
+  //   - Task deletion
+  //
+  // What it does NOT do (vs the v1.22v detector):
+  //   - Watch sdio_write specifically (it's expected to be
+  //     eBlocked whenever idle)
+  //   - Auto-fire C6 reset (wedge_trigger_c6_reset_ is kept
+  //     as a callable for future use; the monitor is pure
+  //     observation). Recovery remains a yaml knob that no
+  //     code path currently consumes.
+  //
+  // What this buys us:
+  //   - Priority-inversion visibility: the timeline of "httpd
+  //     went Running→Blocked at T+50ms" + "lvgl went
+  //     Ready→Running at T+50ms" + a long eBlocked gives
+  //     the postmortem signal that the httpd/lvgl mutex pair
+  //     is contended. The sdio_write-only v1.22v check
+  //     couldn't see this.
+  //   - Stack-overflow pre-warning: a 256-byte HWM drop fires
+  //     ERROR before the actual overflow crashes the device.
+  if (!this->enable_task_monitor_) return;
+  uint32_t now = millis();
+  if (this->last_task_monitor_ms_ != 0 &&
+      (now - this->last_task_monitor_ms_) < 1000) {
+    return;  // throttle to 1 Hz
+  }
+  this->last_task_monitor_ms_ = now;
+  UBaseType_t num = uxTaskGetNumberOfTasks();
+  if (num == 0) return;
+  // Heap-allocate the array. TaskStatus_t is ~36 bytes; ~30
+  // tasks = ~1KB. Allocating on the heap avoids any 4KB
+  // stack issues on the main loop.
+  std::vector<TaskStatus_t> statuses(num);
+  UBaseType_t filled = uxTaskGetSystemState(
+      statuses.data(), num, nullptr);
+  std::set<TaskHandle_t> seen;
+  for (UBaseType_t i = 0; i < filled; i++) {
+    const auto& s = statuses[i];
+    TaskHandle_t h = s.xHandle;
+    seen.insert(h);
+    eTaskState new_state = (eTaskState)s.eCurrentState;
+    UBaseType_t new_prio = s.xCurrentPriority;
+    uint16_t new_hwm = (uint16_t)s.usStackHighWaterMark;
+    const char* name = (s.pcTaskName != nullptr) ? s.pcTaskName : "?";
+    auto it = this->task_snapshots_.find(h);
+    if (it == this->task_snapshots_.end()) {
+      // First sighting
+      ESP_LOGI(TAG, "[task] tracking %s state=%d prio=%u hwm=%u (handle=%p)",
+               name, (int)new_state, (unsigned)new_prio,
+               (unsigned)new_hwm, (void*)h);
+      TaskSnapshot snap;
+      snap.state = new_state;
+      snap.priority = new_prio;
+      snap.stack_hwm = new_hwm;
+      if (new_state == eBlocked) {
+        snap.blocked_since_ms = now;
+      }
+      this->task_snapshots_[h] = snap;
+      continue;
+    }
+    auto& snap = it->second;
+    // State change
+    if (new_state != snap.state) {
+      // Filter: Ready↔Running flips are high-frequency
+      // scheduling churn, not signal. Anything involving
+      // eBlocked, eDeleted, eSuspended is signal.
+      bool significant = !((snap.state == eReady || snap.state == eRunning) &&
+                           (new_state == eReady || new_state == eRunning));
+      if (significant) {
+        ESP_LOGI(TAG, "[task] %s: %d -> %d", name,
+                 (int)snap.state, (int)new_state);
+      } else {
+        ESP_LOGD(TAG, "[task] %s: %d -> %d", name,
+                 (int)snap.state, (int)new_state);
+      }
+      if (new_state == eBlocked) {
+        snap.blocked_since_ms = now;
+      }
+      snap.state = new_state;
+    }
+    // Priority change
+    if (new_prio != snap.priority) {
+      ESP_LOGI(TAG, "[task] %s prio: %u -> %u", name,
+               (unsigned)snap.priority, (unsigned)new_prio);
+      snap.priority = new_prio;
+    }
+    // Stack HWM drain
+    if (new_hwm < snap.stack_hwm) {
+      if (new_hwm < 256 && snap.stack_hwm >= 256) {
+        ESP_LOGE(TAG, "[task] %s stack HWM: %u -> %u "
+                      "(DANGER: overflow imminent)",
+                 name, (unsigned)snap.stack_hwm, (unsigned)new_hwm);
+      } else if (new_hwm < 512 && snap.stack_hwm >= 512) {
+        ESP_LOGW(TAG, "[task] %s stack HWM: %u -> %u (warning)",
+                 name, (unsigned)snap.stack_hwm, (unsigned)new_hwm);
+      }
+      snap.stack_hwm = new_hwm;
+    }
+  }
+  // Detect deleted tasks: any handle in the snapshot that
+  // wasn't in this pass.
+  for (auto it = this->task_snapshots_.begin(); it != this->task_snapshots_.end();) {
+    if (seen.find(it->first) == seen.end()) {
+      ESP_LOGI(TAG, "[task] handle=%p deleted (was state=%d prio=%u hwm=%u)",
+               (void*)it->first, (int)it->second.state,
+               (unsigned)it->second.priority,
+               (unsigned)it->second.stack_hwm);
+      it = this->task_snapshots_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
   //
   // Per the user's note: "I think you'll find the ESP Hosted
   // tasks are max priority - but it's the blocking we are
@@ -4206,12 +4326,11 @@ void HaAutoPanel::loop() {
   // get_states response on connect covers any initial
   // freshness. We don't need a periodic poll anymore.
 
-  // v1.22v: WLED-pattern stuck-task monitor + recovery
-  // (only does something if enable_stuck_task_recovery_ is
-  // true; otherwise pure observability). Self-throttled to 1
-  // Hz. Runs always (not gated on subscribe_mode) so we can
-  // see the SDIO wedge even with subscribe_mode="none".
-  this->check_stuck_tasks_();
+  // v1.25c7: WLED-style task state monitor. Pure
+  // observability - logs state/priority/HWM changes for all
+  // tasks. Self-throttled to 1 Hz. Replaces the v1.22v
+  // check_stuck_tasks_() which only watched sdio_write.
+  this->monitor_task_states_();
 
   // Pending 2-tap-confirm timeout. If the user armed Reboot or
   // Reset customizations and then didn't tap again within 5s, revert
@@ -5223,10 +5342,18 @@ void HaAutoPanel::handle_test_cmd_(AsyncWebServerRequest *request) {
                   "C/S need coordinates - use /test/click or /test/scroll");
     return;
   }
-  bool ok = this->process_command_(ch);
+  // v1.25c7: defer the heavy work to the main loop. The httpd
+  // task's stack is 4KB (HTTPD_DEFAULT_CONFIG); the trigger_discovery
+  // / show_entity_detail_ paths recurse through flex_update enough to
+  // overflow it. process_command_ is idempotent (single-char
+  // dispatch) so deferring it costs only one frame of latency.
+  // The bft test waits 2s between commands so the defer is invisible.
   char body[64];
-  snprintf(body, sizeof(body), "cmd '%c' -> %s\n", ch, ok ? "ok" : "unknown");
-  request->send(ok ? 200 : 400, "text/plain", body);
+  snprintf(body, sizeof(body), "cmd '%c' -> deferred\n", ch);
+  request->send(200, "text/plain", body);
+  this->set_timeout("test_cmd", 0, [this, ch]() {
+    this->process_command_(ch);
+  });
 }
 
 // Stringify the current PanelState for the /test/state response.
