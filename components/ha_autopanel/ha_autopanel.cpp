@@ -4923,6 +4923,11 @@ void HaAutoPanel::probe_authorization_() {
 void HaAutoPanel::on_auth_probe_response_(bool success, const char* error) {
   if (!this->auth_probe_pending_) return;
   this->auth_probe_pending_ = false;
+  // v1.24: reset retry state on a definitive response (success
+  // OR HA-confirmed error). On timeout we keep the retry
+  // counter and re-arm the next_retry timer in loop().
+  this->auth_probe_retries_left_ = AUTH_PROBE_MAX_RETRIES;
+  this->auth_probe_next_retry_ms_ = 0;
   ESP_LOGI(TAG, "Auth probe response: success=%d error=%s",
            (int) success, error ? error : "(none)");
   if (success) {
@@ -4989,13 +4994,40 @@ void HaAutoPanel::loop() {
     this->pending_auth_probe_ = true;
   }
 
-  // Check authorization probe timeout
+  // Check authorization probe timeout. v1.24: instead of
+  // declaring NOT_AUTHORIZED on a single timeout, retry
+  // up to AUTH_PROBE_MAX_RETRIES times with
+  // AUTH_PROBE_RETRY_DELAY_MS between attempts. This
+  // recovers from cold-boot timing where the first
+  // service call may race with the HA API encryption
+  // handshake.
   if (this->auth_probe_pending_) {
     if (millis() - this->auth_probe_started_ms_ > AUTH_PROBE_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "Auth probe timed out (HA may have dropped the call silently)");
-      this->auth_probe_pending_ = false;
-      this->set_panel_state_(PanelState::NOT_AUTHORIZED);
+      if (this->auth_probe_retries_left_ > 0) {
+        this->auth_probe_retries_left_--;
+        this->auth_probe_next_retry_ms_ = millis() + AUTH_PROBE_RETRY_DELAY_MS;
+        this->auth_probe_pending_ = false;
+        ESP_LOGW(TAG, "Auth probe timed out; retrying (%d left) in %ums",
+                 this->auth_probe_retries_left_,
+                 (unsigned) AUTH_PROBE_RETRY_DELAY_MS);
+        // Reset the CONNECTING state so the user sees
+        // something happening (the status_screen_ will
+        // show "retrying auth probe" briefly).
+        this->set_panel_state_(PanelState::CONNECTING);
+      } else {
+        ESP_LOGW(TAG, "Auth probe timed out after %d retries; giving up",
+                 AUTH_PROBE_MAX_RETRIES);
+        this->auth_probe_pending_ = false;
+        this->set_panel_state_(PanelState::NOT_AUTHORIZED);
+      }
     }
+  }
+  // Issue the retry when the delay elapses.
+  if (!this->auth_probe_pending_ &&
+      this->auth_probe_next_retry_ms_ != 0 &&
+      millis() >= this->auth_probe_next_retry_ms_) {
+    this->auth_probe_next_retry_ms_ = 0;
+    this->probe_authorization_();
   }
 
   // Lazy-register the web handler once the web server is up.

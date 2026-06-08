@@ -854,8 +854,23 @@ class HaAutoPanel : public Component {
   // Authorization probe state
   bool auth_probe_pending_{false};
   uint32_t auth_probe_started_ms_{0};
-  static constexpr uint32_t AUTH_PROBE_TIMEOUT_MS = 5000;
+  // v1.24: bumped from 5s -> 15s. On cold boot the HA native
+  // API encryption handshake + first service call can take
+  // >5s, causing the probe to time out and the panel to
+  // flip to NOT_AUTHORIZED until the user taps Retry.
+  // 15s gives the cold-boot path enough headroom while
+  // still catching genuine auth failures promptly.
+  static constexpr uint32_t AUTH_PROBE_TIMEOUT_MS = 15000;
   static constexpr uint32_t AUTH_PROBE_CALL_ID = 0xA1701ACE;  // unique probe id
+  // v1.24: how many times to auto-retry the probe before
+  // declaring NOT_AUTHORIZED. Each retry waits
+  // AUTH_PROBE_RETRY_DELAY_MS between attempts. 3 retries
+  // at 5s intervals = up to 15s of recovery time before
+  // the panel gives up and shows the NOT_AUTHORIZED screen.
+  static constexpr int AUTH_PROBE_MAX_RETRIES = 3;
+  static constexpr uint32_t AUTH_PROBE_RETRY_DELAY_MS = 5000;
+  int auth_probe_retries_left_{AUTH_PROBE_MAX_RETRIES};
+  uint32_t auth_probe_next_retry_ms_{0};
 
   // Persistent config (LittleFS at /storage/autopanel.cfg)
   bool config_loaded_{false};
