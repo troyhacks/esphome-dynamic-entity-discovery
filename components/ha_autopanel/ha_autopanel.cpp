@@ -1285,7 +1285,7 @@ void HaAutoPanel::monitor_task_states_() {
     TaskHandle_t h = s.xHandle;
     seen.insert(h);
     eTaskState new_state = (eTaskState)s.eCurrentState;
-    UBaseType_t new_prio = s.xCurrentPriority;
+    UBaseType_t new_prio = s.uxCurrentPriority;
     uint16_t new_hwm = (uint16_t)s.usStackHighWaterMark;
     const char* name = (s.pcTaskName != nullptr) ? s.pcTaskName : "?";
     auto it = this->task_snapshots_.find(h);
