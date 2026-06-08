@@ -6509,17 +6509,7 @@ static int measure_text_width_(const char* text, const lv_font_t* font) {
   // Force a layout pass so the label measures itself.
   lv_obj_update_layout(lbl);
   int w = lv_obj_get_self_width(lbl);
-  // v1.25c6: lv_obj_delete_async() instead of lv_obj_del().
-  // lv_obj_set_style_text_font() above fires an LV_EVENT_STYLE_CHANGED
-  // which is queued and dispatched on the next display refresh. If
-  // we lv_obj_del() here, the queued event fires on the freed label
-  // -> use-after-free in the event handler's lv_obj_get_style_prop,
-  // which surfaces as a breakpoint in lv_obj_is_valid() (lv_obj_style.c:820).
-  // Async delete defers the free to the next idle cycle, AFTER the
-  // pending event is dispatched. Cost: a few extra labels in flight
-  // during the title-bar render (one per measure_text_width_ call),
-  // ~5-10 small labels at peak. Negligible vs the UAF.
-  lv_obj_delete_async(lbl);
+  lv_obj_del(lbl);
   return w;
 }
 
