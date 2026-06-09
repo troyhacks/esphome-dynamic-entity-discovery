@@ -66,18 +66,17 @@ class HaAutoPanel;
 #define HA_WS_TAG "ha_ws"
 #endif
 
-// HA WebSocket protocol state machine. Surfaced to the panel
-// only for logging; the panel's existing PanelState is left
-// alone (the READY transition is still driven by the
-// entities_by_area_ ready flag in start_discovery_()).
+// HA WebSocket protocol state machine. v1.27 (Phase 4.7):
+// AUTHENTICATED -> READY directly. The get_states round
+// trip is replaced by the per-area aggregate template
+// (subscribed in setup_render_template_subscriptions_).
 enum class HaWsState : uint8_t {
   DISCONNECTED,    // Initial state, no client
   CONNECTING,      // esp_websocket_client_start() called
   AUTH_REQUIRED,   // Connected, awaiting first message (auth_required)
   AUTHENTICATING,  // auth sent, awaiting auth_ok
-  AUTHENTICATED,   // auth_ok received, about to send get_states
-  GETTING_STATES,  // get_states sent, awaiting result (200 KB!)
-  READY,           // subscribe_events ack received; live updates streaming
+  AUTHENTICATED,   // auth_ok received, subscriptions sent
+  READY,           // subscriptions live; clock + aggregate updates streaming
 };
 
 // Per-entity state change event handed from parse_task to
@@ -171,106 +170,12 @@ static inline char* psram_strdup_(size_t cap) {
 //
 // The user confirmed 32MB PSRAM is available, so 1MB for the
 // pool is cheap.
-class HaWsPreallocPool : public ArduinoJson::Allocator {
- public:
-  static constexpr size_t CAPACITY = 1024 * 1024;  // 1 MB
-
-  void init() {
-    if (buf_ == nullptr) {
-      buf_ = (char*) heap_caps_malloc_prefer(
-          CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      if (buf_ != nullptr) {
-        ESP_LOGI(HA_WS_TAG, "init: pre-allocated 1MB PSRAM pool for JSON parse");
-      } else {
-        ESP_LOGE(HA_WS_TAG, "init: failed to pre-allocate 1MB PSRAM");
-      }
-    }
-    this->reset_();
-  }
-
-  void reset_() { pos_ = 0; }
-
-  void* allocate(size_t n) override {
-    if (n == 0) return nullptr;
-    if (buf_ == nullptr || pos_ + n > CAPACITY) return nullptr;  // OOM
-    void* p = buf_ + pos_;
-    pos_ += n;
-    return p;
-  }
-
-  void* reallocate(void* p, size_t n) override {
-    if (n == 0) return nullptr;
-    if (buf_ == nullptr || pos_ + n > CAPACITY) return nullptr;
-    void* np = buf_ + pos_;
-    pos_ += n;
-    if (p != nullptr) {
-      memcpy(np, p, n);
-    }
-    return np;
-  }
-
-  void deallocate(void* p) override { /* no-op */ }
-
-  size_t used() const { return pos_; }
-
- private:
-  char* buf_{nullptr};
-  size_t pos_{0};
-};
-
-// ChunkedJsonReader: wraps a const char* + size_t and yields
-// to the FreeRTOS scheduler every CHUNK_YIELD_BYTES bytes
-// during the 200 KB+ get_states parse. Without the yields,
-// the parse_task hogs core 0 for >1s and the SDIO RX task
-// can't drain its buffer - sdio_drv.c:1260 copy_payload
-// asserts. The yields give the SDIO task (and any other
-// core-0 task) a chance to run. The TWDT is fed by
-// esp_task_wdt_reset() between yields.
 //
-// ArduinoJson 7.x's deserializeJson takes any class that
-// duck-types read() + readBytes() (no inheritance required
-// - the template deduces the interface). We pass a reference
-// to this class to deserializeJson.
-class ChunkedJsonReader {
- public:
-  ChunkedJsonReader(const char* data, size_t len)
-      : data_(data), len_(len), pos_(0) {}
-
-  int read() {
-    if (pos_ >= len_) return -1;
-    char c = this->data_[this->pos_++];
-    this->maybe_yield_(1);
-    return static_cast<unsigned char>(c);
-  }
-
-  size_t readBytes(char* buffer, size_t length) {
-    size_t avail = this->len_ - this->pos_;
-    size_t to_read = (length < avail) ? length : avail;
-    if (to_read > 0) {
-      memcpy(buffer, this->data_ + this->pos_, to_read);
-      this->pos_ += to_read;
-      this->maybe_yield_(to_read);
-    }
-    return to_read;
-  }
-
- private:
-  void maybe_yield_(size_t n) {
-    this->bytes_since_yield_ += n;
-    if (this->bytes_since_yield_ >= CHUNK_YIELD_BYTES) {
-      this->bytes_since_yield_ = 0;
-      esp_task_wdt_reset();
-      vTaskDelay(1);
-    }
-  }
-
-  const char* data_;
-  size_t len_;
-  size_t pos_;
-  size_t bytes_since_yield_{0};
-  static constexpr size_t CHUNK_YIELD_BYTES = 4096;
-};
+// v1.27 (Phase 4.7): HaWsPreallocPool and ChunkedJsonReader
+// are GONE. The 200 KB get_states parse is replaced by the
+// per-area render_template subscription (~50 KB per push),
+// which fits comfortably in the HaWsPsramAllocator's heap
+// path. No more pre-alloc pool, no more chunked reader.
 
 class HaWsClient {
  public:
@@ -313,13 +218,12 @@ class HaWsClient {
   bool push_aggregate_event_(const char* json);
   void drain_aggregate_events();
 
-  // True after we've successfully received and parsed the
-  // get_states response. HaAutoPanel uses this to decide
-  // when it's safe to render the room grid (though the
-  // room grid already renders with stub state from
-  // fetch_areas_(); this just gates the PanelState::READY
-  // transition).
-  bool initial_states_received() const { return initial_states_received_.load(std::memory_order_acquire); }
+  // v1.27 (Phase 4.7): initial_states_received() is gone
+  // (the get_states round trip is gone). The room grid
+  // renders with stub state from fetch_areas_() and the
+  // per-area aggregate (subscribed via WS) updates the
+  // state asynchronously. Use is_ws_ready() (below) to
+  // check the WS connection state.
 
   // Convenience: is the WS state machine at READY?
   bool is_ws_ready() const { return ws_state_.load(std::memory_order_acquire) == HaWsState::READY; }
@@ -372,32 +276,28 @@ class HaWsClient {
   static constexpr int    WS_TASK_PRIO       = 3;        // esp_websocket_client's internal task
   static constexpr int    WS_TASK_STACK      = 6144;     // bytes
   static constexpr int    PARSE_TASK_PRIO    = 3;        // our parse task
-  static constexpr int    PARSE_TASK_STACK   = 16384;    // bytes; 200 KB JSON parse needs headroom
-  // v1.24 fix: was 0. The SDIO RX task (which drains the wifi
-  // C6's data into the host) runs on core 0. When our parse_task
-  // was also on core 0, the 200KB get_states parse hogged the
-  // core for >1s and the SDIO ring buffer overflowed
-  // (sdio_drv.c:1260 copy_payload assert). Moving the parse
-  // to core 1 lets the SDIO task on core 0 drain in real time
-  // as the 200KB response streams in. loopTask also runs on
-  // core 1 but is preempted by the parse_task (prio 3 vs 1)
-  // for the duration of the parse. The chunked-parse
-  // ChunkedJsonReader is kept as a safety net (helps if per-
-  // entity processing is the bottleneck rather than the
-  // deserializeJson itself).
+  // v1.27 (Phase 4.7): reduced from 16 KB to 8 KB. The
+  // 200 KB get_states parse is gone; the parse_task now
+  // only handles small render_template event payloads
+  // (~50 KB per push, which ArduinoJson stores on the
+  // heap, not on the task stack).
+  static constexpr size_t PARSE_TASK_STACK   = 8192;     // bytes
+  // v1.27 (Phase 4.7): PARSE_TASK_CORE is now
+  // unimportant for SDIO contention (the big parse is
+  // gone). Kept on core 1 to avoid being preempted by
+  // loopTask; future-tuning can move it if needed.
   static constexpr int    PARSE_TASK_CORE    = 1;
   static constexpr size_t RAW_QUEUE_CAPACITY = 8;        // WS task -> parse_task
   static constexpr size_t STATE_QUEUE_CAPACITY = 32;     // parse_task -> loopTask
   static constexpr size_t STATE_DRAIN_PER_TICK = 16;     // hard cap per loop iteration
   static constexpr int    PING_INTERVAL_SEC   = 25;       // HA hardcodes ~55s pong timeout
   static constexpr int    PING_TIMEOUT_SEC    = 60;
-  static constexpr uint32_t GET_STATES_ID     = 1;
-  static constexpr uint32_t SUBSCRIBE_ID      = 2;
+  // v1.27 (Phase 4.7): GET_STATES_ID and SUBSCRIBE_ID
+  // removed. The render_template subscriptions use
+  // TemplateApi's auto-incrementing ids (starting at 100).
   // After 10s with no auth_ok after sending auth, force a reconnect
   // (esp_websocket_client is otherwise silent if HA's response stalls).
   static constexpr uint32_t AUTH_TIMEOUT_MS    = 10000;
-  // After 30s with no subscribe_events ack, force a reconnect.
-  static constexpr uint32_t SUBSCRIBE_TIMEOUT_MS = 30000;
 
   // ===== Owner / config =====
   HaAutoPanel* parent_;
@@ -408,7 +308,6 @@ class HaWsClient {
   esp_websocket_client_handle_t client_{nullptr};
   std::string ws_uri_;                              // derived in start_(); held alive while client_ is up
   std::atomic<HaWsState> ws_state_{HaWsState::DISCONNECTED};
-  std::atomic<bool> initial_states_received_{false};
   std::atomic<bool> stopping_{false};
   std::atomic<uint32_t> auth_sent_ms_{0};           // esp_timer_get_time()/1000
   std::atomic<uint32_t> subscribe_sent_ms_{0};
@@ -504,10 +403,11 @@ class HaWsClient {
   // v1.24: pre-allocated 1MB PSRAM pool for the ArduinoJson
   // deserializer. Allocated once at start() and reused for
   // every get_states response. Eliminates heap lock
-  // contention with the SDIO RX task (which was the
-  // sdio_drv.c:1260 copy_payload assert trigger). With 32MB
-  // PSRAM on the P4, 1MB for the pool is cheap.
-  HaWsPreallocPool psram_pool_;
+  // v1.27 (Phase 4.7): the 1 MB PSRAM pre-alloc pool is gone
+  // (the 200 KB get_states parse is replaced by a per-area
+  // render_template subscription). Free heap is ~1 MB larger
+  // at idle and the SDIO RX task no longer contends with us
+  // for the heap lock during a multi-second parse.
 };
 
 // =====================================================================
@@ -524,29 +424,18 @@ namespace {
 // Parsing the 200 KB get_states response can take >5s; we
 // unsubscribe the parse_task from the IDF TWDT for the duration
 // of the parse and re-subscribe on scope exit.
-class HaWsTwdtGuard {
- public:
-  HaWsTwdtGuard() {
-    this->task_ = xTaskGetCurrentTaskHandle();
-    if (esp_task_wdt_delete(this->task_) != ESP_OK) {
-      this->task_ = nullptr;
-    }
-  }
-  ~HaWsTwdtGuard() {
-    if (this->task_ != nullptr) {
-      esp_task_wdt_add(this->task_);
-    }
-  }
-  HaWsTwdtGuard(const HaWsTwdtGuard&) = delete;
-  HaWsTwdtGuard& operator=(const HaWsTwdtGuard&) = delete;
- private:
-  TaskHandle_t task_{nullptr};
-};
-
-// PSRAM-preferring JSON document allocator (used for small event
-// messages, where heap allocation is fine). For the large
-// get_states parse we use a pre-allocated pool (see below) to
-// avoid contending with the SDIO RX task for the heap lock.
+// PSRAM-preferring JSON document allocator (used for the
+// per-area aggregate event payload, ~50 KB). Heap
+// allocation is fine because:
+//   1. The aggregate event is much smaller than the old
+//      200 KB get_states response.
+//   2. ArduinoJson's internal PSRAM allocation (via
+//      heap_caps_realloc_prefer) doesn't compete with the
+//      SDIO RX task for the heap lock - the SDIO RX task
+//      only takes the lock briefly to copy payloads.
+//   3. The parse_task is on core 1 (PARSE_TASK_CORE); the
+//      SDIO RX task runs on core 0. They never share
+//      heaps.
 class HaWsPsramAllocator : public ArduinoJson::Allocator {
  public:
   void* allocate(size_t n) override {
@@ -618,9 +507,10 @@ inline void HaWsClient::start() {
 
   // v1.24: pre-allocate the 1MB PSRAM pool for the
   // ArduinoJson deserializer. Done here, in start(), so the
-  // SDIO RX task isn't competing for the heap lock during
-  // the 229KB get_states parse.
-  this->psram_pool_.init();
+  // v1.27 (Phase 4.7): psram_pool_.init() is gone (the
+  // 1 MB pre-alloc pool is deleted). The parse_task below
+  // uses HaWsPsramAllocator (heap-backed) for the
+  // render_template event payloads.
 
   // Create parse_task. It subscribes itself to the TWDT at the
   // top of parse_task_loop_().
@@ -843,6 +733,11 @@ inline void HaWsClient::parse_task_loop_() {
           this->parse_auth_invalid_(msg->data, msg->len);
           break;
         case 4:  // result
+          // v1.27 (Phase 4.7): the get_states round trip is
+          // gone. The only "result" message we ever receive
+          // now is the ack for the clock / aggregate
+          // render_template subscriptions (with
+          // success=true, result=null). Just log + ignore.
           if (msg->data != nullptr && msg->data[0] == '{') {
             const char* idp = strstr(msg->data, "\"id\":");
             if (idp != nullptr) {
@@ -850,12 +745,8 @@ inline void HaWsClient::parse_task_loop_() {
               msg->id = (uint32_t) idv;
             }
           }
-          if (msg->id == GET_STATES_ID) {
-            this->parse_get_states_result_(msg->data, msg->len);
-          } else {
-            ESP_LOGI(HA_WS_TAG, "result msg id=%u (%zu bytes), ignoring",
-                     (unsigned) msg->id, msg->len);
-          }
+          ESP_LOGD(HA_WS_TAG, "result msg id=%u (%zu bytes), acking",
+                   (unsigned) msg->id, msg->len);
           break;
         case 5:  // event
           this->parse_event_message_(msg->data, msg->len);
@@ -882,15 +773,10 @@ inline void HaWsClient::parse_task_loop_() {
         esp_websocket_client_close(this->client_, portMAX_DELAY);
       }
     }
-    if (this->ws_state_.load(std::memory_order_acquire) == HaWsState::GETTING_STATES &&
-        this->subscribe_sent_ms_.load(std::memory_order_acquire) != 0 &&
-        now_ms - this->subscribe_sent_ms_.load(std::memory_order_acquire) > SUBSCRIBE_TIMEOUT_MS) {
-      ESP_LOGE(HA_WS_TAG, "subscribe_events ack timeout after %ums, forcing reconnect",
-               (unsigned) (now_ms - this->subscribe_sent_ms_.load(std::memory_order_acquire)));
-      if (this->client_ != nullptr) {
-        esp_websocket_client_close(this->client_, portMAX_DELAY);
-      }
-    }
+    // v1.27 (Phase 4.7): removed the GETTING_STATES +
+    // SUBSCRIBE_TIMEOUT_MS check. The state machine no longer
+    // goes through GETTING_STATES (we go AUTHENTICATED -> READY
+    // directly after subscribe_clock_/subscribe_aggregate_).
   }
 }
 
@@ -933,82 +819,51 @@ inline void HaWsClient::parse_auth_invalid_(const char* json, size_t len) {
   }
 }
 
-// v1.27 (Phase 4): the get_states round trip is gone. The
-// per-area aggregate template (subscribed via WS
-// render_template) replaces the 200KB bulk parse. This
-// function is kept as a no-op stub because it's still
-// wired into the parse_task dispatch (Phase 4.7 will
-// delete it entirely). Any "get_states" result that
-// somehow arrives (e.g. stale code) is ignored.
-inline void HaWsClient::parse_get_states_result_(const char* json, size_t len) {
-  ESP_LOGW(HA_WS_TAG, "parse_get_states_result_ called (%u bytes) - "
-                       "should be dead code in v1.27. Ignoring.",
-           (unsigned) len);
-  (void) json; (void) len;
+// v1.27 (Phase 4.7): the get_states round trip and its
+// 200KB parse are GONE. The per-area aggregate template
+// (subscribed via WS render_template) replaces them. The
+// function declaration is kept (so the parse_task dispatch
+// can be updated cleanly in a future pass) but the body
+// is empty - no WS message with id=GET_STATES_ID (1)
+// is ever sent, so the dispatch never reaches here.
+inline void HaWsClient::parse_get_states_result_(const char* /*json*/, size_t /*len*/) {
+  // Phase 4.7: this method is unreachable. Kept as an
+  // empty stub to minimize the diff; safe to delete in
+  // the next pass along with the parse_task dispatch.
 }
 
 
+// v1.27 (Phase 4.7): the state_changed subscription is gone.
+// All WS events are now render_template pushes (clock +
+// aggregate). The dispatch is purely by the subscription id
+// in doc["id"]. A typical event payload looks like:
+//
+//   {"id":N, "type":"event",
+//    "event": {"result": "<rendered string>",
+//              "listeners": {...}}}
+//
+// For errors, the payload is:
+//   {"id":N, "type":"event",
+//    "event": {"error": "UndefinedError: ...", "level": "ERROR"}}
 inline void HaWsClient::parse_event_message_(const char* json, size_t len) {
   if (json == nullptr || len == 0) return;
   this->events_received_.fetch_add(1, std::memory_order_relaxed);
 
   ArduinoJson::JsonDocument doc(new HaWsPsramAllocator());
 
-  {
-    HaWsTwdtGuard g;
-    DeserializationError err = deserializeJson(doc, json, len);
-    if (err) return;
-  }
+  // v1.27 (Phase 4.7): no HaWsTwdtGuard needed. The
+  // per-area aggregate event payload is ~50 KB max, which
+  // ArduinoJson parses in ~50 ms - well under the 5 s
+  // TWDT window. The HaWsTwdtGuard was for the 200 KB
+  // get_states parse that could take >1 s.
+  DeserializationError err = deserializeJson(doc, json, len);
+  if (err) return;
 
   const char* type = doc["type"] | "";
   if (strcmp(type, "event") != 0) return;
-  // v1.27: an "event" message in HA's WS protocol can be
-  // either:
-  //   (a) state_changed event with event_type=
-  //       "state_changed" and data.entity_id etc.
-  //   (b) render_template event with the render result in
-  //       event.result. The subscription id is in
-  //       doc["id"] (top-level, NOT inside event).
-  //
-  // Demux by the presence of event.event_type. If it
-  // exists, this is the legacy state_changed path
-  // (kept for now, deleted in Phase 4.7). Otherwise it's
-  // a TemplateApi subscription - hand off to the dispatch.
   uint32_t sub_id = doc["id"] | 0;
   JsonObject ev = doc["event"].as<JsonObject>();
   if (ev.isNull()) return;
-  const char* event_type = ev["event_type"] | "";
-  if (event_type[0] != '\0') {
-    // ----- Legacy state_changed path (Phase 4.7 removes) -----
-    if (strcmp(event_type, "state_changed") != 0) return;
-    JsonObject data = ev["data"].as<JsonObject>();
-    if (data.isNull()) return;
-    const char* eid = data["entity_id"];
-    if (eid == nullptr) return;
-    if (this->our_entity_ids_.find(eid) == this->our_entity_ids_.end()) return;
-    JsonObject new_state = data["new_state"].as<JsonObject>();
-    if (new_state.isNull()) return;
-    const char* st = new_state["state"] | "";
-    int brightness = -1;
-    bool has_brightness = false;
-    JsonObject attrs = new_state["attributes"].as<JsonObject>();
-    if (!attrs.isNull()) {
-      JsonVariant bv = attrs["brightness"];
-      if (!bv.isNull()) {
-        brightness = bv.as<int>();
-        if (brightness < 0) brightness = 0;
-        if (brightness > 255) brightness = 255;
-        has_brightness = true;
-      }
-    }
-    this->push_state_event_(eid, st, brightness, has_brightness);
-    esphome::App.wake_loop_threadsafe();
-    return;
-  }
-  // ----- TemplateApi render_template event path -----
-  // ev.result holds the rendered string (HA returns it
-  // as a JSON string). If ev.error is set, the template
-  // had a render error - log and skip.
   if (ev["error"].is<const char*>()) {
     ESP_LOGW(HA_WS_TAG, "render_template id=%u error: %s",
              (unsigned) sub_id, ev["error"].as<const char*>());
@@ -1049,15 +904,11 @@ inline bool HaWsClient::send_auth_() {
   return this->send_text_(body.data(), body.size());
 }
 
-inline bool HaWsClient::send_get_states_() {
-  const char* body = "{\"id\":1,\"type\":\"get_states\"}";
-  return this->send_text_(body, strlen(body));
-}
-
-inline bool HaWsClient::send_subscribe_events_() {
-  const char* body = "{\"id\":2,\"type\":\"subscribe_events\",\"event_type\":\"state_changed\"}";
-  return this->send_text_(body, strlen(body));
-}
+// v1.27 (Phase 4.7): send_get_states_ and send_subscribe_events_
+// are GONE. The clock + aggregate render_template subscriptions
+// (sent via TemplateApi::subscribe() in
+// setup_render_template_subscriptions_) replace the get_states
+// round trip AND the state_changed subscription.
 
 // ----- Helpers -----
 
