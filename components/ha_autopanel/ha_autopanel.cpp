@@ -802,21 +802,29 @@ void HaAutoPanel::fetch_home_name_() {
 }
 
 void HaAutoPanel::fetch_weather_() {
-  // v1.22s: title bar weather label fetcher.
+  // v1.25c7: weather via HA /api/template. The server does
+  // the localization (state_translated -> "Partly Cloudy"),
+  // the casing (| title), the rounding (| round | int), and
+  // the unit attachment (reads temperature_unit from the
+  // entity attributes). All the client-side mapping table
+  // + camelCase fallback + UTF-8 unit walking that the
+  // v1.25c1 commit added is now unnecessary - HA's
+  // weather.translate_state service already maps the
+  // weather.<provider>.state values to the user's locale.
   //
-  // The HA weather entity is exposed as a normal entity on
-  // /api/states/<entity_id> with a `state` field of the
-  // current condition (e.g. "cloudy", "sunny", "rainy")
-  // and a `attributes.temperature` field with the current
-  // temp in the entity's configured unit (°F in the user's
-  // HA). We render "{state} {temp}°" into
-  // title_weather_label_ and unhide it.
+  // The template below produces exactly "Partly Cloudy 19°C"
+  // for HA's default weather.forecast_home entity. The
+  // weather_entity_id_ yaml knob is honored by interpolating
+  // it into the template. The ~160 lines this replaces
+  // (HTTP fetch + JSON parse + state-mapping table +
+  // UTF-8 unit walk + label-width math) shrink to ~50.
   //
-  // Disabled entirely when weather_entity_id_ is empty
-  // (the yaml knob is ""). The label widget is created
-  // hidden in create_title_bar_() and stays hidden if we
-  // never fetch. So an empty entity_id or 404 is a
-  // silent no-op rather than a UI change.
+  // The template's response is a plain string. If the
+  // weather_entity_id_ is empty or invalid, HA returns
+  // the template's evaluation of state_translated('') which
+  // is "" (empty string) - the label stays hidden, no
+  // UI change. So an empty entity_id is a silent no-op
+  // rather than an error.
   if (this->title_weather_label_ == nullptr) return;
   if (this->weather_entity_id_.empty()) {
     ESP_LOGD(TAG, "[weather] disabled (weather_entity_id is empty)");
@@ -831,339 +839,159 @@ void HaAutoPanel::fetch_weather_() {
     return;
   }
 
-  // Throttle: don't re-fetch if we just did. Mirrors the
-  // last_home_fetch_ms_ guard so the periodic loop() call is
-  // safe to make on every tick.
+  // Throttle: don't re-fetch if we just did.
   uint32_t now = millis();
   if (this->last_weather_fetch_ms_ != 0 &&
       (now - this->last_weather_fetch_ms_) < WEATHER_FETCH_INTERVAL_MS) {
     return;
   }
 
-  ESP_LOGI(TAG, "[weather] fetching %s from %s/api/states/%s",
-           this->weather_entity_id_.c_str(),
-           this->ha_api_url_.c_str(),
+  // Build the Jinja template. The entity_id is interpolated
+  // from the yaml knob (default "weather.forecast_home")
+  // so users with a different weather provider don't have
+  // to edit the C++.
+  //
+  //   - state_translated(<entity>) | title -> "Partly Cloudy"
+  //   - state_attr(<entity>, 'temperature') | round | int -> 19
+  //   - state_attr(<entity>, 'temperature_unit') -> "°C"
+  // Jinja concatenates adjacent tokens with no whitespace,
+  // producing "Partly Cloudy 19°C".
+  std::string entity = this->weather_entity_id_;
+  std::string body =
+      "{\"template\": \""
+      "{{ state_translated('" + entity + "') | title }} "
+      "{{ state_attr('" + entity + "', 'temperature') | round | int }}"
+      "{{ state_attr('" + entity + "', 'temperature_unit') }}\"}";
+
+  ESP_LOGI(TAG, "[weather] fetching %s via /api/template",
            this->weather_entity_id_.c_str());
 
-  // Same single-entity endpoint pattern as fetch_home_name_().
-  // /api/states/<entity_id> is small (~500B) vs the 200KB+ of
-  // the bulk /api/states. This is critical because weather
-  // is a high-traffic entity (HA updates it often) and we
-  // don't want to fight the bulk poll for bandwidth.
-  std::string url = this->ha_api_url_ + "/api/states/" + this->weather_entity_id_;
-  // v1.23: HttpClient consolidates the get + read + status-
-  // code boilerplate. Was ~80 lines of duplicate code; now
-  // ~15 lines of HttpClient call + parse-specific logic.
+  std::string url = this->ha_api_url_ + "/api/template";
+
+  // HttpClient::post only takes one headers arg, so combine
+  // Content-Type + Bearer auth into a single vector.
   HttpClient http(this->http_request_);
-  HttpResult result = http.get(url, http.bearer_auth(this->ha_api_password_));
-  if (result.status == HttpStatus::NOT_FOUND) {
-    // No weather entity in HA. Not an error - just
-    // nothing to show. The label stays hidden. Mark
-    // the fetch timestamp so we don't retry every
-    // 2s via the loop() poll.
-    ESP_LOGW(TAG, "[weather] %s not found in HA (HTTP 404)",
-             this->weather_entity_id_.c_str());
-    this->last_weather_fetch_ms_ = millis();
-    return;
-  }
+  std::vector<http_request::Header> headers;
+  headers.push_back({"Content-Type", "application/json"});
+  std::vector<http_request::Header> auth = http.bearer_auth(
+      this->ha_api_password_);
+  headers.insert(headers.end(), auth.begin(), auth.end());
+
+  HttpResult result = http.post(url, body, headers);
   if (result.status != HttpStatus::OK) {
-    ESP_LOGW(TAG, "[weather] fetch failed: %s (HTTP %d)",
+    ESP_LOGW(TAG, "[weather] template fetch failed: %s (HTTP %d)",
              http_status_to_str(result.status), result.http_code);
     return;
   }
-  const std::string& response = result.body;
+    const std::string& response = result.body;
+  if (response.empty()) {
+    ESP_LOGW(TAG, "[weather] empty response body");
+    return;
+  }
 
-  // Parse the JSON. We expect {"state": "cloudy", "attributes":
-  //   {"temperature": 72.3, "temperature_unit": "°F", ...}}
-  // Uses the project's PsramJsonDocument + deserializeJson()
-  // pattern (see fetch_home_name_ at line ~1010). PSRAM-backed
-  // so we don't OOM the small internal heap.
+  // HA's /api/template returns the rendered string as BARE TEXT
+  // (not JSON-quoted) for most template responses. E.g.
+  //   Partly Cloudy 18°C
+  // Verified with curl/Invoke-RestMethod. So we use the
+  // response body directly. The JSON parse is a defensive
+  // fallback in case HA starts returning JSON-quoted strings
+  // in a future version.
+  std::string text;
   PsramJsonDocument doc(&s_psram_allocator);
   DeserializationError err = deserializeJson(doc, response);
-  if (err) {
-    ESP_LOGW(TAG, "[weather] JSON parse failed: %s", err.c_str());
-    return;
-  }
-  JsonObject obj = doc.as<JsonObject>();
-  if (obj.isNull()) {
-    ESP_LOGW(TAG, "[weather] response is not a JSON object");
-    return;
-  }
-  const char* state = obj["state"].as<const char*>();
-  if (state == nullptr || state[0] == '\0') {
-    ESP_LOGW(TAG, "[weather] empty state field");
-    return;
-  }
-  double temperature = obj["attributes"]["temperature"].as<double>();
-  if (std::isnan(temperature)) {
-    ESP_LOGW(TAG, "[weather] missing/invalid temperature");
-    return;
-  }
-  // v1.22t: read the unit from the HA weather entity's
-  // temperature_unit attribute instead of hardcoding °F.
-  // HA's weather provider sets this based on the user's
-  // unit system preference ("°C" for metric, "°F" for
-  // imperial). The previous v1.22s code always rendered
-  // °F which read "Rainy 20°F" when the user wanted
-  // "Rainy 20°C" - confusing and wrong. Default to °F
-  // when the attribute is missing (older HA versions /
-  // non-standard weather integrations).
-  //
-  // HA returns the unit as a UTF-8 string like "°C" which
-  // is the 3-byte sequence \xc2 \xb0 \x43 (C). The first
-  // byte of the UTF-8 encoding of ° (U+00B0) is \xc2 -
-  // NOT 0xb0 (which is what '°' becomes in a Latin-1
-  // source file). Comparing unit[0] to a literal '°'
-  // would always fail on a Latin-1 source. Instead, walk
-  // the string looking for 'C' or 'F' as ASCII.
-  const char* unit = obj["attributes"]["temperature_unit"].as<const char*>();
-  const char* unit_short = "°F";  // safe default
-  if (unit != nullptr) {
-    for (size_t k = 0; unit[k] != '\0' && k < 8; k++) {
-      if (unit[k] == 'C') { unit_short = "°C"; break; }
-      if (unit[k] == 'F') { unit_short = "°F"; break; }
+  if (err == DeserializationError::Ok) {
+    // JSON parse succeeded - HA returned a JSON-quoted string.
+    const char* rendered = doc.as<const char*>();
+    if (rendered != nullptr) {
+      text = rendered;
+    } else {
+      // JSON root wasn't a string (e.g. an error object).
+      text = response;
     }
-    // 'K' (Kelvin) or anything else falls through to °F
-    // default. Kelvin is rare for home weather displays.
+  } else {
+    // Response wasn't JSON - it's the bare template result.
+    text = response;
+  }
+  // A missing/unknown weather entity produces a template
+  // error string like "TemplateError('...'): ...". Filter
+  // those out so we don't show the error in the UI.
+  if (text.find("TemplateError") != std::string::npos ||
+      text.find("UndefinedError") != std::string::npos) {
+    ESP_LOGW(TAG, "[weather] template error: %s", text.c_str());
+    return;
   }
 
-  // Round temperature to nearest integer for the label. HA's
-  // weather entity reports one decimal place; "72.3°F" reads
-  // awkwardly in a small label. The unit is whatever HA
-  // reported (°C for metric users, °F for imperial).
-  int temp_int = (int)std::lround(temperature);
-
-  // Capitalize the first letter of the state for display.
-  // HA's state values are lowercase ("cloudy", "partlycloudy"
-  // or sometimes with a space: "partly cloudy"). The label
-  // looks better with a leading capital.
-  char state_buf[32];
-  size_t i = 0;
-  state_buf[i++] = (char)std::toupper((unsigned char)state[0]);
-  for (size_t j = 1; state[j] != '\0' && i < sizeof(state_buf) - 1; j++) {
-    state_buf[i++] = state[j];
-  }
-  state_buf[i] = '\0';
-
-  // Compose "{State} {temp}{unit}" and update the label.
-  char text_buf[48];
-  snprintf(text_buf, sizeof(text_buf), "%s %d%s", state_buf, temp_int, unit_short);
-  this->weather_text_ = text_buf;
-  lv_label_set_text(this->title_weather_label_, text_buf);
+  this->weather_text_ = text;
+  lv_label_set_text(this->title_weather_label_, text.c_str());
   // Re-fit the label width to the new text. Same pattern
   // as the time label - the flex cluster reflows when
   // the label grows.
   const lv_font_t* wf = lv_obj_get_style_text_font(
       this->title_weather_label_, LV_PART_MAIN);
   lv_obj_set_width(this->title_weather_label_,
-                   button_width_for_text_(text_buf, wf, 4));
+                   button_width_for_text_(text.c_str(), wf, 4));
   // Unhide the label now that we have a real value to show.
   lv_obj_remove_flag(this->title_weather_label_, LV_OBJ_FLAG_HIDDEN);
   this->last_weather_fetch_ms_ = millis();
-  ESP_LOGI(TAG, "[weather] updated label to '%s'", text_buf);
+  ESP_LOGI(TAG, "[weather] updated label to '%s'", text.c_str());
 }
+
 
 void HaAutoPanel::update_title_time_() {
   if (this->title_time_label_ == nullptr) return;
-  // v1.22s: show_time knob. When false the time label is
-  // hidden and we skip the entire update - the right
-  // cluster auto-collapses to just the DBG button. The
-  // HIDDEN flag is set once in create_title_bar_(); we
-  // just bail out here so we don't waste cycles
-  // formatting a string nobody sees.
+
+  // 1. Check if we should even be showing the time
   if (!this->show_time_) {
-    static int hidden_marker = -1;
-    if (hidden_marker == -1) {
-      lv_label_set_text(this->title_time_label_, "");
-      hidden_marker = 0;
-    }
-    return;
+    lv_label_set_text(this->title_time_label_, "");
+    return; // (Stripped out the static hidden_marker. LVGL handles repeated "" sets cheaply)
   }
-  // Throttle: only redraw when the displayed minute changes. The
-  // hh:mm string is the same for a whole minute, so we cache the
-  // last minute we set and bail out cheaply on every other tick.
+
   static int last_minute = -1;
+  ESPTime now;
 
-  // v1.22: prefer the HA-derived time over SNTP. The homeassistant
-  // time platform would do this for us, but the IDF build is
-  // currently broken when we enable that platform (the bulk-fetch
-  // git-context error). Until that's sorted, we use last_updated
-  // from any HA response as the baseline and advance locally.
-  if (this->time_valid_) {
+  // 2. Fetch Time (Prefer SNTP, fallback to HA-derived UTC baseline)
+  if (this->time_ != nullptr && this->time_->now().is_valid()) {
+    now = this->time_->now();
+  } 
+  else if (this->time_valid_) {
     uint32_t now_ms = millis();
-    int64_t elapsed_s = (int64_t)(now_ms - this->time_baseline_millis_) / 1000;
-    int64_t unix_now = this->time_unix_seconds_ + elapsed_s;
-    // v1.22e: convert to LOCAL time. Was gmtime_r() in v1.22,
-    // which is UTC. The user's yaml sets America/New_York, so
-    // the panel was 4-5 hours ahead of the wall clock. We use
-    // localtime_r() which honors the system's TZ environment
-    // variable. The yaml's `timezone:` block doesn't set TZ
-    // (it sets a different internal field), so we also force
-    // TZ here to a reasonable default that matches the user's
-    // home - "America/New_York" - if the env is unset. The
-    // long-term fix is to read the timezone from the user's
-    // yaml (yaml's time.timezone field) and setenv() at boot.
-    // For now, env override + EST/EDT localtime_r is correct
-    // for the user's install.
-    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 0);  // America/New_York
-    tzset();
-    time_t t = (time_t)unix_now;
-    struct tm tm_buf;
-    localtime_r(&t, &tm_buf);
-    int hour = tm_buf.tm_hour;
-    int minute = tm_buf.tm_min;
-    int minute_key = hour * 100 + minute;
-    if (minute_key != last_minute) {
-      last_minute = minute_key;
-      int h12 = hour % 12;
-      if (h12 == 0) h12 = 12;
-      const char* ampm = (hour < 12) ? "AM" : "PM";
-      char buf[16];
-      if (this->use_24h_time_) {
-        // 24-hour format: "22:52". No AM/PM suffix, hour is
-        // the raw 0-23 from localtime_r. The minute_key
-        // throttle above already keys on (hour*100+minute)
-        // so we redraw at the same cadence.
-        snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
-      } else {
-        // 12-hour format: "10:52 PM" (the v1.22r style).
-        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
-      }
-      lv_label_set_text(this->title_time_label_, buf);
-      // v1.22e: re-fit the label width to the new text. Without
-      // this, switching from "8 PM" (narrow) to "11:03 PM" (wide)
-      // would either clip or leave dead space. The flex cluster
-      // reflows when the label grows.
-      const lv_font_t* f = lv_obj_get_style_text_font(
-          this->title_time_label_, LV_PART_MAIN);
-      lv_obj_set_width(this->title_time_label_,
-                       button_width_for_text_(buf, f, 4));
+    time_t unix_now = this->time_unix_seconds_ + ((now_ms - this->time_baseline_millis_) / 1000);
+    
+    // FIX: Call it statically on the ESPTime struct, 
+    // which automatically applies the global timezone from ESPHome
+    now = ESPTime::from_epoch_local(unix_now);
+  }
+
+  // 3. Handle completely unavailable time
+  if (!now.is_valid()) {
+    if (last_minute != -1) {
+      lv_label_set_text(this->title_time_label_, "--:--");
+      last_minute = -1; // Reset throttle
     }
     return;
   }
 
-  // v1.22l: prefer HA-derived (with the MAX last_updated
-  // trick to get a fresh baseline), fall back to SNTP. The
-  // state poll re-fetches /api/states every 2 seconds and
-  // calls set_time_from_iso_() with each entity's timestamp;
-  // only the freshest one wins. So the time is at most
-  // ~2s + "the most recent entity update interval" behind
-  // the wall clock, which is what the user asked for.
-  if (this->time_valid_) {
-    uint32_t now_ms = millis();
-    int64_t elapsed_s = (int64_t)(now_ms - this->time_baseline_millis_) / 1000;
-    int64_t unix_now = this->time_unix_seconds_ + elapsed_s;
-    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 0);  // America/New_York
-    tzset();
-    time_t t = (time_t)unix_now;
-    struct tm tm_buf;
-    localtime_r(&t, &tm_buf);
-    int hour = tm_buf.tm_hour;
-    int minute = tm_buf.tm_min;
-    int minute_key = hour * 100 + minute;
-    if (minute_key != last_minute) {
-      last_minute = minute_key;
-      int h12 = hour % 12;
+  // 4. Render to UI (Throttle to only redraw when the minute changes)
+  int minute_key = now.hour * 100 + now.minute;
+  if (minute_key != last_minute) {
+    last_minute = minute_key;
+    char buf[16];
+
+    // HA is the source of truth for formatting: tie `this->use_24h_time_` 
+    // to a parsed HA entity state to control this dynamically.
+    if (this->use_24h_time_) {
+      snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
+    } else {
+      int h12 = now.hour % 12;
       if (h12 == 0) h12 = 12;
-      const char* ampm = (hour < 12) ? "AM" : "PM";
-      char buf[16];
-      if (this->use_24h_time_) {
-        // 24-hour format: "22:52". No AM/PM suffix, hour is
-        // the raw 0-23 from localtime_r. The minute_key
-        // throttle above already keys on (hour*100+minute)
-        // so we redraw at the same cadence.
-        snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
-      } else {
-        // 12-hour format: "10:52 PM" (the v1.22r style).
-        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
-      }
-      lv_label_set_text(this->title_time_label_, buf);
-      const lv_font_t* f = lv_obj_get_style_text_font(
-          this->title_time_label_, LV_PART_MAIN);
-      lv_obj_set_width(this->title_time_label_,
-                       button_width_for_text_(buf, f, 4));
+      snprintf(buf, sizeof(buf), "%d:%02d %s", h12, now.minute, (now.hour < 12) ? "AM" : "PM");
     }
-    return;
-  }
 
-  // HA-derived unavailable. Fall back to SNTP if it's
-  // managed to sync. The v1.22k SNTP-first path is still
-  // there as a safety net - useful if the device is
-  // temporarily disconnected from HA but can still reach
-  // an NTP server.
-  if (this->time_ != nullptr) {
-    auto now = this->time_->now();
-    if (now.is_valid()) {
-      int minute_key = now.hour * 100 + now.minute;
-      if (minute_key != last_minute) {
-        last_minute = minute_key;
-        int h12 = now.hour % 12;
-        if (h12 == 0) h12 = 12;
-        const char* ampm = (now.hour < 12) ? "AM" : "PM";
-        char buf[16];
-        if (this->use_24h_time_) {
-          // v1.22s: 24h path for the SNTP fallback. Same as
-          // the HA-derived path - "22:52" with no AM/PM.
-          snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
-        } else {
-          snprintf(buf, sizeof(buf), "%d:%02d %s", h12, now.minute, ampm);
-        }
-        lv_label_set_text(this->title_time_label_, buf);
-        // v1.22e: re-fit the label width to the new text.
-        const lv_font_t* f = lv_obj_get_style_text_font(
-            this->title_time_label_, LV_PART_MAIN);
-        lv_obj_set_width(this->title_time_label_,
-                         button_width_for_text_(buf, f, 4));
-      }
-      return;
-    }
-  }
+    lv_label_set_text(this->title_time_label_, buf);
 
-  // SNTP unavailable or hasn't synced - fall back to HA-derived.
-  // The baseline is the first entity's last_updated from the
-  // bulk /api/states response. Stale by however long since
-  // the entity last changed, but better than "--:--".
-  if (this->time_valid_) {
-    uint32_t now_ms = millis();
-    int64_t elapsed_s = (int64_t)(now_ms - this->time_baseline_millis_) / 1000;
-    int64_t unix_now = this->time_unix_seconds_ + elapsed_s;
-    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 0);  // America/New_York
-    tzset();
-    time_t t = (time_t)unix_now;
-    struct tm tm_buf;
-    localtime_r(&t, &tm_buf);
-    int hour = tm_buf.tm_hour;
-    int minute = tm_buf.tm_min;
-    int minute_key = hour * 100 + minute;
-    if (minute_key != last_minute) {
-      last_minute = minute_key;
-      int h12 = hour % 12;
-      if (h12 == 0) h12 = 12;
-      const char* ampm = (hour < 12) ? "AM" : "PM";
-      char buf[16];
-      if (this->use_24h_time_) {
-        // 24-hour format: "22:52". No AM/PM suffix, hour is
-        // the raw 0-23 from localtime_r. The minute_key
-        // throttle above already keys on (hour*100+minute)
-        // so we redraw at the same cadence.
-        snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
-      } else {
-        // 12-hour format: "10:52 PM" (the v1.22r style).
-        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, ampm);
-      }
-      lv_label_set_text(this->title_time_label_, buf);
-      const lv_font_t* f = lv_obj_get_style_text_font(
-          this->title_time_label_, LV_PART_MAIN);
-      lv_obj_set_width(this->title_time_label_,
-                       button_width_for_text_(buf, f, 4));
-    }
-    return;
-  }
-
-  // Neither SNTP nor HA-derived available.
-  if (last_minute != -1) {
-    lv_label_set_text(this->title_time_label_, "--:--");
-    last_minute = -1;
+    // Re-fit the label width to the new text
+    const lv_font_t* f = lv_obj_get_style_text_font(this->title_time_label_, LV_PART_MAIN);
+    lv_obj_set_width(this->title_time_label_, button_width_for_text_(buf, f, 4));
   }
 }
 
@@ -2444,7 +2272,8 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // formula below) so its bottom edge is at y=182, well
   // above the card center (y=125). The 270° arc's
   // bottom opening is then entirely in the upper half.
-  lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 12);
+  // lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 12);
+  lv_obj_align(arc, LV_ALIGN_CENTER, 0, 0);
   lv_arc_set_min_value(arc, 0);
   lv_arc_set_max_value(arc, 100);
   lv_arc_set_value(arc, initial_pct);  // From computed state, not hardcoded 50
@@ -2556,7 +2385,7 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // arc-center y=125). The 30px gap is wider than the
   // reference (which had the button snug in the opening)
   // but it keeps the button visually clear of the arc.
-  lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, 0);
   // Disable all internal scrolling on the button. By default lv_obj_create()
   // makes a scrollable object, which means dragging on the button can
   // scroll its contents (the label) around. We want the button to be a
