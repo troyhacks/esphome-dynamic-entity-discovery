@@ -219,7 +219,7 @@ const char* http_status_to_str(HttpStatus s) {
 // build a unique fingerprint even between two builds of the
 // same source.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.24"
+#define FIRMWARE_VERSION "v1.27"
 #endif
 
 const uint32_t HaAutoPanel::ROOM_COLORS_[] = {
@@ -3414,17 +3414,25 @@ void HaAutoPanel::on_aggregate_update_(const std::string& json) {
 //      element so the max is well-defined (and 0 if no
 //      lights are on).
 void HaAutoPanel::build_room_aggregate_template_() {
-  // Build the included_areas variables JSON.
+  // Build the included_areas variables JSON. Each area_id
+  // must be wrapped in double-quotes AND have its `\` and `"`
+  // chars escaped (e.g. "back_room" -> "back_room"). The
+  // previous version pushed the raw chars into vars without
+  // the surrounding quotes, producing invalid JSON like
+  // [dining_room,back_yard,...] (no quotes around values).
+  // HA returns HTTP 400 "Invalid JSON specified" for that.
+  // (Fixed after the v1.27 debug-log dump showed the body.)
   std::string vars = "{\"included_areas\":[";
   bool first = true;
   for (const auto& a : this->discovered_areas_) {
     if (!first) vars += ",";
     first = false;
-    // Escape the area_id for safe JSON inclusion.
+    vars += "\"";
     for (char c : a.area_id) {
       if (c == '\\' || c == '"') vars.push_back('\\');
       vars.push_back(c);
     }
+    vars += "\"";
   }
   vars += "]}";
   this->room_aggregate_variables_ = std::move(vars);

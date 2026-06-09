@@ -239,12 +239,23 @@ class TemplateApi {
     }
     // Build the JSON body:
     //   {"id":N,"type":"render_template","template":"<tmpl>"[,"variables":<vars>]}
-    // Escape \ and " in the template body for valid JSON.
+    // Escape \ " \n \r \t in the template body for valid JSON.
+    // (The template body is usually a multi-line R"DELIM(...)"
+    // raw string, so the unescaped newlines are real - HA
+    // would return HTTP 400 "Invalid JSON specified" without
+    // this. Verified with curl: 1022 bytes / 400, 1043 bytes
+    // / 200.)
     std::string esc;
     esc.reserve(tmpl.size() + 32);
     for (char c : tmpl) {
-      if (c == '\\' || c == '"') esc.push_back('\\');
-      esc.push_back(c);
+      switch (c) {
+        case '\\': esc += "\\\\"; break;
+        case '"':  esc += "\\\""; break;
+        case '\n': esc += "\\n";  break;
+        case '\r': esc += "\\r";  break;
+        case '\t': esc += "\\t";  break;
+        default:   esc.push_back(c); break;
+      }
     }
     char header[64];
     snprintf(header, sizeof(header),
@@ -285,11 +296,21 @@ class TemplateApi {
     }
 
     // Build {"template":"<escaped>"[,"variables":<vars>]}
+    // Escape \ " \n \r \t for valid JSON. (Multi-line
+    // R"DELIM(...)" templates have real newlines that would
+    // otherwise produce "Invalid JSON specified" 400s from
+    // HA.)
     std::string esc;
     esc.reserve(tmpl.size() + 32);
     for (char c : tmpl) {
-      if (c == '\\' || c == '"') esc.push_back('\\');
-      esc.push_back(c);
+      switch (c) {
+        case '\\': esc += "\\\\"; break;
+        case '"':  esc += "\\\""; break;
+        case '\n': esc += "\\n";  break;
+        case '\r': esc += "\\r";  break;
+        case '\t': esc += "\\t";  break;
+        default:   esc.push_back(c); break;
+      }
     }
     std::string body = std::string("{\"template\":\"") + esc + "\"";
     if (!variables_json.empty()) {
