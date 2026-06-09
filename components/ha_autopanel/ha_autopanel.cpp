@@ -1103,6 +1103,24 @@ void HaAutoPanel::start_discovery_() {
   // name, area_id); the WebSocket path fills in state +
   // brightness via the get_states response and the
   // subscribe_events stream.
+  //
+  // v1.27 (Phase 4): BOTH paths above have been replaced by
+  // the per-area aggregate template. fetch_room_aggregates_()
+  // below does a one-shot POST /api/template to populate the
+  // initial state, and the WS render_template subscription
+  // (set up in parse_auth_ok_) keeps it fresh.
+
+  // Build the per-area aggregate template now that we know
+  // the area list. The template body is the Jinja2 we
+  // validated against the live HA in Phase 0.
+  this->build_room_aggregate_template_();
+
+  // One-shot initial fetch of the aggregate. This populates
+  // entities_by_area_ with the actual on/off/brightness
+  // values BEFORE the WS connection opens. The WS push
+  // (which arrives within ~200 ms of auth_ok) will then
+  // update them with the latest snapshot.
+  this->fetch_room_aggregates_();
 
   if (discovered_areas_.empty()) {
     ESP_LOGW(TAG, "No areas discovered from HA - check API token and connectivity");
@@ -3339,21 +3357,215 @@ void HaAutoPanel::on_clock_update_(const std::string& rendered) {
 
 // v1.27 (Phase 4): per-area aggregate JSON handler. Called
 // on loopTask; safe to do the ArduinoJson parse here.
-// For now this is a no-op stub - the real implementation
-// (apply_room_aggregates_) is added in Phase 4. We just
-// log the size so we can confirm the subscription is
-// working on hardware.
 void HaAutoPanel::on_aggregate_update_(const std::string& json) {
-  ESP_LOGD(TAG, "[aggregate] event: %zu bytes (Phase 4 will decode)", json.size());
+  this->apply_room_aggregates_(json);
+}
+
+// v1.27: build the per-area aggregate template body from
+// the discovered_areas_ list. R"DELIM( ... )DELIM" raw
+// string: the Jinja2 is pasted verbatim with no escape
+// sequence hell. The included_areas variable is supplied
+// at render time (in variables_json for the REST call, in
+// the subscribe body for the WS call).
+//
+// The template iterates over areas() (HA's complete area
+// list), filters to those in included_areas, and emits a
+// compact JSON summary per area:
+//
+//   {
+//     "area_id": "kitchen",
+//     "name": "Kitchen",
+//     "on_count": 7,                   // lights on
+//     "max_pct": 50,                   // 0-100, brightest "on" light
+//     "states": {
+//       "light.kitchen_main":  {"s": "on",  "b": 128},
+//       "light.kitchen_cabinet": {"s": "off", "b": 0},
+//       ...
+//     }
+//   }
+//
+// For the user's install (15 areas, 415 entities), the
+// rendered JSON is ~44 KB (4.6x smaller than the legacy
+// 200KB /api/states bulk response).
+//
+// The template uses two non-obvious tricks:
+//   1. `map('int', 0)` on brightness values - the
+//      state_attr() return can be None for entities that
+//      don't have a brightness attribute (binary_sensors,
+//      buttons, etc.). The `| int(0)` filter coerces to
+//      int, defaulting to 0 on None or non-numeric.
+//   2. `+ [0]) | max` - HA's `max` filter errors on an
+//      empty list. The `+ [0]` ensures at least one
+//      element so the max is well-defined (and 0 if no
+//      lights are on).
+void HaAutoPanel::build_room_aggregate_template_() {
+  // Build the included_areas variables JSON.
+  std::string vars = "{\"included_areas\":[";
+  bool first = true;
+  for (const auto& a : this->discovered_areas_) {
+    if (!first) vars += ",";
+    first = false;
+    // Escape the area_id for safe JSON inclusion.
+    for (char c : a.area_id) {
+      if (c == '\\' || c == '"') vars.push_back('\\');
+      vars.push_back(c);
+    }
+  }
+  vars += "]}";
+  this->room_aggregate_variables_ = std::move(vars);
+  this->room_aggregate_template_ = R"DELIM({
+  "rooms": [
+    {% for a in areas() %}
+    {% if a in included_areas %}
+    {
+      "area_id": "{{ a }}",
+      "name": "{{ area_name(a) }}",
+      "on_count": {{ area_entities(a) | select('is_state', 'on') | list | length }},
+      "max_pct": {{ ((area_entities(a) | select('is_state', 'on') | map('state_attr', 'brightness') | map('int', 0) | list) + [0]) | max * 100 // 255 }},
+      "states": {
+        {% for e in area_entities(a) %}
+        {% if states(e) is not none %}
+        "{{ e }}": {"s": "{{ states(e) }}", "b": {{ state_attr(e, 'brightness') | int(0) }}}{% if not loop.last %},{% endif %}
+        {% endif %}
+        {% endfor %}
+      }
+    }{% if not loop.last %},{% endif %}
+    {% endif %}
+    {% endfor %}
+  ]
+})DELIM";
+  ESP_LOGI(TAG, "[aggregate] template built for %zu areas",
+           this->discovered_areas_.size());
+}
+
+// v1.27: one-shot fetch of the per-area aggregate. Called
+// from start_discovery_() after fetch_areas_() and the WS
+// subscription setup, so the initial state is populated
+// before the first WS push arrives (or in case the WS
+// push is delayed). POST /api/template with
+// {"template": ..., "variables": {"included_areas": [...]}}.
+void HaAutoPanel::fetch_room_aggregates_() {
+  if (this->http_request_ == nullptr) {
+    ESP_LOGW(TAG, "[aggregate] http_request_ is null - cannot fetch");
+    return;
+  }
+  if (this->discovered_areas_.empty()) {
+    ESP_LOGW(TAG, "[aggregate] no areas discovered - skipping fetch");
+    return;
+  }
+  if (this->room_aggregate_template_.empty()) {
+    this->build_room_aggregate_template_();
+  }
+  ESP_LOGI(TAG, "[aggregate] fetching %zu areas via /api/template",
+           this->discovered_areas_.size());
+  auto response = this->template_api_.render_with_vars(
+      this->room_aggregate_template_, this->room_aggregate_variables_);
+  if (!response) {
+    ESP_LOGW(TAG, "[aggregate] render failed");
+    return;
+  }
+  ESP_LOGI(TAG, "[aggregate] initial fetch: %zu bytes", response->size());
+  this->apply_room_aggregates_(*response);
+}
+
+// v1.27: parse the aggregate JSON and update
+// room_aggregates_ + entities_by_area_ in place. Shared
+// by the initial fetch and every WS push. The PSRAM-
+// preferring PsramJsonDocument is the same allocator the
+// rest of the .cpp uses; the body is at most ~50 KB so
+// PSRAM is plenty.
+//
+// The parse is intentionally shallow: we only need
+// per-area per-entity {state, brightness} snapshots. The
+// on_count and max_pct fields are currently informational
+// only (logged for debugging) - the actual room-card arc
+// % comes from the individual entity brightness values
+// via compute_room_brightness_pct_().
+void HaAutoPanel::apply_room_aggregates_(const std::string& json) {
+  PsramJsonDocument doc(&s_psram_allocator);
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    ESP_LOGW(TAG, "[aggregate] parse failed: %s", err.c_str());
+    return;
+  }
+  JsonArray rooms = doc["rooms"].as<JsonArray>();
+  if (rooms.isNull()) {
+    ESP_LOGW(TAG, "[aggregate] no 'rooms' array");
+    return;
+  }
+  size_t n_rooms = 0, n_entities = 0;
+  for (JsonObject r : rooms) {
+    const char* aid = r["area_id"] | nullptr;
+    if (aid == nullptr) continue;
+    RoomAggregate& agg = this->room_aggregates_[aid];
+    agg.area_id = aid;
+    if (const char* nm = r["name"] | nullptr) {
+      agg.name = nm;
+    }
+    int on_count = r["on_count"] | 0;
+    int max_pct = r["max_pct"] | 0;
+    ESP_LOGD(TAG, "[aggregate]   %s: %d on, max_pct=%d",
+             aid, on_count, max_pct);
+    agg.entities.clear();
+    JsonObject states = r["states"].as<JsonObject>();
+    if (states.isNull()) {
+      n_rooms++;
+      continue;
+    }
+    for (JsonPair kv : states) {
+      const char* eid_str = kv.key().c_str();
+      if (eid_str == nullptr) continue;
+      RoomAggregate::Entry e;
+      JsonObject s = kv.value().as<JsonObject>();
+      e.state = s["s"] | "";
+      e.brightness = (uint8_t) (s["b"] | 0);
+      e.has_brightness = (s["b"] != nullptr);
+      // intern() the entity_id into the arena; the returned
+      // string_view stays valid for the component's lifetime.
+      std::string_view eid = entity_arena().intern(eid_str);
+      agg.entities[eid] = std::move(e);
+      n_entities++;
+    }
+    n_rooms++;
+  }
+  ESP_LOGD(TAG, "[aggregate] applied %zu rooms, %zu entities",
+           n_rooms, n_entities);
+  this->sync_entities_from_aggregates_();
+}
+
+// v1.27: walk room_aggregates_ and copy each Entry's
+// state/brightness into the corresponding Entity record
+// in entities_by_area_. Then call
+// update_room_card_visual_state_for_area_() for each area
+// so the room cards repaint. Also refreshes the media
+// banner since the media player's state may have changed.
+void HaAutoPanel::sync_entities_from_aggregates_() {
+  for (auto& rkv : this->room_aggregates_) {
+    const std::string& area_id = rkv.first;
+    RoomAggregate& agg = rkv.second;
+    auto bucket_it = this->entities_by_area_.find(area_id);
+    if (bucket_it == this->entities_by_area_.end()) continue;
+    for (auto& e : bucket_it->second) {
+      auto sit = agg.entities.find(e.entity_id);
+      if (sit == agg.entities.end()) continue;
+      e.state = sit->second.state;
+      if (sit->second.has_brightness) {
+        e.brightness = sit->second.brightness;
+        e.has_brightness = true;
+      }
+    }
+    this->update_room_card_visual_state_for_area_(area_id);
+  }
+  this->update_media_banner_();
 }
 
 // v1.27: set up the clock + aggregate render_template
 // subscriptions over the WebSocket. Called from
 // HaWsClient::parse_auth_ok_() right after the auth_ok
-// state transition (before any get_states / state_changed
-// traffic). The TemplateApi allocates fresh ids starting
-// at 100; we store them in clock_sub_id_ / aggregate_sub_id_
-// for logging. Returns true if both subscriptions succeeded.
+// state transition. The TemplateApi allocates fresh ids
+// starting at 100; we store them in clock_sub_id_ /
+// aggregate_sub_id_ for logging. Returns true if both
+// subscriptions succeeded.
 //
 // The clock template uses R"DELIM( ... )DELIM" - no JSON
 // escape, no need to understand strftime flags in C++.
@@ -3386,27 +3598,33 @@ bool HaAutoPanel::setup_render_template_subscriptions_() {
              this->use_24h_time_ ? "yes" : "no");
   }
   // ----- Aggregate -----
-  // The per-area aggregate template is built by
-  // build_room_aggregate_template_() and depends on the
-  // discovered area list. If the areas haven't been
-  // discovered yet (or the template is empty), the
-  // subscription silently no-ops until a future auth_ok.
-  // For now, build a simple "per-entity state" template as
-  // a stub; Phase 4 replaces it with the per-area template.
-  std::string agg_tmpl =
-      R"DELIM({ "rooms": [], "phase": "stub" })DELIM";
-  this->aggregate_sub_id_ = this->template_api_.subscribe(
-      agg_tmpl,
+  // Phase 4: use the per-area aggregate template built by
+  // build_room_aggregate_template_(). The variables
+  // (included_areas) are passed in the subscribe body so
+  // HA snapshots them at subscribe time. If the area
+  // list is empty (areas haven't been discovered yet),
+  // we skip the subscription; the next auth_ok will retry.
+  if (this->discovered_areas_.empty()) {
+    ESP_LOGW(TAG, "[aggregate] no areas yet - skipping subscribe");
+    this->aggregate_sub_id_ = 0;
+    return this->clock_sub_id_ != 0;
+  }
+  if (this->room_aggregate_template_.empty()) {
+    this->build_room_aggregate_template_();
+  }
+  this->aggregate_sub_id_ = this->template_api_.subscribe_with_vars(
+      this->room_aggregate_template_, this->room_aggregate_variables_,
       [this](const std::string& rendered) {
         if (this->ws_client_) {
           this->ws_client_->push_aggregate_event_(rendered.c_str());
         }
       });
   if (this->aggregate_sub_id_ == 0) {
-    ESP_LOGW(TAG, "[aggregate] subscribe failed (Phase 4 stub)");
+    ESP_LOGW(TAG, "[aggregate] subscribe failed");
   } else {
-    ESP_LOGI(TAG, "[aggregate] subscribed id=%u (Phase 4 stub)",
-             (unsigned) this->aggregate_sub_id_);
+    ESP_LOGI(TAG, "[aggregate] subscribed id=%u (%zu areas)",
+             (unsigned) this->aggregate_sub_id_,
+             this->discovered_areas_.size());
   }
   return this->clock_sub_id_ != 0;
 }

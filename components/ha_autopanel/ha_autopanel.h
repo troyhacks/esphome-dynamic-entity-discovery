@@ -233,6 +233,38 @@ struct RoomCard {
   uint32_t color;
 };
 
+// v1.27: per-room aggregate produced by HA's render_template
+// subscription. Populated by apply_room_aggregates_() from
+// the JSON HA pushes when any of the panel's entities
+// changes state (or on the initial one-shot fetch). The
+// panel reads from room_aggregates_ during sync to update
+// the Entity records in entities_by_area_ in place, so the
+// room cards pick up the new state without a full re-render.
+//
+// We key entities by string_view into the entity_arena()
+// (same trick as Entity::entity_id) so the per-entity
+// entries are just 16 B per entity. For 419 entities the
+// aggregate is ~12 KB on the heap - much smaller than the
+// 200KB+ get_states response it replaces.
+struct RoomAggregate {
+  std::string area_id;
+  std::string name;
+  // Per-entity state snapshot. Populated from the
+  // aggregate's "states" map. The Entry holds a copy of
+  // the state string (it's mutable at runtime) and the
+  // raw brightness 0-255.
+  struct Entry {
+    std::string state;
+    uint8_t brightness{0};
+    bool has_brightness{false};
+  };
+  // string_view into entity_arena() intern'd entity_ids.
+  // std::less<> (transparent) enables heterogeneous lookup
+  // against Entity::entity_id without allocating a
+  // std::string key.
+  std::map<std::string_view, Entry, std::less<>> entities;
+};
+
 // Per-arc registry entry - replaces heap-allocated ArcCallbackData.
 // Lives for the component lifetime; index is stable per render but the
 // vector is cleared at the top of each create_*_ call that appends to it.
@@ -429,6 +461,28 @@ class HaAutoPanel : public Component {
   // std::string payloads share a single arena container.
   std::map<std::string, std::vector<Entity, PsramStlAllocator<Entity>>> entities_by_area_;
   std::vector<RoomCard> room_cards_;
+
+  // v1.27: per-room aggregate from the render_template
+  // subscription. Keyed by area_id (the same key as
+  // entities_by_area_). The aggregate holds per-entity
+  // state snapshots; sync_entities_from_aggregates_()
+  // copies them back into Entity records and repaints the
+  // room cards.
+  std::map<std::string, RoomAggregate, std::less<>> room_aggregates_;
+
+  // v1.27: the per-area aggregate template body. Built
+  // once by build_room_aggregate_template_() after
+  // fetch_areas_() populates the area list. R"DELIM(...)
+  // raw string syntax means the Jinja2 template is pasted
+  // verbatim with no escape sequence hell.
+  std::string room_aggregate_template_;
+
+  // v1.27: render-time variables for the per-area
+  // aggregate template. {"included_areas": ["kitchen",
+  // "living_room", ...]} - a JSON array of the
+  // post-include/exclude-filter area ids from
+  // discovered_areas_.
+  std::string room_aggregate_variables_;
 
   // UI state - stored for navigation between room grid and entity detail
   lv_obj_t* main_container_{nullptr};
@@ -1149,6 +1203,36 @@ class HaAutoPanel : public Component {
   // log them in dump_config.
   uint32_t clock_sub_id_{0};
   uint32_t aggregate_sub_id_{0};
+
+  // v1.27: build the per-area aggregate template body
+  // (room_aggregate_template_) and the included_areas
+  // variables JSON (room_aggregate_variables_) from the
+  // discovered_areas_ list. Called once after fetch_areas_()
+  // populates the area list. Idempotent.
+  void build_room_aggregate_template_();
+
+  // v1.27: one-shot fetch of the per-area aggregate via
+  // POST /api/template with the included_areas variable.
+  // Called from start_discovery_() after fetch_areas_() so
+  // the panel's initial state is populated before the WS
+  // subscription's first event arrives (or in case the WS
+  // subscription is delayed by a few hundred ms).
+  void fetch_room_aggregates_();
+
+  // v1.27: parse the aggregate JSON and update
+  // room_aggregates_ + entities_by_area_ in place.
+  // Shared by the initial fetch and every WS push.
+  // No-op on parse error.
+  void apply_room_aggregates_(const std::string& json);
+
+  // v1.27: walk room_aggregates_ and copy each Entry's
+  // state/brightness into the corresponding Entity record
+  // in entities_by_area_. Then call
+  // update_room_card_visual_state_for_area_() for each
+  // changed area so the room cards repaint. Also calls
+  // update_media_banner_() since the media state can
+  // change too.
+  void sync_entities_from_aggregates_();
 
   // Panel state machine
   void set_panel_state_(PanelState new_state);

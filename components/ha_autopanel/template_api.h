@@ -127,51 +127,24 @@ class TemplateApi {
   // loopTask-drained queue (same pattern as StateEvent).
   uint32_t subscribe(const std::string& tmpl,
                      std::function<void(const std::string&)> cb) {
-    if (cb == nullptr) {
-      ESP_LOGW(HA_TPL_TAG, "subscribe: cb is null");
-      return 0;
-    }
-    std::function<bool(const std::string&)> sender;
-    {
-      std::lock_guard<std::mutex> lk(write_mu_);
-      sender = this->ws_sender_;
-    }
-    if (!sender) {
-      ESP_LOGW(HA_TPL_TAG, "subscribe: ws_sender not set (WS not ready)");
-      return 0;
-    }
-    uint32_t id = this->next_sub_id_.fetch_add(1, std::memory_order_relaxed);
-    if (id == 0) {
-      // first id is 1 - never 0 (we use 0 as failure)
-      id = this->next_sub_id_.fetch_add(1, std::memory_order_relaxed);
-    }
-    // Register the callback BEFORE sending so the parse_task
-    // can dispatch immediately on the first event.
-    {
-      std::unique_lock<std::shared_mutex> lk(subs_mu_);
-      this->subs_[id] = std::move(cb);
-    }
-    // Build the JSON body: {"id":N,"type":"render_template","template":"<tmpl>"}
-    // Escape \ and " in the template body for valid JSON.
-    std::string esc;
-    esc.reserve(tmpl.size() + 32);
-    for (char c : tmpl) {
-      if (c == '\\' || c == '"') esc.push_back('\\');
-      esc.push_back(c);
-    }
-    char header[64];
-    snprintf(header, sizeof(header),
-             "{\"id\":%u,\"type\":\"render_template\",\"template\":\"", (unsigned) id);
-    std::string body = header + esc + "\"}";
-    if (!sender(body)) {
-      ESP_LOGW(HA_TPL_TAG, "subscribe id=%u: send failed", (unsigned) id);
-      std::unique_lock<std::shared_mutex> lk(subs_mu_);
-      this->subs_.erase(id);
-      return 0;
-    }
-    ESP_LOGI(HA_TPL_TAG, "subscribed id=%u (%zu bytes)",
-             (unsigned) id, body.size());
-    return id;
+    return this->subscribe_impl_(tmpl, "", std::move(cb));
+  }
+
+  // v1.27: subscribe with render-time variables. The variables
+  // argument is a pre-serialized JSON object string (e.g.
+  // `{"included_areas": ["kitchen"]}`). The subscribe body
+  // becomes:
+  //   {"id":N,"type":"render_template","template":"...",
+  //    "variables":<vars>}
+  // HA snapshots the variables at subscribe time. State
+  // changes to any entity referenced in the template trigger
+  // re-evaluation. Useful for the per-area aggregate: pass
+  // the panel's area list as `included_areas` so the
+  // template only iterates over our areas.
+  uint32_t subscribe_with_vars(const std::string& tmpl,
+                               const std::string& variables_json,
+                               std::function<void(const std::string&)> cb) {
+    return this->subscribe_impl_(tmpl, variables_json, std::move(cb));
   }
 
   // Cancel a subscription. Sends
@@ -222,6 +195,66 @@ class TemplateApi {
   }
 
  private:
+  // Shared implementation for subscribe() and
+  // subscribe_with_vars(). variables_json is "" for plain
+  // subscribe; otherwise it's a JSON object string to
+  // include in the body.
+  uint32_t subscribe_impl_(const std::string& tmpl,
+                           const std::string& variables_json,
+                           std::function<void(const std::string&)> cb) {
+    if (cb == nullptr) {
+      ESP_LOGW(HA_TPL_TAG, "subscribe: cb is null");
+      return 0;
+    }
+    std::function<bool(const std::string&)> sender;
+    {
+      std::lock_guard<std::mutex> lk(write_mu_);
+      sender = this->ws_sender_;
+    }
+    if (!sender) {
+      ESP_LOGW(HA_TPL_TAG, "subscribe: ws_sender not set (WS not ready)");
+      return 0;
+    }
+    uint32_t id = this->next_sub_id_.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) {
+      id = this->next_sub_id_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Register the callback BEFORE sending so the parse_task
+    // can dispatch immediately on the first event.
+    {
+      std::unique_lock<std::shared_mutex> lk(subs_mu_);
+      this->subs_[id] = std::move(cb);
+    }
+    // Build the JSON body:
+    //   {"id":N,"type":"render_template","template":"<tmpl>"[,"variables":<vars>]}
+    // Escape \ and " in the template body for valid JSON.
+    std::string esc;
+    esc.reserve(tmpl.size() + 32);
+    for (char c : tmpl) {
+      if (c == '\\' || c == '"') esc.push_back('\\');
+      esc.push_back(c);
+    }
+    char header[64];
+    snprintf(header, sizeof(header),
+             "{\"id\":%u,\"type\":\"render_template\",\"template\":\"", (unsigned) id);
+    std::string body = header + esc + "\"";
+    if (!variables_json.empty()) {
+      body += ",\"variables\":";
+      body += variables_json;
+    }
+    body += "}";
+    if (!sender(body)) {
+      ESP_LOGW(HA_TPL_TAG, "subscribe id=%u: send failed", (unsigned) id);
+      std::unique_lock<std::shared_mutex> lk(subs_mu_);
+      this->subs_.erase(id);
+      return 0;
+    }
+    ESP_LOGI(HA_TPL_TAG, "subscribed id=%u (%zu bytes)",
+             (unsigned) id, body.size());
+    return id;
+  }
+
+  // One-shot POST to {base}/api/template. The variables_json
   // One-shot POST to {base}/api/template. The variables_json
   // is "" for a plain render, or a JSON object for render_with_vars.
   std::optional<std::string> do_post_(const std::string& tmpl,

@@ -908,17 +908,21 @@ inline void HaWsClient::parse_auth_ok_() {
   this->auth_sent_ms_.store(0, std::memory_order_release);
   this->subscribe_sent_ms_.store((uint32_t) (esp_timer_get_time() / 1000),
                                 std::memory_order_release);
-  // v1.27: set up the clock + aggregate render_template
-  // subscriptions BEFORE the (heavy) get_states round trip.
-  // The subscriptions only cost a small WS message; the
-  // first event arrives within a few hundred ms. Doing
-  // this before get_states means the clock starts
-  // updating even if get_states is slow.
+  // v1.27 (Phase 4): the clock + aggregate render_template
+  // subscriptions replace both the get_states round trip
+  // AND the state_changed subscription. No more 200KB bulk
+  // parse, no more PSRAM pre-alloc pool. The aggregate
+  // subscription's first event arrives within a few hundred
+  // ms; the panel's entities are populated by the one-shot
+  // fetch_room_aggregates_() in start_discovery_() before
+  // the WS even opens, so the UI is never empty.
   if (this->parent_ != nullptr) {
     this->parent_->setup_render_template_subscriptions_();
   }
-  this->send_get_states_();
-  this->ws_state_.store(HaWsState::GETTING_STATES, std::memory_order_release);
+  // Mark the panel READY now - the entity data is already
+  // in entities_by_area_ (from fetch_room_aggregates_()),
+  // and the WS push will keep it fresh.
+  this->ws_state_.store(HaWsState::READY, std::memory_order_release);
 }
 
 inline void HaWsClient::parse_auth_invalid_(const char* json, size_t len) {
@@ -929,74 +933,20 @@ inline void HaWsClient::parse_auth_invalid_(const char* json, size_t len) {
   }
 }
 
+// v1.27 (Phase 4): the get_states round trip is gone. The
+// per-area aggregate template (subscribed via WS
+// render_template) replaces the 200KB bulk parse. This
+// function is kept as a no-op stub because it's still
+// wired into the parse_task dispatch (Phase 4.7 will
+// delete it entirely). Any "get_states" result that
+// somehow arrives (e.g. stale code) is ignored.
 inline void HaWsClient::parse_get_states_result_(const char* json, size_t len) {
-  if (json == nullptr || len == 0) {
-    ESP_LOGW(HA_WS_TAG, "get_states result empty");
-    return;
-  }
-  ESP_LOGI(HA_WS_TAG, "get_states result: %u bytes, parsing...", (unsigned) len);
-  uint32_t t0 = (uint32_t) (esp_timer_get_time() / 1000);
-
-  // v1.24: use the pre-allocated 1MB PSRAM pool. No heap
-  // lock contention with the SDIO RX task during the
-  // parse. Reset the pool position before each parse so
-  // the same buffer is reused.
-  this->psram_pool_.reset_();
-  ArduinoJson::JsonDocument doc(&this->psram_pool_);
-
-  {
-    HaWsTwdtGuard g;  // unsubscribe from TWDT for the long parse
-    // ChunkedJsonReader yields to the scheduler every 4 KB
-    // during the parse. This gives the SDIO RX task on
-    // core 0 a chance to drain its buffer, preventing the
-    // sdio_drv.c:1260 copy_payload assert that fires when
-    // the parse_task hogs the core for >1s with a 200 KB+
-    // get_states response.
-    ChunkedJsonReader reader(json, len);
-    DeserializationError err = deserializeJson(doc, reader);
-    if (err) {
-      ESP_LOGE(HA_WS_TAG, "get_states parse failed: %s", err.c_str());
-      return;
-    }
-  }
-  esp_task_wdt_reset();
-
-  JsonArray results = doc["result"].as<JsonArray>();
-  if (results.isNull()) {
-    ESP_LOGE(HA_WS_TAG, "get_states result: no 'result' field");
-    return;
-  }
-  uint32_t matched = 0;
-  for (JsonObject entry : results) {
-    const char* eid = entry["entity_id"];
-    if (eid == nullptr) continue;
-    if (this->our_entity_ids_.find(eid) == this->our_entity_ids_.end()) continue;
-    const char* st = entry["state"] | "";
-    int brightness = -1;
-    bool has_brightness = false;
-    JsonObject attrs = entry["attributes"].as<JsonObject>();
-    if (!attrs.isNull()) {
-      JsonVariant bv = attrs["brightness"];
-      if (!bv.isNull()) {
-        brightness = bv.as<int>();
-        if (brightness < 0) brightness = 0;
-        if (brightness > 255) brightness = 255;
-        has_brightness = true;
-      }
-    }
-    this->push_state_event_(eid, st, brightness, has_brightness);
-    matched++;
-  }
-  uint32_t dt = (uint32_t) (esp_timer_get_time() / 1000) - t0;
-  ESP_LOGI(HA_WS_TAG, "get_states: matched %u of %zu entities, %u ms",
-           (unsigned) matched, this->our_entity_ids_.size(), (unsigned) dt);
-
-  this->initial_states_received_.store(true, std::memory_order_release);
-  this->send_subscribe_events_();
-  this->ws_state_.store(HaWsState::READY, std::memory_order_release);
-  this->subscribe_sent_ms_.store((uint32_t) (esp_timer_get_time() / 1000),
-                                std::memory_order_release);
+  ESP_LOGW(HA_WS_TAG, "parse_get_states_result_ called (%u bytes) - "
+                       "should be dead code in v1.27. Ignoring.",
+           (unsigned) len);
+  (void) json; (void) len;
 }
+
 
 inline void HaWsClient::parse_event_message_(const char* json, size_t len) {
   if (json == nullptr || len == 0) return;
