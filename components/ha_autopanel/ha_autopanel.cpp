@@ -347,9 +347,8 @@ void HaAutoPanel::setup() {
       // what the build was compiled with. Format:
       //   "HA AutoPanel v1.22e"
       // (FIRMWARE_VERSION is the bare "v1.22e" form.)
-      char splash_buf[64];
-      snprintf(splash_buf, sizeof(splash_buf), "HA AutoPanel %s", FIRMWARE_VERSION);
-      lv_label_set_text(this->splash_label_, splash_buf);
+      std::string splash_text = std::string("HA AutoPanel ") + FIRMWARE_VERSION;
+      set_label_text_if_changed(this->splash_label_, splash_text);
       // Pure red (0xFF0000) per the spec. Default font is fine here —
       // it's larger and bolder than the title-bar label, which is what we
       // want for a centered splash. If you want a specific face/size, set
@@ -2997,7 +2996,7 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
     lv_obj_set_style_arc_width(arc, 6, LV_PART_INDICATOR);
 
     lv_obj_t* pct_label = lv_label_create(control);
-    lv_label_set_text_fmt(pct_label, "%d%%", initial_pct);
+    set_label_text_if_changed(pct_label, std::to_string(initial_pct) + "%");
     lv_obj_set_style_text_color(pct_label, lv_color_hex(0xFFFFFF), 0);
     // v1.14: shifted from -100 to -150 to pair with the new
     // arc position (-250). Together they form a coherent
@@ -3019,7 +3018,13 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
       size_t idx = (size_t)(intptr_t)lv_obj_get_user_data(arc);
       if (s_instance != nullptr && idx < s_instance->arc_records_.size()) {
         lv_obj_t* label = s_instance->arc_records_[idx].pct_label;
-        if (label != nullptr) lv_label_set_text_fmt(label, "%d%%", value);
+        if (label != nullptr) {
+          // v1.27: use set_label_text_if_changed so dragging
+          // the arc to the same value (which fires at 60+ Hz
+          // on the ESP32-P4) doesn't churn LVGL's label cache.
+          // The early-out is a 1-line no-op when text is unchanged.
+          set_label_text_if_changed(label, std::to_string(value) + "%");
+        }
       }
     }, LV_EVENT_VALUE_CHANGED, nullptr);
 
@@ -5739,10 +5744,13 @@ void HaAutoPanel::build_debug_panel_content_() {
     lv_obj_del(lv_obj_get_child(this->debug_panel_, i - 1));
   }
 
-  // Helper: create a small key:value label pair. Returns the value
-  // label so the caller can update it in place (we rebuild every
-  // show so this is just for clarity).
-  auto add_kv = [&](const char* key, const char* value) {
+  // Helper: create a small key:value label pair. v1.27 takes
+  // const std::string& for the value (was const char*) so
+  // callers can pass std::to_string(...) / formatted
+  // std::string without an intermediate char buf. The
+  // label is set via set_label_text_if_changed (uniform with
+  // the rest of the panel's label updates).
+  auto add_kv = [&](const char* key, const std::string& value) {
     lv_obj_t* row = lv_obj_create(this->debug_panel_);
     lv_obj_set_size(row, lv_pct(100), 22);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
@@ -5762,7 +5770,7 @@ void HaAutoPanel::build_debug_panel_content_() {
     lv_obj_set_pos(k, 0, 2);
 
     lv_obj_t* v = lv_label_create(row);
-    lv_label_set_text(v, value);
+    set_label_text_if_changed(v, value);
     lv_obj_set_style_text_color(v, lv_color_hex(0xe5e7eb), 0);
     lv_obj_set_width(v, 800);
     lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_LEFT, 0);
@@ -5828,46 +5836,49 @@ void HaAutoPanel::build_debug_panel_content_() {
     case PanelState::CONNECTING:     state_str = "Connecting..."; break;
     case PanelState::READY:          state_str = "Connected"; break;
   }
-  add_kv("Status", state_str);
-  char entity_count[32];
-  snprintf(entity_count, sizeof(entity_count), "%d entities",
-           (int) room_cards_.size());
-  add_kv("Rooms shown", entity_count);
-  add_kv("Home", this->home_name_.empty() ? "—" : this->home_name_.c_str());
+  add_kv("Status", std::string(state_str));
+  add_kv("Rooms shown", std::to_string((int) room_cards_.size()) + " entities");
+  add_kv("Home", this->home_name_.empty() ? std::string("—") : this->home_name_);
 
   // --- Customizations section ---
   add_header("CUSTOMIZATIONS");
-  char hidden_buf[32];
-  snprintf(hidden_buf, sizeof(hidden_buf), "%u rooms, %u entities",
-           (unsigned) this->customizations_.hidden_rooms.size(),
-           (unsigned) this->customizations_.hidden_entities.size());
-  add_kv("Hidden", hidden_buf);
-  snprintf(hidden_buf, sizeof(hidden_buf), "%u entries",
-           (unsigned) this->customizations_.room_order.size());
-  add_kv("Room order", hidden_buf);
+  add_kv("Hidden", std::to_string((unsigned) this->customizations_.hidden_rooms.size())
+                  + " rooms, "
+                  + std::to_string((unsigned) this->customizations_.hidden_entities.size())
+                  + " entities");
+  add_kv("Room order", std::to_string((unsigned) this->customizations_.room_order.size())
+                      + " entries");
 
   // --- Date & Time section ---
   add_header("DATE & TIME");
   if (this->time_ != nullptr) {
     auto now = this->time_->now();
     if (now.is_valid()) {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02d  %d:%02d:%02d",
-               now.year, now.month, now.day_of_month,
-               now.hour, now.minute, now.second);
-      add_kv("Local", buf);
-      const char* synced = "yes";
-      add_kv("NTP synced", synced);
+      // v1.27: std::to_string for the integers; manually pad
+      // to 2 digits with std::string since to_string doesn't
+      // honor width.
+      auto pad2 = [](int v) {
+        std::string s = std::to_string(v);
+        if (s.size() < 2) s = "0" + s;
+        return s;
+      };
+      std::string local_str = std::to_string(now.year) + "-"
+                            + pad2(now.month) + "-"
+                            + pad2(now.day_of_month) + "  "
+                            + std::to_string(now.hour) + ":"
+                            + pad2(now.minute) + ":"
+                            + pad2(now.second);
+      add_kv("Local", local_str);
+      add_kv("NTP synced", std::string("yes"));
     } else {
-      add_kv("Local", "--:--:-- (syncing)");
+      add_kv("Local", std::string("--:--:-- (syncing)"));
     }
   } else {
-    add_kv("Local", "(no time component)");
+    add_kv("Local", std::string("(no time component)"));
   }
 
   // --- Device section (heap / PSRAM / flash / uptime / version) ---
   add_header("DEVICE");
-  char buf[64];
   size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   size_t largest_heap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -5875,17 +5886,19 @@ void HaAutoPanel::build_debug_panel_content_() {
   // The user asked specifically for the "maximum allocated block" for
   // both internal RAM and PSRAM (2026-06-03) - it's the most
   // useful number when diagnosing fragmentation.
-  snprintf(buf, sizeof(buf), "%u KB free, largest %u KB",
-           (unsigned)(free_heap / 1024), (unsigned)(largest_heap / 1024));
-  add_kv("Internal RAM", buf);
+  add_kv("Internal RAM", std::to_string((unsigned)(free_heap / 1024))
+                       + " KB free, largest "
+                       + std::to_string((unsigned)(largest_heap / 1024))
+                       + " KB");
   // PSRAM mode (Octal on the ESP32-P4's default PSRAM config) is
   // hardcoded for now - the runtime API to query the mode isn't
   // portable across ESP-IDF versions. If the user changes the
   // psram: config in YAML, this label may be wrong; safe enough for
   // a debug surface.
-  snprintf(buf, sizeof(buf), "%u KB free, largest %u KB (Octal)",
-           (unsigned)(free_psram / 1024), (unsigned)(largest_psram / 1024));
-  add_kv("PSRAM", buf);
+  add_kv("PSRAM", std::to_string((unsigned)(free_psram / 1024))
+                + " KB free, largest "
+                + std::to_string((unsigned)(largest_psram / 1024))
+                + " KB (Octal)");
   // Flash: just report the chip size (from the boot log it is 16 MB
   // on the Crowpanel 7"; querying it at runtime would call
   // esp_flash_get_chip_size which is in a different header depending
@@ -5893,17 +5906,17 @@ void HaAutoPanel::build_debug_panel_content_() {
   // that doesn't change at runtime). The flash mode (QIO / QOUT /
   // etc.) is similarly build-time - see sdkconfig. Hardcoding to
   // 16MB/QIO for now; if the user changes board they can tweak.
-  add_kv("Flash", "16 MB, QIO");
+  add_kv("Flash", std::string("16 MB, QIO"));
   // Uptime - millis() wraps at ~49 days, format the wrap day too.
   uint32_t ms = millis();
   uint32_t secs = ms / 1000;
   uint32_t days = secs / 86400;
   uint32_t hours = (secs % 86400) / 3600;
   uint32_t mins = (secs % 3600) / 60;
-  snprintf(buf, sizeof(buf), "%ud %uh %um", (unsigned) days,
-           (unsigned) hours, (unsigned) mins);
-  add_kv("Uptime", buf);
-  add_kv("ESPHome", "2026.4.5");  // pinned in the yaml
+  add_kv("Uptime", std::to_string((unsigned) days) + "d "
+                     + std::to_string((unsigned) hours) + "h "
+                     + std::to_string((unsigned) mins) + "m");
+  add_kv("ESPHome", std::string("2026.4.5"));  // pinned in the yaml
   // Last reset reason. Useful for diagnosing crash loops.
   esp_reset_reason_t reason = esp_reset_reason();
   const char* rr_str = "?";
@@ -5920,7 +5933,7 @@ void HaAutoPanel::build_debug_panel_content_() {
     case ESP_RST_SDIO:      rr_str = "SDIO"; break;
     default: rr_str = "Unknown"; break;
   }
-  add_kv("Last reset", rr_str);
+  add_kv("Last reset", std::string(rr_str));
 
   // --- Actions section ---
   add_header("ACTIONS");
