@@ -812,18 +812,30 @@ void HaAutoPanel::fetch_weather_() {
     return;
   }
 
-  // R"DELIM( ... )DELIM" raw string: paste Jinja2 verbatim,
-  // no escape sequence hell. The entity_id is interpolated
-  // from the yaml knob (default "weather.forecast_home")
-  // so users with a different weather provider don't have
-  // to edit the C++. The concatenation (no whitespace) gives
-  // exactly "Partly Cloudy 19°C".
+  // v1.27: build the Jinja2 template. The entity_id is
+  // interpolated from the yaml knob (default
+  // "weather.forecast_home") so users with a different
+  // weather provider don't have to edit the C++.
+  //
+  // We use regular C++ string literals (not R"DELIM(...)"
+  // raw strings) here because the template has to be
+  // concatenated with the entity_id variable. Raw strings
+  // do NOT recognize C++ operators like + or variable
+  // names like `entity` between the open R"DELIM(" and
+  // close )DELIM" - everything between them is literal
+  // text, INCLUDING the `+ entity +` lines. The previous
+  // multi-line raw-string + variable + raw-string pattern
+  // was a no-op: the device was sending the literal C++
+  // source as the template body, and HA was returning 400
+  // for the unparseable body. Using regular literals with
+  // \" escapes works because each `+` is now a real C++
+  // concatenation operator.
   std::string entity = this->weather_entity_id_;
   std::string tmpl =
-      R"DELIM({{ state_translated(')" + entity +
-      R"DELIM(') | title }} {{ state_attr(')" + entity +
-      R"DELIM(', 'temperature') | round | int }}{{ state_attr(')" + entity +
-      R"DELIM(', 'temperature_unit') }})DELIM";
+      std::string("{{ state_translated('") + entity +
+      "') | title }} {{ state_attr('" + entity +
+      "', 'temperature') | round | int }}{{ state_attr('" + entity +
+      "', 'temperature_unit') }}";
 
   ESP_LOGI(TAG, "[weather] fetching %s via /api/template",
            this->weather_entity_id_.c_str());
@@ -3943,7 +3955,21 @@ void HaAutoPanel::probe_authorization_() {
   ESP_LOGI(TAG, "Probing HA authorization (5s timeout)...");
   this->auth_probe_pending_ = true;
   this->auth_probe_started_ms_ = millis();
-  this->set_panel_state_(PanelState::CONNECTING);
+  // v1.27: only show the "Fetching rooms" status screen if
+  // the panel isn't already in READY (rooms drawn). The
+  // first probe call (right after WiFi connects) usually
+  // races with start_discovery_(), which also sets
+  // CONNECTING. Either way the screen is the same, so this
+  // is a no-op on first boot. The auth-probe RETRY
+  // (after a 5s timeout) is the case the user noticed:
+  // rooms were already drawn (READY), the probe timed out,
+  // and the retry was about to show "Fetching rooms"
+  // again. We skip that: the rooms stay visible, the
+  // probe runs in the background, and only switches to
+  // READY or NOT_AUTHORIZED when it resolves.
+  if (this->state_ != PanelState::READY) {
+    this->set_panel_state_(PanelState::CONNECTING);
+  }
 
   // Build the probe: homeassistant.update_entity on sun.sun
   // We do this through the global api server's send_homeassistant_action.
@@ -4089,10 +4115,18 @@ void HaAutoPanel::loop() {
         ESP_LOGW(TAG, "Auth probe timed out; retrying (%d left) in %ums",
                  this->auth_probe_retries_left_,
                  (unsigned) AUTH_PROBE_RETRY_DELAY_MS);
-        // Reset the CONNECTING state so the user sees
-        // something happening (the status_screen_ will
-        // show "retrying auth probe" briefly).
-        this->set_panel_state_(PanelState::CONNECTING);
+        // v1.27: don't show the "Fetching rooms" popup
+        // during a retry if the rooms are already drawn
+        // (state == READY). The probe runs in the
+        // background; the rooms stay visible. set_panel_state_
+        // is only called on the transition to CONNECTING,
+        // and we skip the transition if we're already in
+        // READY. On success/failure of the retry the state
+        // changes via on_auth_probe_response_() or
+        // NOT_AUTHORIZED.
+        if (this->state_ != PanelState::READY) {
+          this->set_panel_state_(PanelState::CONNECTING);
+        }
       } else {
         ESP_LOGW(TAG, "Auth probe timed out after %d retries; giving up",
                  AUTH_PROBE_MAX_RETRIES);
@@ -4655,6 +4689,31 @@ void HaAutoPanel::boot_from_storage_() {
     // No file - first boot. Keep YAML defaults and prompt the user
     // to set up via the web UI.
     ESP_LOGI(TAG, "No saved config; first boot");
+    // v1.27: if WiFi isn't connected yet (and the AP fallback
+    // isn't running), DON'T show SETUP_REQUIRED yet. The user's
+    // WiFi might still be trying to connect (5+ seconds is
+    // normal on first boot with multiple BSSIDs). Showing
+    // "WiFi not connected. Please check your WiFi configuration"
+    // is misleading when WiFi is actively retrying. Stay in
+    // BOOTING (splash up) until either:
+    //   - WiFi connects: trigger_discovery runs, fetches areas,
+    //     and SETUP_REQUIRED is shown then (with the panel's IP
+    //     so the user can reach the setup form).
+    //   - AP fallback activates: SETUP_REQUIRED is shown then
+    //     (with AP credentials so the user can connect to the
+    //     panel's AP and reach the setup form).
+    wifi::WiFiComponent* wifi = wifi::global_wifi_component;
+    if (wifi != nullptr && !wifi->is_connected() &&
+        !(wifi->has_ap() && wifi->is_ap_active())) {
+      ESP_LOGI(TAG, "No saved config + WiFi not connected yet; "
+                     "deferring SETUP_REQUIRED until WiFi resolves");
+      // State stays BOOTING; splash stays up. WiFi on_connect
+      // lambda (in the YAML) will call trigger_discovery,
+      // which will fall through to SETUP_REQUIRED via
+      // start_discovery_()'s NOT_AUTHORIZED path if there's
+      // no network, or show rooms if there is.
+      return;
+    }
     this->set_panel_state_(PanelState::SETUP_REQUIRED);
     return;
   }
