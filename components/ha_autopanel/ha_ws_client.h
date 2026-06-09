@@ -663,6 +663,16 @@ inline void HaWsClient::on_ws_data_chunk_(const esp_websocket_event_data_t* ev) 
       return;
     }
     this->inflight_buf_[this->inflight_len_] = '\0';
+    // DEBUG: log every complete WS message to see what's arriving
+    if (this->inflight_len_ < 256) {
+      ESP_LOGI(HA_WS_TAG, "RX msg (%zu bytes): %.*s",
+               this->inflight_len_,
+               (int) this->inflight_len_,
+               this->inflight_buf_);
+    } else {
+      ESP_LOGI(HA_WS_TAG, "RX msg (%zu bytes): %.*s... [truncated]",
+               this->inflight_len_, 100, this->inflight_buf_);
+    }
     RawWsMessage* msg = this->raw_pool_.allocate();
     if (msg == nullptr) {
       this->events_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -851,27 +861,73 @@ inline void HaWsClient::parse_event_message_(const char* json, size_t len) {
 
   ArduinoJson::JsonDocument doc(new HaWsPsramAllocator());
 
-  // v1.27 (Phase 4.7): no HaWsTwdtGuard needed. The
-  // per-area aggregate event payload is ~50 KB max, which
-  // ArduinoJson parses in ~50 ms - well under the 5 s
-  // TWDT window. The HaWsTwdtGuard was for the 200 KB
-  // get_states parse that could take >1 s.
   DeserializationError err = deserializeJson(doc, json, len);
-  if (err) return;
+  if (err) {
+    ESP_LOGW(HA_WS_TAG, "event parse failed (%zu bytes): %s",
+             len, err.c_str());
+    return;
+  }
 
   const char* type = doc["type"] | "";
-  if (strcmp(type, "event") != 0) return;
+  if (strcmp(type, "event") != 0) {
+    ESP_LOGD(HA_WS_TAG, "non-event msg: type=%s", type);
+    return;
+  }
   uint32_t sub_id = doc["id"] | 0;
   JsonObject ev = doc["event"].as<JsonObject>();
-  if (ev.isNull()) return;
+  if (ev.isNull()) {
+    ESP_LOGW(HA_WS_TAG, "event has no 'event' object");
+    return;
+  }
   if (ev["error"].is<const char*>()) {
     ESP_LOGW(HA_WS_TAG, "render_template id=%u error: %s",
              (unsigned) sub_id, ev["error"].as<const char*>());
     return;
   }
-  const char* result = ev["result"] | nullptr;
-  if (result == nullptr) return;
-  if (this->parent_ == nullptr) return;
+  // DEBUG: check if 'result' is a string or object
+  if (ev["result"].is<const char*>()) {
+    ESP_LOGI(HA_WS_TAG, "event id=%u result is string", (unsigned) sub_id);
+  } else if (ev["result"].is<JsonObject>()) {
+    ESP_LOGI(HA_WS_TAG, "event id=%u result is JsonObject", (unsigned) sub_id);
+  } else if (ev["result"].isNull()) {
+    ESP_LOGI(HA_WS_TAG, "event id=%u result is null", (unsigned) sub_id);
+  } else {
+    ESP_LOGI(HA_WS_TAG, "event id=%u result is other (isString=%d isInt=%d)",
+             (unsigned) sub_id,
+             ev["result"].is<const char*>(),
+             ev["result"].is<int>());
+  }
+  const char* result = ev["result"].as<const char*>();
+  if (result == nullptr) {
+    // For aggregate events, result is a JsonObject. Serialize
+    // it back to a JSON string and pass that as the rendered
+    // value. For the clock (string), this path is dead code.
+    std::string result_str;
+    if (ev["result"].is<JsonObject>()) {
+      serializeJson(ev["result"].as<JsonObject>(), result_str);
+    } else {
+      ESP_LOGW(HA_WS_TAG, "event id=%u has no result", (unsigned) sub_id);
+      return;
+    }
+    if (this->parent_ == nullptr) {
+      ESP_LOGW(HA_WS_TAG, "parent_ is null, cannot dispatch");
+      return;
+    }
+    this->parent_->template_api_.on_ws_event_(sub_id, result_str.c_str());
+    esphome::App.wake_loop_threadsafe();
+    return;
+  }
+  // DEBUG: log first ~80 chars of the result so we can see
+  // what HA is actually pushing.
+  ESP_LOGI(HA_WS_TAG, "event id=%u result(%zu): %.80s%s",
+           (unsigned) sub_id,
+           ev["result"].as<const char*>() ? std::strlen(ev["result"].as<const char*>()) : 0,
+           result,
+           std::strlen(result) > 80 ? "..." : "");
+  if (this->parent_ == nullptr) {
+    ESP_LOGW(HA_WS_TAG, "parent_ is null, cannot dispatch");
+    return;
+  }
   // Dispatch to the TemplateApi. The callback will
   // queue an event to clock_queue_ / agg_queue_ for
   // loopTask delivery.
