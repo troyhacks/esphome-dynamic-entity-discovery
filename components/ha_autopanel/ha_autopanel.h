@@ -14,6 +14,7 @@
 #include "esphome/components/wifi/wifi_component.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 #include "esphome/components/time/real_time_clock.h"
+#include "template_api.h"  // v1.27: TemplateApi (render() + subscribe() to HA)
 #include "esp_http_server.h"  // for AsyncWebHandler / AsyncWebServerRequest
 #include "esphome/core/preferences.h"
 #include "esp_heap_caps.h"
@@ -33,6 +34,29 @@
 namespace esphome::ha_autopanel {
 class HaWsClient;  // forward decl
 }
+
+// ----- v1.27: set_label_text_if_changed -----
+//
+// Replaces the pattern of: snprintf(buf, ...); lv_label_set_text(lbl, buf);
+// at every "update a label" site. The early-out is a 1-line no-op when
+// the text is already current, which is the common case for snprintf
+// calls that produce the same value 60x/second (clock, brightness %).
+// We compare against lv_label_get_text (LVGL 9 API) so the helper is
+// always correct even if the caller hasn't kept a local copy.
+//
+// Place this BEFORE the class declaration so it's visible to the
+// templates; it can also be called as set_label_text_if_changed(lbl, s)
+// from anywhere inside the namespace.
+namespace esphome {
+namespace ha_autopanel {
+inline void set_label_text_if_changed(lv_obj_t* label, const std::string& text) {
+  if (label == nullptr) return;
+  const char* cur = lv_label_get_text(label);
+  if (cur != nullptr && std::strcmp(cur, text.c_str()) == 0) return;
+  lv_label_set_text(label, text.c_str());
+}
+}  // namespace ha_autopanel
+}  // namespace esphome
 
 namespace esphome {
 namespace ha_autopanel {
@@ -437,6 +461,15 @@ class HaAutoPanel : public Component {
   // that was aborting at PC 0x480dxxxx.
   std::unique_ptr<HaWsClient> ws_client_;
 
+  // v1.27: TemplateApi - one-shot render() and push subscribe()
+  // wrappers for HA's /api/template REST endpoint and the
+  // WebSocket render_template subscription. Used for the
+  // clock (push), weather + home name + per-area aggregate
+  // (one-shot). Constructed in setup() with http_request_ and
+  // the current URL/token; the WS-send callback is wired in
+  // start_discovery_() once ws_client_ exists.
+  TemplateApi template_api_{this->http_request_, std::string(), std::string()};
+
   // Panel state machine
   PanelState state_{PanelState::BOOTING};
   // Boot splash — full-screen black with red centered "HA AutoPanel v1.0".
@@ -505,59 +538,18 @@ class HaAutoPanel : public Component {
   // suite can refuse to run if the device's firmware is older
   // than what the test was written against.
   std::string firmware_version_{};
-  // v1.22: HA-derived time baseline. The homeassistant time
-  // platform (which would fix the --:-- clock) is blocked by
-  // a build-dep issue, so we hand-roll a thin version: any HA
-  // REST response we receive (zone.home in fetch_home_name_,
-  // the bulk /api/states in fetch_entities_, the auth probe)
-  // includes a last_updated ISO-8601 timestamp. We parse that
-  // once, store unix seconds + millis() as the baseline, and
-  // advance the clock as baseline + (now - baseline_ms) / 1000
-  // until the next HA call refreshes it. Same pattern as
-  // ESPHome's homeassistant time platform, just inlined.
-  int64_t time_unix_seconds_{0};
-  uint32_t time_baseline_millis_{0};
-  bool time_valid_{false};
-  // Parse 'YYYY-MM-DDTHH:MM:SS[.ffffff][+HH:MM | Z]' into a
-  // unix timestamp. Returns 0 on parse error. ESPHome doesn't
-  // ship strptime so we hand-parse the ISO-8601 string.
-  int64_t parse_iso_to_unix_(const char* iso);
-  // Stamp a freshly-parsed ISO string into the time baseline.
-  // Safe to call from any thread (lvgl or http_request callback).
-  void set_time_from_iso_(const char* iso);
-  // v1.22l: periodic single-entity fetch to keep the HA-derived
-  // time baseline fresh. The bulk /api/states fetch only runs
-  // once (at discovery) and uses the first entity's last_updated
-  // as the baseline. If the entity hasn't changed in hours, the
-  // baseline is hours stale. Throttled to once every 5 minutes
-  // (TIME_BASELINE_REFRESH_INTERVAL_MS). The fetched entity is
-  // zone.home (a HA virtual entity that's always present and
-  // has a current last_updated).
-  void maybe_refresh_time_baseline_();
-  // Wall-clock millis of the last successful time baseline
-  // refresh, so maybe_refresh_time_baseline_() can throttle
-  // itself. Set to 0 initially so the first call after READY
-  // fires immediately.
-  uint32_t last_time_baseline_refresh_ms_{0};
-  // The HA entity we refresh against. zone.home is always
-  // present and has a real last_updated. We could also use
-  // sensor.time if the user has one, but zone.home is
-  // universal.
-  static constexpr uint32_t TIME_BASELINE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;  // 5 min
-  // v1.22l: entity-state poll interval (Fix #11 real-time
-  // sync). The user said "realtime within a second or two"
-  // but a 2s interval overwhelms the httpd (the bulk
-  // /api/states response is ~200KB and the httpd queue
-  // gets backed up with the screenshot handler). 5s is
-  // the practical floor - the state subscription pushes
-  // updates within ~100ms when it works, and the poll
-  // is the safety net for missed pushes. With both, the
-  // user sees real-time updates most of the time and the
-  // panel never goes more than 5s stale.
-  static constexpr uint32_t STATE_POLL_INTERVAL_MS = 5 * 1000;  // 5 s
-  // Wall-clock millis of the last entity-state poll. Throttles
-  // maybe_poll_entity_states_().
-  uint32_t last_state_poll_ms_{0};
+  // v1.27: removed HA-derived time baseline (parse_iso_to_unix_,
+  // set_time_from_iso_, time_unix_seconds_, time_baseline_millis_,
+  // time_valid_, maybe_refresh_time_baseline_,
+  // last_time_baseline_refresh_ms_, TIME_BASELINE_REFRESH_INTERVAL_MS,
+  // last_state_poll_ms_, STATE_POLL_INTERVAL_MS). The title-bar
+  // clock now subscribes to {{ now().strftime('%-H:%M') }} via
+  // the WS render_template subscription (see
+  // setup_render_template_subscriptions_() in this header).
+  // HA's template engine handles timezone + DST + format
+  // conversion; the panel just stamps the resulting string
+  // into the time label. No device-side ISO-8601 parsing,
+  // no unix epoch math, no localtime_r/tzset/TZ env vars.
   // v1.22l: re-fetch /api/states periodically and apply any
   // state changes to the entity model. Real-time sync
   // (Fix #11). Reuses fetch_entities_() to read the JSON,
@@ -933,12 +925,10 @@ class HaAutoPanel : public Component {
   bool write_config_file_(const std::string &body);
   void apply_config_file_(const std::string &body);
   void apply_runtime_config_();
-  // Refresh the title-bar clock label. Reads from the SNTP time
-  // component (id `sntp_time` in the user's yaml) and formats
-  // "h:mm AM/PM" (or "--:--" until sync succeeds). Cheap; safe to
-  // call from loop() every tick (the time string only changes once
-  // per minute, so most calls early-exit without touching LVGL).
-  void update_title_time_();
+  // v1.27: update_title_time_() was deleted. The title-bar
+  // clock is now driven by the on_clock_update_() callback,
+  // which receives the HA-rendered clock string from the
+  // render_template subscription. No per-tick loop work.
   // Show / hide the debug button in the title bar. Called whenever
   // the panel state changes. No-op if the button hasn't been
   // created yet (still in setup()).
@@ -1130,6 +1120,35 @@ class HaAutoPanel : public Component {
   void update_room_card_visual_state_for_entity_(std::string_view entity_id);
   void update_room_card_visual_state_for_area_(const std::string& area_id);
   std::string find_area_id_for_entity_(std::string_view entity_id) const;
+
+  // v1.27: render-template subscription handlers. Both are
+  // called from loopTask (the events are pushed to a
+  // loopTask-drained queue in ha_ws_client.h, so the actual
+  // lv_label_set_text / ArduinoJson parse happens on the
+  // LVGL-safe context).
+  //
+  // on_clock_update_ takes the rendered clock string
+  // (e.g. "14:30") and stamps it into the time label. The
+  // format string lives in the WS subscribe message
+  // ({{ now().strftime(...) }}).
+  void on_clock_update_(const std::string& rendered);
+  // v1.27 (Phase 4): the per-area aggregate JSON handler.
+  // Forwarded by HaWsClient::drain_aggregate_events. Decodes
+  // the JSON and updates entities_by_area_ in place.
+  void on_aggregate_update_(const std::string& json);
+
+  // v1.27: set up the clock + aggregate render_template
+  // subscriptions. Called from HaWsClient::parse_auth_ok_
+  // (which is the right moment to subscribe - we know
+  // auth_ok came back, so the WS is ready). Returns true
+  // if both subscriptions succeeded.
+  bool setup_render_template_subscriptions_();
+
+  // v1.27: subscription ids from TemplateApi::subscribe().
+  // Stored so we can unsubscribe on shutdown (future) and
+  // log them in dump_config.
+  uint32_t clock_sub_id_{0};
+  uint32_t aggregate_sub_id_{0};
 
   // Panel state machine
   void set_panel_state_(PanelState new_state);

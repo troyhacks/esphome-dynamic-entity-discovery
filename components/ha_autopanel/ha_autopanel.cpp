@@ -389,6 +389,14 @@ void HaAutoPanel::setup() {
   // the config is good.
   this->boot_from_storage_();
 
+  // v1.27: TemplateApi was constructed in place in the header with
+  // http_request_ and empty URL/token. The URL/token may have been
+  // populated by boot_from_storage_() above (or by YAML's set_*()
+  // before setup()) - update the helper so it picks them up. The
+  // WS-send callback is wired later in start_discovery_() once
+  // ws_client_ is constructed.
+  this->template_api_.update(this->ha_api_url_, this->ha_api_password_);
+
   // v1.22u removed: SDIO wedge detector task spawn.
   // The dedicated FreeRTOS task was the wrong abstraction;
   // it watched loopTask's heartbeat but the actual
@@ -677,6 +685,13 @@ void HaAutoPanel::fetch_areas_() {
 
 
 void HaAutoPanel::fetch_home_name_() {
+  // v1.27: switched from GET /api/states/zone.home + ArduinoJson
+  // parse to POST /api/template with `state_attr('zone.home',
+  // 'friendly_name')`. The whole /api/states response body
+  // (~500 B JSON) is replaced with a bare-text response like
+  // "My Home". No JSON parse, no client-side attribute drill.
+  // The "404 zone.home not found" case becomes the same
+  // behavior (empty string -> cleared cache).
   if (this->http_request_ == nullptr) {
     ESP_LOGW(TAG, "[home] http_request_ is null - cannot fetch home name");
     return;
@@ -698,74 +713,40 @@ void HaAutoPanel::fetch_home_name_() {
     return;
   }
 
-  ESP_LOGI(TAG, "[home] fetching zone.home friendly_name from %s/api/states/zone.home",
-           this->ha_api_url_.c_str());
+  ESP_LOGI(TAG, "[home] fetching zone.home friendly_name via /api/template");
 
-  // Server-side filter: HA's REST API supports /api/states/<entity_id>
-  // which returns a single entity object (not the full array). This
-  // is much better than fetching the whole /api/states (which can be
-  // 250KB+ with 419 entities) and filtering client-side. The response
-  // is a small JSON object ~500 bytes. Same shape as an entry in the
-  // /api/states array, so we parse it the same way.
-  std::string url = this->ha_api_url_ + "/api/states/zone.home";
-  // v1.23: HttpClient consolidates the get + read + status-
-  // code boilerplate (was ~80 lines of duplicate code).
-  HttpClient http(this->http_request_);
-  HttpResult result = http.get(url, http.bearer_auth(this->ha_api_password_));
-  if (result.status == HttpStatus::NOT_FOUND) {
-    // zone.home doesn't exist (user hasn't set up a Home zone in
-    // HA, or renamed it to something else). Not an error - just
-    // nothing to display. Clear the cache and return.
-    ESP_LOGW(TAG, "[home] zone.home not found in HA (HTTP 404)");
+  // R"DELIM( ... )DELIM" raw string: no JSON escape. HA's
+  // state_attr() returns the friendly_name attribute from the
+  // zone.home entity. If zone.home is missing, state_attr
+  // returns Unknown (literal) or the empty string - we filter
+  // both below.
+  std::string tmpl = R"DELIM({{ state_attr('zone.home', 'friendly_name') }})DELIM";
+
+  std::optional<std::string> response = this->template_api_.render(tmpl);
+  if (!response) {
+    ESP_LOGW(TAG, "[home] template render failed");
+    return;
+  }
+  std::string found = *response;
+  // Strip surrounding JSON quotes if HA ever returns a
+  // JSON-quoted string. No JSON library needed.
+  if (found.size() >= 2 && found.front() == '"' && found.back() == '"') {
+    found = found.substr(1, found.size() - 2);
+  }
+  // Filter HA's "Unknown" / "unknown" sentinel and TemplateError
+  // / UndefinedError strings. These are what state_attr() returns
+  // when the entity is missing or the attribute is undefined.
+  if (found.empty() ||
+      found == "Unknown" || found == "unknown" ||
+      found.find("TemplateError") != std::string::npos ||
+      found.find("UndefinedError") != std::string::npos) {
+    ESP_LOGW(TAG, "[home] zone.home friendly_name unavailable ('%s')", found.c_str());
     this->home_name_.clear();
     this->last_home_fetch_ms_ = millis();
     return;
   }
-  if (result.status != HttpStatus::OK) {
-    ESP_LOGW(TAG, "[home] fetch failed: %s (HTTP %d)",
-             http_status_to_str(result.status), result.http_code);
-    return;
-  }
-  const std::string& response = result.body;
-
-  // Parse with ArduinoJson. The response is a JSON object (not an
-  // array) since we used the /api/states/<id> endpoint. Using the
-  // PSRAM-backed allocator (same as fetch_entities_) so we don't
-  // OOM the small internal heap.
-  PsramJsonDocument doc(&s_psram_allocator);
-  DeserializationError err = deserializeJson(doc, response);
-  if (err) {
-    ESP_LOGW(TAG, "[home] JSON parse failed: %s", err.c_str());
-    return;
-  }
-  JsonObject obj = doc.as<JsonObject>();
-  if (obj.isNull()) {
-    ESP_LOGW(TAG, "[home] response is not a JSON object");
-    return;
-  }
-
-  // Drill directly into attributes.friendly_name - no client-side
-  // filter loop needed.
-  JsonObject attrs = obj["attributes"];
-  if (attrs.isNull()) {
-    ESP_LOGW(TAG, "[home] response has no 'attributes' object");
-    return;
-  }
-  const char* name = attrs["friendly_name"];
-  if (name == nullptr || name[0] == '\0') {
-    ESP_LOGW(TAG, "[home] zone.home has no friendly_name");
-    return;
-  }
-  std::string found = name;
-
-  if (found.size() > 64) {
-    ESP_LOGW(TAG, "[home] friendly_name is %u chars - truncating to 64",
-             (unsigned)found.size());
-    found.resize(64);
-  }
-  // Cap at 64 chars so a pathological friendly_name doesn't blow the
-  // title bar layout. Falls back to whatever fits in the 700px label
-  // box with LV_LABEL_LONG_CLIP for the rest.
+  // Cap at 64 chars so a pathological friendly_name doesn't blow
+  // the title bar layout.
   if (found.size() > 64) {
     ESP_LOGW(TAG, "[home] friendly_name is %u chars - truncating to 64",
              (unsigned)found.size());
@@ -775,30 +756,17 @@ void HaAutoPanel::fetch_home_name_() {
   this->home_name_ = found;
   this->last_home_fetch_ms_ = millis();
   if (this->title_home_label_ != nullptr) {
-    lv_label_set_text(this->title_home_label_, this->home_name_.c_str());
+    set_label_text_if_changed(this->title_home_label_, this->home_name_);
   }
   // [home] tag mirrors [ip] / [cmd] - the test harness (send_cmd.py)
   // greps for this to verify the title bar is showing the expected name.
   ESP_LOGI(TAG, "[home] %s", this->home_name_.c_str());
 
-  // v1.22: also seed the title-bar clock from HA's last_updated
-  // field. The user's network blocks UDP/123 (NTP) so the
-  // homeassistant-platform time source was the only working
-  // option, but that platform pulls in a heavy component the
-  // dep resolver can't always handle. A thinner alternative:
-  // any time we make an HA REST call (this one, the bulk
-  // /api/states fetch, the auth probe), HA's response includes
-  // a `last_updated` ISO-8601 timestamp. We parse it once and
-  // use millis()-since to keep advancing the clock locally
-  // until the next HA call refreshes it. This is the same
-  // pattern ESPHome's homeassistant time platform uses, just
-  // inlined.
-  if (!obj["last_updated"].isNull()) {
-    const char* last_updated = obj["last_updated"].as<const char*>();
-    if (last_updated != nullptr && last_updated[0] != '\0') {
-      this->set_time_from_iso_(last_updated);
-    }
-  }
+  // v1.27: the previous version of this function also seeded the
+  // title-bar clock from the entity's `last_updated` field. The
+  // clock now subscribes to its own render_template via the WS,
+  // so this seeding is no longer needed (and parse_iso_to_unix_
+  // / set_time_from_iso_ are being deleted in Phase 3).
 }
 
 void HaAutoPanel::fetch_weather_() {
@@ -812,19 +780,15 @@ void HaAutoPanel::fetch_weather_() {
   // weather.translate_state service already maps the
   // weather.<provider>.state values to the user's locale.
   //
-  // The template below produces exactly "Partly Cloudy 19°C"
-  // for HA's default weather.forecast_home entity. The
-  // weather_entity_id_ yaml knob is honored by interpolating
-  // it into the template. The ~160 lines this replaces
-  // (HTTP fetch + JSON parse + state-mapping table +
-  // UTF-8 unit walk + label-width math) shrink to ~50.
-  //
-  // The template's response is a plain string. If the
-  // weather_entity_id_ is empty or invalid, HA returns
-  // the template's evaluation of state_translated('') which
-  // is "" (empty string) - the label stays hidden, no
-  // UI change. So an empty entity_id is a silent no-op
-  // rather than an error.
+  // v1.27: switched to TemplateApi::render() to centralize
+  // the {"template": "..."} JSON wrapping + Bearer auth.
+  // The body construction, header assembly, and HTTP post
+  // are now inside the helper. The defensive ArduinoJson
+  // parse is gone - HA returns the rendered string as bare
+  // text (verified via curl/Invoke-RestMethod in
+  // [[ha-autopanel-v127-template-api]]); we still strip
+  // surrounding JSON quotes as a belt-and-suspenders guard
+  // in case a future HA version returns JSON-quoted text.
   if (this->title_weather_label_ == nullptr) return;
   if (this->weather_entity_id_.empty()) {
     ESP_LOGD(TAG, "[weather] disabled (weather_entity_id is empty)");
@@ -846,71 +810,37 @@ void HaAutoPanel::fetch_weather_() {
     return;
   }
 
-  // Build the Jinja template. The entity_id is interpolated
+  // R"DELIM( ... )DELIM" raw string: paste Jinja2 verbatim,
+  // no escape sequence hell. The entity_id is interpolated
   // from the yaml knob (default "weather.forecast_home")
   // so users with a different weather provider don't have
-  // to edit the C++.
-  //
-  //   - state_translated(<entity>) | title -> "Partly Cloudy"
-  //   - state_attr(<entity>, 'temperature') | round | int -> 19
-  //   - state_attr(<entity>, 'temperature_unit') -> "°C"
-  // Jinja concatenates adjacent tokens with no whitespace,
-  // producing "Partly Cloudy 19°C".
+  // to edit the C++. The concatenation (no whitespace) gives
+  // exactly "Partly Cloudy 19°C".
   std::string entity = this->weather_entity_id_;
-  std::string body =
-      "{\"template\": \""
-      "{{ state_translated('" + entity + "') | title }} "
-      "{{ state_attr('" + entity + "', 'temperature') | round | int }}"
-      "{{ state_attr('" + entity + "', 'temperature_unit') }}\"}";
+  std::string tmpl =
+      R"DELIM({{ state_translated(')" + entity +
+      R"DELIM(') | title }} {{ state_attr(')" + entity +
+      R"DELIM(', 'temperature') | round | int }}{{ state_attr(')" + entity +
+      R"DELIM(', 'temperature_unit') }})DELIM";
 
   ESP_LOGI(TAG, "[weather] fetching %s via /api/template",
            this->weather_entity_id_.c_str());
 
-  std::string url = this->ha_api_url_ + "/api/template";
-
-  // HttpClient::post only takes one headers arg, so combine
-  // Content-Type + Bearer auth into a single vector.
-  HttpClient http(this->http_request_);
-  std::vector<http_request::Header> headers;
-  headers.push_back({"Content-Type", "application/json"});
-  std::vector<http_request::Header> auth = http.bearer_auth(
-      this->ha_api_password_);
-  headers.insert(headers.end(), auth.begin(), auth.end());
-
-  HttpResult result = http.post(url, body, headers);
-  if (result.status != HttpStatus::OK) {
-    ESP_LOGW(TAG, "[weather] template fetch failed: %s (HTTP %d)",
-             http_status_to_str(result.status), result.http_code);
+  std::optional<std::string> response = this->template_api_.render(tmpl);
+  if (!response) {
+    ESP_LOGW(TAG, "[weather] template render failed");
     return;
   }
-    const std::string& response = result.body;
-  if (response.empty()) {
+  std::string text = std::move(*response);
+  if (text.empty()) {
     ESP_LOGW(TAG, "[weather] empty response body");
     return;
   }
-
-  // HA's /api/template returns the rendered string as BARE TEXT
-  // (not JSON-quoted) for most template responses. E.g.
-  //   Partly Cloudy 18°C
-  // Verified with curl/Invoke-RestMethod. So we use the
-  // response body directly. The JSON parse is a defensive
-  // fallback in case HA starts returning JSON-quoted strings
-  // in a future version.
-  std::string text;
-  PsramJsonDocument doc(&s_psram_allocator);
-  DeserializationError err = deserializeJson(doc, response);
-  if (err == DeserializationError::Ok) {
-    // JSON parse succeeded - HA returned a JSON-quoted string.
-    const char* rendered = doc.as<const char*>();
-    if (rendered != nullptr) {
-      text = rendered;
-    } else {
-      // JSON root wasn't a string (e.g. an error object).
-      text = response;
-    }
-  } else {
-    // Response wasn't JSON - it's the bare template result.
-    text = response;
+  // Strip surrounding JSON quotes if HA ever returns a
+  // JSON-quoted string. No JSON library needed - just a
+  // character check.
+  if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+    text = text.substr(1, text.size() - 2);
   }
   // A missing/unknown weather entity produces a template
   // error string like "TemplateError('...'): ...". Filter
@@ -922,7 +852,7 @@ void HaAutoPanel::fetch_weather_() {
   }
 
   this->weather_text_ = text;
-  lv_label_set_text(this->title_weather_label_, text.c_str());
+  set_label_text_if_changed(this->title_weather_label_, text);
   // Re-fit the label width to the new text. Same pattern
   // as the time label - the flex cluster reflows when
   // the label grows.
@@ -934,128 +864,30 @@ void HaAutoPanel::fetch_weather_() {
   lv_obj_remove_flag(this->title_weather_label_, LV_OBJ_FLAG_HIDDEN);
   this->last_weather_fetch_ms_ = millis();
   ESP_LOGI(TAG, "[weather] updated label to '%s'", text.c_str());
-}
+}// v1.27: update_title_time_() was deleted. The title-bar
+// clock is now driven by the on_clock_update_() callback,
+// which is invoked from HaWsClient::drain_clock_events()
+// (called in HaAutoPanel::loop()). The callback receives
+// the HA-rendered clock string (e.g. "14:30" or "2:30 PM")
+// and stamps it into the title_time_label_ via
+// set_label_text_if_changed. HA's template engine handles
+// timezone + DST + format conversion; the panel does no
+// ISO-8601 parsing, no unix epoch math, no
+// localtime_r / tzset / setenv / TZ env-var manipulation.
+//
+// The SNTP time source (this->time_) is still available for
+// the debug panel's "Date/Time" section if the user wired
+// one up in YAML (set_time() from a time: block). It's no
+// longer used for the title clock.
 
-
-void HaAutoPanel::update_title_time_() {
-  if (this->title_time_label_ == nullptr) return;
-
-  // 1. Check if we should even be showing the time
-  if (!this->show_time_) {
-    lv_label_set_text(this->title_time_label_, "");
-    return; // (Stripped out the static hidden_marker. LVGL handles repeated "" sets cheaply)
-  }
-
-  static int last_minute = -1;
-  ESPTime now;
-
-  // 2. Fetch Time (Prefer SNTP, fallback to HA-derived UTC baseline)
-  if (this->time_ != nullptr && this->time_->now().is_valid()) {
-    now = this->time_->now();
-  } 
-  else if (this->time_valid_) {
-    uint32_t now_ms = millis();
-    time_t unix_now = this->time_unix_seconds_ + ((now_ms - this->time_baseline_millis_) / 1000);
-    
-    // FIX: Call it statically on the ESPTime struct, 
-    // which automatically applies the global timezone from ESPHome
-    now = ESPTime::from_epoch_local(unix_now);
-  }
-
-  // 3. Handle completely unavailable time
-  if (!now.is_valid()) {
-    if (last_minute != -1) {
-      lv_label_set_text(this->title_time_label_, "--:--");
-      last_minute = -1; // Reset throttle
-    }
-    return;
-  }
-
-  // 4. Render to UI (Throttle to only redraw when the minute changes)
-  int minute_key = now.hour * 100 + now.minute;
-  if (minute_key != last_minute) {
-    last_minute = minute_key;
-    char buf[16];
-
-    // HA is the source of truth for formatting: tie `this->use_24h_time_` 
-    // to a parsed HA entity state to control this dynamically.
-    if (this->use_24h_time_) {
-      snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
-    } else {
-      int h12 = now.hour % 12;
-      if (h12 == 0) h12 = 12;
-      snprintf(buf, sizeof(buf), "%d:%02d %s", h12, now.minute, (now.hour < 12) ? "AM" : "PM");
-    }
-
-    lv_label_set_text(this->title_time_label_, buf);
-
-    // Re-fit the label width to the new text
-    const lv_font_t* f = lv_obj_get_style_text_font(this->title_time_label_, LV_PART_MAIN);
-    lv_obj_set_width(this->title_time_label_, button_width_for_text_(buf, f, 4));
-  }
-}
-
-int64_t HaAutoPanel::parse_iso_to_unix_(const char* iso) {
-  if (iso == nullptr) return 0;
-  // HA returns timestamps like "2026-06-05T13:45:00.123456+00:00"
-  // or "...Z" (UTC) or with no fractional seconds. We hand-parse
-  // rather than pull in ctime's strptime so the code stays
-  // portable to all the ESPHome-supported toolchains.
-  int year = 0, mon = 0, day = 0, hour = 0, min = 0, sec = 0;
-  int matched = sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d",
-                       &year, &mon, &day, &hour, &min, &sec);
-  if (matched != 6) {
-    ESP_LOGW(TAG, "[time] bad ISO-8601 timestamp '%s' (matched %d/6)",
-             iso, matched);
-    return 0;
-  }
-  // Days-since-epoch for the parsed date, in UTC. We compute this
-  // without timegm() (also ctime) using the standard proleptic
-  // Gregorian formula. Good enough for the next ~300 years.
-  int y = year - (mon <= 2 ? 1 : 0);
-  int era = (y >= 0 ? y : y - 399) / 400;
-  int yoe = y - era * 400;                              // [0, 399]
-  int doy = (153 * (mon + (mon > 2 ? -3 : 9)) + 2) / 5
-          + day - 1;                                    // [0, 365]
-  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;      // [0, 146096]
-  int64_t days = (int64_t)era * 146097 + (int64_t)doe - 719468;
-  // Timezone offset (HA returns +HH:MM or Z). Default to UTC.
-  int64_t tz_off_s = 0;
-  const char* t = strchr(iso, 'T');
-  if (t != nullptr) {
-    t = strchr(t, '+');
-    if (t == nullptr) t = strchr(iso, '-');  // negative offset (would need more care)
-    if (t != nullptr && (t[0] == '+' || t[0] == '-')) {
-      int tzh = 0, tzm = 0;
-      if (sscanf(t, "%*c%2d:%2d", &tzh, &tzm) == 2) {
-        tz_off_s = (int64_t)tzh * 3600 + (int64_t)tzm * 60;
-        if (t[0] == '-') tz_off_s = -tz_off_s;
-      }
-    }
-  }
-  return days * 86400 + hour * 3600 + min * 60 + sec - tz_off_s;
-}
-
-void HaAutoPanel::set_time_from_iso_(const char* iso) {
-  int64_t unix = this->parse_iso_to_unix_(iso);
-  if (unix <= 0) return;
-  // v1.22l: only accept a baseline if it's MORE RECENT
-  // than the current one. The bulk /api/states response
-  // can include many entities; we may get old last_updated
-  // values from entities that haven't changed in days.
-  // Taking the max (most recent) gives a baseline close to
-  // "now" - typically within seconds if any entity
-  // updated recently, or hours if HA has been idle.
-  if (!this->time_valid_ || unix > this->time_unix_seconds_) {
-    this->time_unix_seconds_ = unix;
-    this->time_baseline_millis_ = millis();
-    this->time_valid_ = true;
-    ESP_LOGI(TAG, "[time] HA-derived baseline advanced: %s -> unix=%lld",
-             iso, (long long)unix);
-  }
-}
-
-
+// v1.27: parse_iso_to_unix_ / set_time_from_iso_ /
+// maybe_refresh_time_baseline_ and the time_valid_ /
+// time_unix_seconds_ / time_baseline_millis_ members were
+// all removed. The title clock now subscribes to a
+// render_template that HA evaluates server-side; the panel
+// just stamps the rendered string into the time label. No
+// ISO-8601 parsing, no epoch math, no timezone math, no
+// periodic baseline refresh fetch.
 
 void HaAutoPanel::monitor_task_states_() {
   // v1.25c7: WLED-style task state monitor. Replaces the v1.22v
@@ -1237,55 +1069,6 @@ void HaAutoPanel::wedge_trigger_c6_reset_() {
   // its next link-up. We don't need to re-configure it.
 }
 
-void HaAutoPanel::maybe_refresh_time_baseline_() {
-  // Throttle: only fetch every 5 minutes. last_time_baseline_refresh_ms_
-  // starts at 0 so the first call after READY fires immediately.
-  uint32_t now_ms = millis();
-  if (this->last_time_baseline_refresh_ms_ != 0 &&
-      (now_ms - this->last_time_baseline_refresh_ms_) < TIME_BASELINE_REFRESH_INTERVAL_MS) {
-    return;
-  }
-  this->last_time_baseline_refresh_ms_ = now_ms;
-  if (this->http_request_ == nullptr || this->ha_api_url_.empty() ||
-      this->ha_api_password_.empty()) {
-    return;  // not configured yet
-  }
-  // GET /api/states/zone.home. ~500 bytes vs the 200KB+ of a bulk
-  // /api/states call, so the network/CPU cost is trivial. The
-  // response is a single-element JSON array (same schema as the
-  // bulk call), so we can reuse the same parse path. zone.home
-  // is always present in HA and has a current last_updated.
-  std::string url = this->ha_api_url_ + "/api/states/zone.home";
-  // v1.23: HttpClient consolidates the get + read + status-
-  // code boilerplate. Was ~50 lines of duplicate code.
-  HttpClient http(this->http_request_);
-  HttpResult result = http.get(url, http.bearer_auth(this->ha_api_password_));
-  if (result.status != HttpStatus::OK) {
-    // try again in 5 minutes (the throttle at the top of
-    // this function is what enforces that)
-    return;
-  }
-  const std::string& body = result.body;
-  if (body.empty()) {
-    return;
-  }
-  // The response is a JSON array. Use a tiny StaticJsonDocument
-  // (the body is ~400 bytes for a single zone.home state).
-  StaticJsonDocument<1024> doc;
-  if (!deserializeJson(doc, body)) {
-    JsonArray arr = doc.as<JsonArray>();
-    if (!arr.isNull() && arr.size() > 0) {
-      JsonObject first = arr[0];
-      if (!first["last_updated"].isNull()) {
-        const char* last_updated = first["last_updated"].as<const char*>();
-        if (last_updated != nullptr && last_updated[0] != '\0') {
-          this->set_time_from_iso_(last_updated);
-        }
-      }
-    }
-  }
-}
-
 void HaAutoPanel::start_discovery_() {
   ESP_LOGI(TAG, "=== Starting Dynamic Entity Discovery ===");
 
@@ -1357,6 +1140,18 @@ void HaAutoPanel::start_discovery_() {
     this->ws_client_ = std::make_unique<HaWsClient>(this);
     this->ws_client_->set_url(this->ha_api_url_);
     this->ws_client_->set_token(this->ha_api_password_);
+    // v1.27: wire the WS-send callback into TemplateApi so
+    // subscribe() / unsubscribe() can push JSON over the WS
+    // connection. The lambda captures `this`; the call site is
+    // on loopTask so the unique_ptr<HaWsClient> is alive for
+    // the duration of the subscription.
+    this->template_api_.set_ws_sender(
+        [this](const std::string& body) {
+          if (this->ws_client_) {
+            return this->ws_client_->send_text_external(body);
+          }
+          return false;
+        });
   }
   this->ws_client_->start();
 
@@ -3506,6 +3301,111 @@ void HaAutoPanel::on_entity_attribute_changed_(std::string_view entity_id, const
   this->update_room_card_visual_state_for_entity_(entity_id);
 }
 
+// v1.27: clock update handler. HA pushes the formatted
+// clock string once per minute (HA's now() re-evaluates
+// per minute). The event was queued to clock_queue_ on
+// parse_task; this runs on loopTask, so it's safe to
+// touch LVGL.
+//
+// The format string is whatever subscribe_clock_() put in
+// the WS render_template message (24h "%-H:%M" or 12h
+// "%-I:%M %p" with no leading zero). The panel doesn't
+// care about the format - it just stamps the string.
+void HaAutoPanel::on_clock_update_(const std::string& rendered) {
+  if (this->title_time_label_ == nullptr) return;
+  // Don't update the label if the user has hidden it.
+  if (!this->show_time_) {
+    set_label_text_if_changed(this->title_time_label_, std::string());
+    return;
+  }
+  set_label_text_if_changed(this->title_time_label_, rendered);
+  // Re-fit the label width (matches the existing
+  // update_title_time_ pattern).
+  const lv_font_t* f = lv_obj_get_style_text_font(
+      this->title_time_label_, LV_PART_MAIN);
+  lv_obj_set_width(this->title_time_label_,
+                   button_width_for_text_(rendered.c_str(), f, 4));
+  // Unhide the label on first push so the panel doesn't
+  // sit at "--:--" forever.
+  if (lv_obj_has_flag(this->title_time_label_, LV_OBJ_FLAG_HIDDEN)) {
+    lv_obj_remove_flag(this->title_time_label_, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// v1.27 (Phase 4): per-area aggregate JSON handler. Called
+// on loopTask; safe to do the ArduinoJson parse here.
+// For now this is a no-op stub - the real implementation
+// (apply_room_aggregates_) is added in Phase 4. We just
+// log the size so we can confirm the subscription is
+// working on hardware.
+void HaAutoPanel::on_aggregate_update_(const std::string& json) {
+  ESP_LOGD(TAG, "[aggregate] event: %zu bytes (Phase 4 will decode)", json.size());
+}
+
+// v1.27: set up the clock + aggregate render_template
+// subscriptions over the WebSocket. Called from
+// HaWsClient::parse_auth_ok_() right after the auth_ok
+// state transition (before any get_states / state_changed
+// traffic). The TemplateApi allocates fresh ids starting
+// at 100; we store them in clock_sub_id_ / aggregate_sub_id_
+// for logging. Returns true if both subscriptions succeeded.
+//
+// The clock template uses R"DELIM( ... )DELIM" - no JSON
+// escape, no need to understand strftime flags in C++.
+// `%-H` and `%-I` are the no-leading-zero formats
+// (Linux/BSD strftime extension). HA runs on Linux so this
+// works; on macOS it would not, but that's not HA's host.
+bool HaAutoPanel::setup_render_template_subscriptions_() {
+  if (this->clock_sub_id_ != 0 || this->aggregate_sub_id_ != 0) {
+    // Already set up; idempotent.
+    return true;
+  }
+  // ----- Clock -----
+  // %-H = hour 0-23, no leading zero. Use 24h.
+  // For 12h, use %-I:%M %p.
+  std::string clock_tmpl = this->use_24h_time_
+      ? R"DELIM({{ now().strftime('%-H:%M') }})DELIM"
+      : R"DELIM({{ now().strftime('%-I:%M %p') }})DELIM";
+  this->clock_sub_id_ = this->template_api_.subscribe(
+      clock_tmpl,
+      [this](const std::string& rendered) {
+        if (this->ws_client_) {
+          this->ws_client_->push_clock_event_(rendered.c_str());
+        }
+      });
+  if (this->clock_sub_id_ == 0) {
+    ESP_LOGW(TAG, "[clock] subscribe failed");
+  } else {
+    ESP_LOGI(TAG, "[clock] subscribed id=%u (24h=%s)",
+             (unsigned) this->clock_sub_id_,
+             this->use_24h_time_ ? "yes" : "no");
+  }
+  // ----- Aggregate -----
+  // The per-area aggregate template is built by
+  // build_room_aggregate_template_() and depends on the
+  // discovered area list. If the areas haven't been
+  // discovered yet (or the template is empty), the
+  // subscription silently no-ops until a future auth_ok.
+  // For now, build a simple "per-entity state" template as
+  // a stub; Phase 4 replaces it with the per-area template.
+  std::string agg_tmpl =
+      R"DELIM({ "rooms": [], "phase": "stub" })DELIM";
+  this->aggregate_sub_id_ = this->template_api_.subscribe(
+      agg_tmpl,
+      [this](const std::string& rendered) {
+        if (this->ws_client_) {
+          this->ws_client_->push_aggregate_event_(rendered.c_str());
+        }
+      });
+  if (this->aggregate_sub_id_ == 0) {
+    ESP_LOGW(TAG, "[aggregate] subscribe failed (Phase 4 stub)");
+  } else {
+    ESP_LOGI(TAG, "[aggregate] subscribed id=%u (Phase 4 stub)",
+             (unsigned) this->aggregate_sub_id_);
+  }
+  return this->clock_sub_id_ != 0;
+}
+
 std::string HaAutoPanel::find_area_id_for_entity_(std::string_view entity_id) const {
   for (const auto& kv : this->entities_by_area_) {
     for (const auto& e : kv.second) {
@@ -3925,6 +3825,12 @@ void HaAutoPanel::loop() {
   // start_discovery_() constructs it.
   if (this->ws_client_) {
     this->ws_client_->drain_state_events();
+    // v1.27: drain the clock + aggregate push event queues.
+    // Both are filled by TemplateApi::subscribe callbacks
+    // running on parse_task; the actual LVGL update / JSON
+    // parse happens here on loopTask.
+    this->ws_client_->drain_clock_events();
+    this->ws_client_->drain_aggregate_events();
   }
 
   // v1.24: auth-probe auto-trigger kept (probe uses
@@ -3998,27 +3904,15 @@ void HaAutoPanel::loop() {
     this->fetch_weather_();
   }
 
-  // Refresh the title-bar clock. update_title_time_() early-exits
-  // cheaply if the displayed minute hasn't changed, so this is
-  // essentially free.
-  this->update_title_time_();
-
-  // v1.22l: periodic time-baseline refresh. SNTP is the
-  // primary time source now (see update_title_time_), but if
-  // it fails to sync and we fall back to the HA-derived
-  // baseline, the baseline is anchored to an entity's
-  // last_updated field which can be hours stale. We
-  // re-fetch a single entity's state every 5 minutes and
-  // update the baseline from its last_updated. A single-
-  // entity GET is ~500 bytes vs the 200KB+ of a bulk
-  // /api/states, so this is cheap. The fetch is throttled
-  // by a member timestamp so we don't hammer HA.
-  if (this->state_ == PanelState::READY &&
-      (this->time_ == nullptr || !this->time_->now().is_valid())) {
-    // Only re-fetch when we're actually using the HA fallback
-    // (SNTP invalid). If SNTP works, no need to poll.
-    this->maybe_refresh_time_baseline_();
-  }
+  // v1.27: update_title_time_() was deleted. The title-bar
+  // clock is now driven by the on_clock_update_() callback
+  // (fired from HaWsClient::drain_clock_events() above),
+  // which is called by the TemplateApi render_template
+  // subscription. HA pushes the formatted clock string
+  // once per minute; no device-side time math is needed.
+  // (The previous version polled maybe_refresh_time_baseline_()
+  // here to keep the HA-derived time baseline fresh. That
+  // machinery is gone.)
 
   // v1.24: removed the v1.22l bulk entity-state poll
   // (maybe_poll_entity_states_) and the v1.22v per-room poll
@@ -4197,6 +4091,14 @@ void HaAutoPanel::apply_config_file_(const std::string &body) {
   if (doc["api_token"].is<const char*>()) {
     this->ha_api_password_ = doc["api_token"].as<std::string>();
   }
+  // v1.27: keep TemplateApi in sync with the new URL/token. The
+  // WS client's URL/token are NOT updated here because changing
+  // them mid-session would require tearing down the WS and
+  // re-authenticating - that's deferred to a future re-connect
+  // (the next HA restart or /autopanel/test/cmd?c=r). For the
+  // REST template fetches the new URL/token take effect on
+  // the next call without a re-connect.
+  this->template_api_.update(this->ha_api_url_, this->ha_api_password_);
   this->config_loaded_ = true;
   ESP_LOGI(TAG, "Config applied: api_url=%s, token_len=%u",
            this->ha_api_url_.c_str(), (unsigned) this->ha_api_password_.size());

@@ -105,6 +105,32 @@ struct StateEvent {
   }
 };
 
+// v1.27: clock event. Holds the HA-rendered clock string
+// (e.g. "14:30" or "2:30 PM") that HA pushed via the
+// render_template subscription. Handed from parse_task to
+// loopTask via a small SPSC queue. The clock fires once per
+// minute, so the pool depth (3) is plenty.
+struct ClockEvent {
+  std::string rendered;  // e.g. "14:30"
+  void release() {
+    rendered.clear();
+    rendered.shrink_to_fit();
+  }
+};
+
+// v1.27: aggregate event. Holds the per-area aggregate JSON
+// that HA pushed when any of the panel's relevant entities
+// changed. Same lifecycle as ClockEvent. Pool depth 3 is
+// fine: the per-area template only re-renders ~once per
+// second under heavy state changes (HA's coalescing).
+struct AggregateEvent {
+  std::string json;
+  void release() {
+    json.clear();
+    json.shrink_to_fit();
+  }
+};
+
 // Raw, owned PSRAM payload handed from the WS event handler
 // (on esp_websocket_client's internal task) to parse_task.
 // The PSRAM data buffer is owned by RawWsMessage and freed
@@ -270,6 +296,23 @@ class HaWsClient {
   // iteration under the 50ms warn threshold.
   void drain_state_events();
 
+  // v1.27: drain up to CLOCK_DRAIN_PER_TICK pending ClockEvents
+  // into the parent's on_clock_update_() handler. Same SPSC
+  // pattern as drain_state_events. Called from
+  // HaAutoPanel::loop() each tick.
+  void drain_clock_events();
+
+  // v1.27: push one rendered clock string to the clock event
+  // queue. Called from the TemplateApi::subscribe callback
+  // (which runs on parse_task). The queue is drained on
+  // loopTask, so the actual lv_label_set_text happens in
+  // LVGL-safe context.
+  bool push_clock_event_(const char* rendered);
+
+  // v1.27: same, for the per-area aggregate push. Used in Phase 4.
+  bool push_aggregate_event_(const char* json);
+  void drain_aggregate_events();
+
   // True after we've successfully received and parsed the
   // get_states response. HaAutoPanel uses this to decide
   // when it's safe to render the room grid (though the
@@ -291,6 +334,37 @@ class HaWsClient {
   // before start()).
   void set_url(const std::string& http_url) { http_url_ = http_url; }
   void set_token(const std::string& token) { token_ = token; }
+
+  // Thread-safe external WS send. Used by TemplateApi to
+  // send render_template / unsubscribe_events messages from
+  // the calling thread (typically loopTask). The underlying
+  // esp_websocket_client_send_text is internally locked, so
+  // this is safe to call from any context. Returns false if
+  // the client isn't connected.
+  bool send_text_external(const std::string& body) {
+    if (this->client_ == nullptr) return false;
+    int r = esp_websocket_client_send_text(this->client_,
+                                           body.data(), body.size(),
+                                           portMAX_DELAY);
+    if (r < 0) {
+      ESP_LOGW(HA_WS_TAG, "send_text_external: esp_websocket_client_send_text failed: %d", r);
+      return false;
+    }
+    return true;
+  }
+
+  // Notify the WS layer that a TemplateApi event with the
+  // given id was received. Called from
+  // parse_event_message_() after demuxing by the event's id.
+  // Safe to call from parse_task only.
+  void forward_template_event_(uint32_t id, const char* result) {
+    if (this->parent_ == nullptr) return;
+    // parent_->template_api_ is accessible because HaAutoPanel
+    // is a complete type at the point this header is included
+    // (ha_ws_client.h is included from ha_autopanel.cpp AFTER
+    // HaAutoPanel's full definition).
+    this->parent_->template_api_.on_ws_event_(id, result);
+  }
 
  private:
   // ===== Constants =====
@@ -356,6 +430,24 @@ class HaWsClient {
   // parse_task -> loopTask: per-entity StateEvents
   EventPool<StateEvent, STATE_QUEUE_CAPACITY - 1> state_pool_;
   NotifyingLockFreeQueue<StateEvent, STATE_QUEUE_CAPACITY> state_queue_;
+
+  // v1.27: parse_task -> loopTask: clock update events.
+  // Pool depth 3 covers the per-minute clock push plus a
+  // burst of up to 2 backlogged events if loopTask is busy
+  // doing a long render.
+  static constexpr size_t CLOCK_QUEUE_CAPACITY = 4;
+  EventPool<ClockEvent, CLOCK_QUEUE_CAPACITY - 1> clock_pool_;
+  NotifyingLockFreeQueue<ClockEvent, CLOCK_QUEUE_CAPACITY> clock_queue_;
+  static constexpr size_t CLOCK_DRAIN_PER_TICK = 4;
+
+  // v1.27: parse_task -> loopTask: per-area aggregate events.
+  // Pool depth 3 covers a burst of updates (HA coalesces
+  // multiple state changes into one re-render, so this
+  // rarely fires more than 1-2 times per second).
+  static constexpr size_t AGG_QUEUE_CAPACITY = 4;
+  EventPool<AggregateEvent, AGG_QUEUE_CAPACITY - 1> agg_pool_;
+  NotifyingLockFreeQueue<AggregateEvent, AGG_QUEUE_CAPACITY> agg_queue_;
+  static constexpr size_t AGG_DRAIN_PER_TICK = 4;
 
   TaskHandle_t parse_task_handle_{nullptr};
 
@@ -816,6 +908,15 @@ inline void HaWsClient::parse_auth_ok_() {
   this->auth_sent_ms_.store(0, std::memory_order_release);
   this->subscribe_sent_ms_.store((uint32_t) (esp_timer_get_time() / 1000),
                                 std::memory_order_release);
+  // v1.27: set up the clock + aggregate render_template
+  // subscriptions BEFORE the (heavy) get_states round trip.
+  // The subscriptions only cost a small WS message; the
+  // first event arrives within a few hundred ms. Doing
+  // this before get_states means the clock starts
+  // updating even if get_states is slow.
+  if (this->parent_ != nullptr) {
+    this->parent_->setup_render_template_subscriptions_();
+  }
   this->send_get_states_();
   this->ws_state_.store(HaWsState::GETTING_STATES, std::memory_order_release);
 }
@@ -911,31 +1012,65 @@ inline void HaWsClient::parse_event_message_(const char* json, size_t len) {
 
   const char* type = doc["type"] | "";
   if (strcmp(type, "event") != 0) return;
+  // v1.27: an "event" message in HA's WS protocol can be
+  // either:
+  //   (a) state_changed event with event_type=
+  //       "state_changed" and data.entity_id etc.
+  //   (b) render_template event with the render result in
+  //       event.result. The subscription id is in
+  //       doc["id"] (top-level, NOT inside event).
+  //
+  // Demux by the presence of event.event_type. If it
+  // exists, this is the legacy state_changed path
+  // (kept for now, deleted in Phase 4.7). Otherwise it's
+  // a TemplateApi subscription - hand off to the dispatch.
+  uint32_t sub_id = doc["id"] | 0;
   JsonObject ev = doc["event"].as<JsonObject>();
   if (ev.isNull()) return;
   const char* event_type = ev["event_type"] | "";
-  if (strcmp(event_type, "state_changed") != 0) return;
-  JsonObject data = ev["data"].as<JsonObject>();
-  if (data.isNull()) return;
-  const char* eid = data["entity_id"];
-  if (eid == nullptr) return;
-  if (this->our_entity_ids_.find(eid) == this->our_entity_ids_.end()) return;
-  JsonObject new_state = data["new_state"].as<JsonObject>();
-  if (new_state.isNull()) return;
-  const char* st = new_state["state"] | "";
-  int brightness = -1;
-  bool has_brightness = false;
-  JsonObject attrs = new_state["attributes"].as<JsonObject>();
-  if (!attrs.isNull()) {
-    JsonVariant bv = attrs["brightness"];
-    if (!bv.isNull()) {
-      brightness = bv.as<int>();
-      if (brightness < 0) brightness = 0;
-      if (brightness > 255) brightness = 255;
-      has_brightness = true;
+  if (event_type[0] != '\0') {
+    // ----- Legacy state_changed path (Phase 4.7 removes) -----
+    if (strcmp(event_type, "state_changed") != 0) return;
+    JsonObject data = ev["data"].as<JsonObject>();
+    if (data.isNull()) return;
+    const char* eid = data["entity_id"];
+    if (eid == nullptr) return;
+    if (this->our_entity_ids_.find(eid) == this->our_entity_ids_.end()) return;
+    JsonObject new_state = data["new_state"].as<JsonObject>();
+    if (new_state.isNull()) return;
+    const char* st = new_state["state"] | "";
+    int brightness = -1;
+    bool has_brightness = false;
+    JsonObject attrs = new_state["attributes"].as<JsonObject>();
+    if (!attrs.isNull()) {
+      JsonVariant bv = attrs["brightness"];
+      if (!bv.isNull()) {
+        brightness = bv.as<int>();
+        if (brightness < 0) brightness = 0;
+        if (brightness > 255) brightness = 255;
+        has_brightness = true;
+      }
     }
+    this->push_state_event_(eid, st, brightness, has_brightness);
+    esphome::App.wake_loop_threadsafe();
+    return;
   }
-  this->push_state_event_(eid, st, brightness, has_brightness);
+  // ----- TemplateApi render_template event path -----
+  // ev.result holds the rendered string (HA returns it
+  // as a JSON string). If ev.error is set, the template
+  // had a render error - log and skip.
+  if (ev["error"].is<const char*>()) {
+    ESP_LOGW(HA_WS_TAG, "render_template id=%u error: %s",
+             (unsigned) sub_id, ev["error"].as<const char*>());
+    return;
+  }
+  const char* result = ev["result"] | nullptr;
+  if (result == nullptr) return;
+  if (this->parent_ == nullptr) return;
+  // Dispatch to the TemplateApi. The callback will
+  // queue an event to clock_queue_ / agg_queue_ for
+  // loopTask delivery.
+  this->parent_->template_api_.on_ws_event_(sub_id, result);
   esphome::App.wake_loop_threadsafe();
 }
 
@@ -1020,6 +1155,75 @@ inline bool HaWsClient::push_state_event_(const std::string& eid, const char* st
     return false;
   }
   return true;
+}
+
+// v1.27: push a rendered clock string to the clock queue.
+// Called from the TemplateApi::subscribe callback (parse_task).
+// Returns false on full queue; events are rare (1/min) so a
+// drop is logged and the next push will succeed.
+inline bool HaWsClient::push_clock_event_(const char* rendered) {
+  if (rendered == nullptr) return false;
+  ClockEvent* ev = this->clock_pool_.allocate();
+  if (ev == nullptr) {
+    this->events_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  ev->rendered = rendered;
+  if (!this->clock_queue_.push(ev)) {
+    this->events_dropped_.fetch_add(1, std::memory_order_relaxed);
+    ev->release();
+    this->clock_pool_.release(ev);
+    return false;
+  }
+  return true;
+}
+
+// v1.27: drain clock events on loopTask. Bounded to
+// CLOCK_DRAIN_PER_TICK (4) per tick; the clock only fires
+// once per minute so 4 is far more than needed.
+inline void HaWsClient::drain_clock_events() {
+  size_t n = 0;
+  ClockEvent* ev;
+  while (n < CLOCK_DRAIN_PER_TICK && (ev = this->clock_queue_.pop()) != nullptr) {
+    if (this->parent_ != nullptr) {
+      this->parent_->on_clock_update_(ev->rendered);
+    }
+    ev->release();
+    this->clock_pool_.release(ev);
+    n++;
+  }
+}
+
+// v1.27: same as push_clock_event_ but for the per-area
+// aggregate JSON. Used in Phase 4.
+inline bool HaWsClient::push_aggregate_event_(const char* json) {
+  if (json == nullptr) return false;
+  AggregateEvent* ev = this->agg_pool_.allocate();
+  if (ev == nullptr) {
+    this->events_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  ev->json = json;
+  if (!this->agg_queue_.push(ev)) {
+    this->events_dropped_.fetch_add(1, std::memory_order_relaxed);
+    ev->release();
+    this->agg_pool_.release(ev);
+    return false;
+  }
+  return true;
+}
+
+inline void HaWsClient::drain_aggregate_events() {
+  size_t n = 0;
+  AggregateEvent* ev;
+  while (n < AGG_DRAIN_PER_TICK && (ev = this->agg_queue_.pop()) != nullptr) {
+    if (this->parent_ != nullptr) {
+      this->parent_->on_aggregate_update_(ev->json);
+    }
+    ev->release();
+    this->agg_pool_.release(ev);
+    n++;
+  }
 }
 
 }  // namespace esphome::ha_autopanel
