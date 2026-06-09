@@ -389,11 +389,14 @@ void HaAutoPanel::setup() {
   this->boot_from_storage_();
 
   // v1.27: TemplateApi was constructed in place in the header with
-  // http_request_ and empty URL/token. The URL/token may have been
-  // populated by boot_from_storage_() above (or by YAML's set_*()
-  // before setup()) - update the helper so it picks them up. The
-  // WS-send callback is wired later in start_discovery_() once
-  // ws_client_ is constructed.
+  // http_request_ and empty URL/token. The in-class initializer
+  // captured http_request_ BEFORE YAML's set_http_request() had a
+  // chance to wire it, so http_ in the helper is null at this
+  // point. Fix: set_http() now (after the YAML wiring), and
+  // update() the URL/token to whatever boot_from_storage_() set
+  // (or the YAML default). The WS-send callback is wired later
+  // in start_discovery_() once ws_client_ is constructed.
+  this->template_api_.set_http(this->http_request_);
   this->template_api_.update(this->ha_api_url_, this->ha_api_password_);
 
   // v1.22u removed: SDIO wedge detector task spawn.

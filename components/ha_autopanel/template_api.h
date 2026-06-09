@@ -95,6 +95,18 @@ class TemplateApi {
     this->ws_sender_ = std::move(sender);
   }
 
+  // v1.27: set the HTTP component used for the one-shot
+  // /api/template REST calls. Called from setup() AFTER
+  // set_http_request() has wired http_request_ (the
+  // constructor's http_ pointer is captured too early
+  // for it to be useful - the in-class initializer for
+  // template_api_ runs before YAML's set_http_request
+  // call).
+  void set_http(http_request::HttpRequestComponent* http) {
+    std::lock_guard<std::mutex> lk(write_mu_);
+    this->http_ = http;
+  }
+
   // One-shot render. POST {base}/api/template with
   // {"template": "<tmpl>"} + Bearer auth. Returns the bare
   // rendered string (HA returns text/plain for string
