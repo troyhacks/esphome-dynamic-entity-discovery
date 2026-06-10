@@ -236,6 +236,16 @@ class HaWsClient {
   // Convenience: is the WS state machine at READY?
   bool is_ws_ready() const { return ws_state_.load(std::memory_order_acquire) == HaWsState::READY; }
 
+  // v1.27 reconnect helpers: parent ha_autopanel::loop() drives
+  // the restart because HaWsClient itself isn't a Component
+  // (no set_timeout available). on_ws_closed_() sets the flag
+  // and records the close timestamp; the parent loop sees the
+  // flag, applies a backoff, then calls start() to recreate
+  // the esp_websocket_client (the parse_task is reused).
+  bool needs_reconnect() const { return needs_reconnect_.load(std::memory_order_acquire); }
+  uint32_t last_closed_ms() const { return last_closed_ms_.load(std::memory_order_acquire); }
+  void clear_reconnect_flag() { needs_reconnect_.store(false, std::memory_order_release); }
+
   // For dump_config and the test debug page.
   HaWsState ws_state() const { return ws_state_.load(std::memory_order_acquire); }
   uint32_t events_received() const { return events_received_.load(std::memory_order_relaxed); }
@@ -317,6 +327,8 @@ class HaWsClient {
   std::string ws_uri_;                              // derived in start_(); held alive while client_ is up
   std::atomic<HaWsState> ws_state_{HaWsState::DISCONNECTED};
   std::atomic<bool> stopping_{false};
+  std::atomic<bool> needs_reconnect_{false};      // set by on_ws_closed_; cleared by parent loop on restart
+  std::atomic<uint32_t> last_closed_ms_{0};       // millis() when needs_reconnect_ was set
   std::atomic<uint32_t> auth_sent_ms_{0};           // esp_timer_get_time()/1000
   std::atomic<uint32_t> subscribe_sent_ms_{0};
 
@@ -709,28 +721,22 @@ inline void HaWsClient::on_ws_closed_() {
   // state_changed + render_template events (clock, light
   // state, etc.).
   //
-  // Workaround: schedule a manual re-start after a short
-  // backoff. We use set_timeout (which runs on loopTask) so
-  // we don't spin in the IDF event handler. The start() guard
-  // (if (this->client_ != nullptr) return) prevents
-  // double-start, so we tear down the dead client first.
+  // HaWsClient doesn't inherit from Component (no
+  // set_timeout), so we just tear down the dead client here
+  // and let ha_autopanel::loop() notice the DISCONNECTED
+  // state, do a backoff, and call start() to re-create the
+  // client. The start() guard (if (this->client_ != nullptr)
+  // return) prevents double-start.
   if (this->stopping_.load(std::memory_order_acquire)) return;
   if (this->client_ == nullptr) return;
-  // Capture pointers locally; set_timeout runs on loopTask
-  // after we're back in the IDF event loop, so we need to be
-  // careful about ordering.
   esp_websocket_client_handle_t dead = this->client_;
   this->client_ = nullptr;
-  this->set_timeout("ha_ws_reconnect", 2000, [this, dead]() {
-    if (this->stopping_.load(std::memory_order_acquire)) return;
-    if (this->client_ != nullptr) return;  // already restarted
-    if (dead != nullptr) {
-      esp_websocket_client_stop(dead);
-      esp_websocket_client_destroy(dead);
-    }
-    ESP_LOGW(HA_WS_TAG, "reconnect: re-starting websocket client");
-    this->start();
-  });
+  if (dead != nullptr) {
+    esp_websocket_client_stop(dead);
+    esp_websocket_client_destroy(dead);
+  }
+  this->last_closed_ms_.store((uint32_t) millis(), std::memory_order_release);
+  this->needs_reconnect_.store(true, std::memory_order_release);
 }
 
 inline void HaWsClient::on_ws_error_() {

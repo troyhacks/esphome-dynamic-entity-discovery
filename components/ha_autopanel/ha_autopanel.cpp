@@ -4107,6 +4107,25 @@ void HaAutoPanel::loop() {
     // parse happens here on loopTask.
     this->ws_client_->drain_clock_events();
     this->ws_client_->drain_aggregate_events();
+    // v1.27 reconnect fix: the esp_websocket_client's
+    // auto-reconnect (cfg.disable_auto_reconnect = false)
+    // isn't firing in our setup - we get a single CONNECTED,
+    // a 9.5s wait for auth_required, an immediate CLOSE 4ms
+    // after sending auth, and then nothing. The WS stays
+    // dead and we lose clock + state updates.
+    //
+    // HaWsClient::on_ws_closed_() teardown is fire-and-forget
+    // (no set_timeout available - HaWsClient isn't a
+    // Component), so it sets a needs_reconnect_ atomic and
+    // this loop is the only place that can drive the restart.
+    // 2-second backoff to give the IDF event loop + SDIO a
+    // moment to settle between attempts.
+    if (this->ws_client_->needs_reconnect() &&
+        millis() - this->ws_client_->last_closed_ms() > 2000) {
+      ESP_LOGW(TAG, "ws: re-starting after close (backoff 2s)");
+      this->ws_client_->clear_reconnect_flag();
+      this->ws_client_->start();
+    }
   }
 
   // v1.24: auth-probe auto-trigger kept (probe uses
