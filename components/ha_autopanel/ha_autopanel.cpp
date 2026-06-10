@@ -7,6 +7,10 @@
 // the full HaWsClient is visible (PIMPL: declared in
 // ha_autopanel.h, defined here as defaulted).
 #include "ha_ws_client.h"
+// v1.27 debug: read C6 firmware version + host library version
+// from esp_hosted at boot so we can rule out (or in) the
+// slave firmware as a cause of the SDIO/heap issues.
+#include "esp_hosted.h"
 
 #include "esphome/core/log.h"
 #include "esphome/core/string_ref.h"
@@ -250,6 +254,27 @@ struct RoomControlData {
 void HaAutoPanel::setup() {
   ESP_LOGI(TAG, "Dynamic Entity Discovery starting...");
   s_instance = this;
+
+  // v1.27 debug: print host library + C6 (slave) firmware
+  // versions so we know what's running. The C6 firmware is
+  // baked at flash time - we can only read its version via
+  // esp_hosted_get_coprocessor_fwversion(), and only the
+  // minor/major/patch integers come back (no git SHA, no
+  // timestamp). The host library version comes from the
+  // ESP_HOSTED_VERSION_* macros in esp_hosted_host_fw_ver.h.
+  {
+    esp_hosted_coprocessor_fwver_t c6_ver{};
+    if (esp_hosted_get_coprocessor_fwversion(&c6_ver) == ESP_OK) {
+      ESP_LOGI(TAG, "ESP Hosted: host_lib=%d.%d.%d  c6_fw=%d.%d.%d",
+               ESP_HOSTED_VERSION_MAJOR_1, ESP_HOSTED_VERSION_MINOR_1,
+               ESP_HOSTED_VERSION_PATCH_1, c6_ver.major1, c6_ver.minor1,
+               c6_ver.patch1);
+    } else {
+      ESP_LOGW(TAG, "ESP Hosted: host_lib=%d.%d.%d  c6_fw=<unavailable>",
+               ESP_HOSTED_VERSION_MAJOR_1, ESP_HOSTED_VERSION_MINOR_1,
+               ESP_HOSTED_VERSION_PATCH_1);
+    }
+  }
 
   // v1.20: build the firmware_version_ string from the baked-in
   // constants. The format is "v1.20-dev 2026-06-05 12:34:56" -
