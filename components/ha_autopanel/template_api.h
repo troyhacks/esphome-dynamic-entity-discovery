@@ -138,7 +138,7 @@ class TemplateApi {
   // caller is responsible for queueing the event to a
   // loopTask-drained queue (same pattern as StateEvent).
   uint32_t subscribe(const std::string& tmpl,
-                     std::function<void(const std::string&)> cb) {
+                     std::function<void(const char*)> cb) {
     return this->subscribe_impl_(tmpl, "", std::move(cb));
   }
 
@@ -155,7 +155,7 @@ class TemplateApi {
   // template only iterates over our areas.
   uint32_t subscribe_with_vars(const std::string& tmpl,
                                const std::string& variables_json,
-                               std::function<void(const std::string&)> cb) {
+                               std::function<void(const char*)> cb) {
     return this->subscribe_impl_(tmpl, variables_json, std::move(cb));
   }
 
@@ -186,17 +186,25 @@ class TemplateApi {
   // Hook: called by HaWsClient::parse_event_message_ when an
   // event arrives with a tracked id. Dispatches to the
   // matching callback. Thread: WS parse_task. The callback
-  // must be safe to invoke there.
+  // must be safe to invoke there. The result is a const char*
+  // (NOT a std::string&) so the dispatch doesn't allocate
+  // a std::string copy of the (potentially 40+KB) aggregate
+  // payload - we had a heap_caps_aligned_alloc_base abort
+  // 6 seconds after dispatching the aggregate event when
+  // we were doing 3x 41KB copies (result_str, std::string
+  // temporary, ev->json queue). The callback is expected to
+  // do its own copy (e.g. ev->json = json) within the
+  // caller's scope.
   void on_ws_event_(uint32_t id, const char* result) {
     if (id == 0 || result == nullptr) return;
-    std::function<void(const std::string&)> cb;
+    std::function<void(const char*)> cb;
     {
       std::shared_lock<std::shared_mutex> lk(subs_mu_);
       auto it = this->subs_.find(id);
       if (it == this->subs_.end()) return;
       cb = it->second;  // copy under lock
     }
-    cb(std::string(result));
+    cb(result);
   }
 
   // Clear all subscriptions (called on WS disconnect so we
@@ -213,7 +221,7 @@ class TemplateApi {
   // include in the body.
   uint32_t subscribe_impl_(const std::string& tmpl,
                            const std::string& variables_json,
-                           std::function<void(const std::string&)> cb) {
+                           std::function<void(const char*)> cb) {
     if (cb == nullptr) {
       ESP_LOGW(HA_TPL_TAG, "subscribe: cb is null");
       return 0;
@@ -369,7 +377,7 @@ class TemplateApi {
 
   // Subscription registry. Read-mostly (the hot path is
   // on_ws_event_ on parse_task), so a shared_mutex.
-  std::map<uint32_t, std::function<void(const std::string&)>> subs_;
+  std::map<uint32_t, std::function<void(const char*)>> subs_;
   mutable std::shared_mutex subs_mu_;
 
   // Monotonic id allocator. Starts at 100 to avoid colliding

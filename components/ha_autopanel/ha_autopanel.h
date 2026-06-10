@@ -1188,8 +1188,11 @@ class HaAutoPanel : public Component {
   void on_clock_update_(const std::string& rendered);
   // v1.27 (Phase 4): the per-area aggregate JSON handler.
   // Forwarded by HaWsClient::drain_aggregate_events. Decodes
-  // the JSON and updates entities_by_area_ in place.
-  void on_aggregate_update_(const std::string& json);
+  // the JSON and updates entities_by_area_ in place. Takes
+  // a string_view pointing into PSRAM (the AggregateEvent's
+  // psram-backed std::string) so we don't allocate a 25KB
+  // std::string copy on the internal heap.
+  void on_aggregate_update_(std::string_view json);
 
   // v1.27: set up the clock + aggregate render_template
   // subscriptions. Called from HaWsClient::parse_auth_ok_
@@ -1222,8 +1225,11 @@ class HaAutoPanel : public Component {
   // v1.27: parse the aggregate JSON and update
   // room_aggregates_ + entities_by_area_ in place.
   // Shared by the initial fetch and every WS push.
-  // No-op on parse error.
-  void apply_room_aggregates_(const std::string& json);
+  // No-op on parse error. Takes a string_view so the
+  // initial fetch (which has a std::string response) and
+  // the WS push (which has a PSRAM-backed string) can
+  // both pass without an intermediate copy.
+  void apply_room_aggregates_(std::string_view json);
 
   // v1.27: walk room_aggregates_ and copy each Entry's
   // state/brightness into the corresponding Entity record

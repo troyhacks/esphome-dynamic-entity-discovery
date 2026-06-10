@@ -122,8 +122,16 @@ struct ClockEvent {
 // changed. Same lifecycle as ClockEvent. Pool depth 3 is
 // fine: the per-area template only re-renders ~once per
 // second under heavy state changes (HA's coalescing).
+// The 25KB JSON buffer is in PSRAM (via PsramStlAllocator)
+// because the parse_task's internal heap is too small to
+// hold two of these at once (the 4.7KB httpd-style 4KB
+// stack and ~300KB internal heap can't absorb a 50KB burst).
+// Pre-v1.27 this struct was std::string (default allocator,
+// internal heap) and we saw std::bad_alloc panics on the
+// S3/P4 parse_task whenever HA pushed >1 aggregate per
+// few seconds.
 struct AggregateEvent {
-  std::string json;
+  std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>> json;
   void release() {
     json.clear();
     json.shrink_to_fit();
@@ -663,16 +671,6 @@ inline void HaWsClient::on_ws_data_chunk_(const esp_websocket_event_data_t* ev) 
       return;
     }
     this->inflight_buf_[this->inflight_len_] = '\0';
-    // DEBUG: log every complete WS message to see what's arriving
-    if (this->inflight_len_ < 256) {
-      ESP_LOGI(HA_WS_TAG, "RX msg (%zu bytes): %.*s",
-               this->inflight_len_,
-               (int) this->inflight_len_,
-               this->inflight_buf_);
-    } else {
-      ESP_LOGI(HA_WS_TAG, "RX msg (%zu bytes): %.*s... [truncated]",
-               this->inflight_len_, 100, this->inflight_buf_);
-    }
     RawWsMessage* msg = this->raw_pool_.allocate();
     if (msg == nullptr) {
       this->events_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -869,10 +867,7 @@ inline void HaWsClient::parse_event_message_(const char* json, size_t len) {
   }
 
   const char* type = doc["type"] | "";
-  if (strcmp(type, "event") != 0) {
-    ESP_LOGD(HA_WS_TAG, "non-event msg: type=%s", type);
-    return;
-  }
+  if (strcmp(type, "event") != 0) return;
   uint32_t sub_id = doc["id"] | 0;
   JsonObject ev = doc["event"].as<JsonObject>();
   if (ev.isNull()) {
@@ -884,53 +879,49 @@ inline void HaWsClient::parse_event_message_(const char* json, size_t len) {
              (unsigned) sub_id, ev["error"].as<const char*>());
     return;
   }
-  // DEBUG: check if 'result' is a string or object
-  if (ev["result"].is<const char*>()) {
-    ESP_LOGI(HA_WS_TAG, "event id=%u result is string", (unsigned) sub_id);
-  } else if (ev["result"].is<JsonObject>()) {
-    ESP_LOGI(HA_WS_TAG, "event id=%u result is JsonObject", (unsigned) sub_id);
-  } else if (ev["result"].isNull()) {
-    ESP_LOGI(HA_WS_TAG, "event id=%u result is null", (unsigned) sub_id);
-  } else {
-    ESP_LOGI(HA_WS_TAG, "event id=%u result is other (isString=%d isInt=%d)",
-             (unsigned) sub_id,
-             ev["result"].is<const char*>(),
-             ev["result"].is<int>());
-  }
+  // v1.27: HA's WS render_template event re-parses the
+  // rendered value as JSON before sending. The aggregate
+  // template uses `to_json` to build the final string, but
+  // HA's re-parser converts it back to a JsonObject on the
+  // wire. The clock template (plain string) arrives as a
+  // const char* (the "happy path"). For the aggregate, we
+  // need to serialize the JsonObject back to a JSON string
+  // before dispatching to the callback.
   const char* result = ev["result"].as<const char*>();
   if (result == nullptr) {
-    // For aggregate events, result is a JsonObject. Serialize
-    // it back to a JSON string and pass that as the rendered
-    // value. For the clock (string), this path is dead code.
-    std::string result_str;
     if (ev["result"].is<JsonObject>()) {
+      // v1.27: allocate a std::string once here, pass the
+      // c_str to the callback, and let the callback do its
+      // own copy. The std::string temporary goes out of
+      // scope when this if-block exits, but the callback
+      // has already copied the data into its own queue
+      // slot (ev->json = json in push_aggregate_event_).
+      // The as-of-v1.27 path was meant to avoid this case
+      // entirely, but the test confirmed HA re-parses
+      // to_json output. Net cost: 2x 25KB allocations per
+      // aggregate event (1x serializeJson here, 1x deep
+      // copy in the callback) vs the pre-v1.27 3x.
+      // Both buffers are PSRAM-backed (PsramStlAllocator)
+      // because the parse_task's internal heap is too small
+      // to hold two 25KB strings at once without
+      // std::bad_alloc panics.
+      std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>> result_str;
       serializeJson(ev["result"].as<JsonObject>(), result_str);
-    } else {
-      ESP_LOGW(HA_WS_TAG, "event id=%u has no result", (unsigned) sub_id);
+      if (this->parent_ == nullptr) return;
+      this->parent_->template_api_.on_ws_event_(sub_id, result_str.c_str());
+      esphome::App.wake_loop_threadsafe();
       return;
     }
-    if (this->parent_ == nullptr) {
-      ESP_LOGW(HA_WS_TAG, "parent_ is null, cannot dispatch");
-      return;
-    }
-    this->parent_->template_api_.on_ws_event_(sub_id, result_str.c_str());
-    esphome::App.wake_loop_threadsafe();
+    ESP_LOGW(HA_WS_TAG, "event id=%u has no result", (unsigned) sub_id);
     return;
   }
-  // DEBUG: log first ~80 chars of the result so we can see
-  // what HA is actually pushing.
-  ESP_LOGI(HA_WS_TAG, "event id=%u result(%zu): %.80s%s",
-           (unsigned) sub_id,
-           ev["result"].as<const char*>() ? std::strlen(ev["result"].as<const char*>()) : 0,
-           result,
-           std::strlen(result) > 80 ? "..." : "");
-  if (this->parent_ == nullptr) {
-    ESP_LOGW(HA_WS_TAG, "parent_ is null, cannot dispatch");
-    return;
-  }
-  // Dispatch to the TemplateApi. The callback will
-  // queue an event to clock_queue_ / agg_queue_ for
-  // loopTask delivery.
+  if (this->parent_ == nullptr) return;
+  // Dispatch via the TemplateApi. The callback takes a
+  // const char* (not std::string&) and copies the data into
+  // its own queue slot (clock_queue_/agg_queue_) in a
+  // single allocation, then the parse_task is done with
+  // the buffer. The on_ws_event_ callback passes the
+  // pointer through - the queue push does the deep copy.
   this->parent_->template_api_.on_ws_event_(sub_id, result);
   esphome::App.wake_loop_threadsafe();
 }
@@ -1075,7 +1066,14 @@ inline void HaWsClient::drain_aggregate_events() {
   AggregateEvent* ev;
   while (n < AGG_DRAIN_PER_TICK && (ev = this->agg_queue_.pop()) != nullptr) {
     if (this->parent_ != nullptr) {
-      this->parent_->on_aggregate_update_(ev->json);
+      // Pass the PSRAM-backed string_view directly. No
+      // 25KB std::string copy on the internal heap - the
+      // view points into ev->json which is in PSRAM and
+      // stays alive until ev->release() below. The consumer
+      // (apply_room_aggregates_) takes a string_view and
+      // calls deserializeJson on it.
+      this->parent_->on_aggregate_update_(
+          std::string_view(ev->json.data(), ev->json.size()));
     }
     ev->release();
     this->agg_pool_.release(ev);

@@ -1,0 +1,39 @@
+{# v1.27 per-area aggregate template.
+
+   Two key Jinja2 quirks to work around:
+   1. `{% set X = ... %}` inside a `{% for %}` creates a LOOP-LOCAL
+      variable. Each iteration starts with the value from outside
+      the loop, so `{% set data = data.rooms + [room] %}` does NOT
+      accumulate across iterations. Use `namespace()` for any
+      accumulator.
+   2. HA's Jinja2 sandbox blocks `dict.update` and `list.append` -
+      so `**` unpacking and `{% do x.append(...) %}` raise
+      SecurityError. Use the `combine` filter (Python-level merge,
+      not blocked) for dict accumulation.
+
+   The `room_states.s | combine({...})` inside the inner `for e`
+   loop is the only inner-loop accumulator. Since `combine` is
+   called as a filter (not assignment to a local), it actually
+   works inside the inner loop - each iteration produces a new
+   dict that is then re-assigned to `room_states.s` (which is
+   itself a namespace attribute and IS preserved across
+   iterations of the OUTER loop; the inner loop reassigns it
+   on each `e` iteration and the value carries forward). -#}
+{% set ns = namespace(rooms=[]) %}
+{% for a in areas() if a in included_areas %}
+  {% set area_ents = area_entities(a) %}
+  {% set on_ents = area_ents | select('is_state', 'on') | list %}
+  {% set room_states = namespace(s={}) %}
+  {% for e in area_ents if states(e) is not none %}
+    {% set room_states.s = room_states.s | combine({e: {'s': states(e), 'b': state_attr(e, 'brightness') | int(0)}}) %}
+  {% endfor %}
+  {% set room = {
+    'area_id': a,
+    'name': area_name(a),
+    'on_count': on_ents | length,
+    'max_pct': (((on_ents | map('state_attr', 'brightness') | map('int', 0) | list) + [0]) | max) * 100 // 255,
+    'states': room_states.s
+  } %}
+  {% set ns.rooms = ns.rooms + [room] %}
+{% endfor %}
+{{ {'rooms': ns.rooms} | to_json }}

@@ -3372,7 +3372,7 @@ void HaAutoPanel::on_clock_update_(const std::string& rendered) {
 
 // v1.27 (Phase 4): per-area aggregate JSON handler. Called
 // on loopTask; safe to do the ArduinoJson parse here.
-void HaAutoPanel::on_aggregate_update_(const std::string& json) {
+void HaAutoPanel::on_aggregate_update_(std::string_view json) {
   this->apply_room_aggregates_(json);
 }
 
@@ -3436,27 +3436,42 @@ void HaAutoPanel::build_room_aggregate_template_() {
   }
   vars += "]}";
   this->room_aggregate_variables_ = std::move(vars);
-  this->room_aggregate_template_ = R"DELIM({
-  "rooms": [
-    {% for a in areas() %}
-    {% if a in included_areas %}
-    {
-      "area_id": "{{ a }}",
-      "name": "{{ area_name(a) }}",
-      "on_count": {{ area_entities(a) | select('is_state', 'on') | list | length }},
-      "max_pct": {{ ((area_entities(a) | select('is_state', 'on') | map('state_attr', 'brightness') | map('int', 0) | list) + [0]) | max * 100 // 255 }},
-      "states": {
-        {% for e in area_entities(a) %}
-        {% if states(e) is not none %}
-        "{{ e }}": {"s": "{{ states(e) }}", "b": {{ state_attr(e, 'brightness') | int(0) }}}{% if not loop.last %},{% endif %}
-        {% endif %}
-        {% endfor %}
-      }
-    }{% if not loop.last %},{% endif %}
-    {% endif %}
-    {% endfor %}
-  ]
-})DELIM";
+  // Build a Jinja2 dict + to_json. The result is a STRING
+  // (the to_json'd JSON), so parse_event_message_'s const
+  // char* dispatch works without any 40+KB heap allocations
+  // for the JsonObject case. We use list-concat via `set` and
+  // dict-merge via `combine` instead of `do data.rooms.append`
+  // because HA's Jinja2 sandbox disables `do` (raises
+  // SecurityError: "access to attribute 'append' of 'list'
+  // object is unsafe"). Also handles all the escaping for
+  // area names with apostrophes like "Kelly's Room" without
+  // any manual escape logic.
+  // v1.27: build the template as a multi-line raw string.
+  // Mirror in room_aggregate.j2 for offline review/diff.
+  // Uses `namespace()` for both accumulators (rooms list and
+  // per-room states dict) because `{% set x = ... %}` inside
+  // a `{% for %}` is loop-local and does NOT persist. Also
+  // uses `combine` for the inner dict merge (sandbox-safe -
+  // the alternative `**` unpacking calls `dict.update` which
+  // the Jinja2 sandbox blocks).
+  this->room_aggregate_template_ = R"DELIM({% set ns = namespace(rooms=[]) %}
+{% for a in areas() if a in included_areas %}
+  {% set area_ents = area_entities(a) %}
+  {% set on_ents = area_ents | select('is_state', 'on') | list %}
+  {% set room_states = namespace(s={}) %}
+  {% for e in area_ents if states(e) is not none %}
+    {% set room_states.s = room_states.s | combine({e: {'s': states(e), 'b': state_attr(e, 'brightness') | int(0)}}) %}
+  {% endfor %}
+  {% set room = {
+    'area_id': a,
+    'name': area_name(a),
+    'on_count': on_ents | length,
+    'max_pct': (((on_ents | map('state_attr', 'brightness') | map('int', 0) | list) + [0]) | max) * 100 // 255,
+    'states': room_states.s
+  } %}
+  {% set ns.rooms = ns.rooms + [room] %}
+{% endfor %}
+{{ {'rooms': ns.rooms} | to_json }})DELIM";
   ESP_LOGI(TAG, "[aggregate] template built for %zu areas",
            this->discovered_areas_.size());
 }
@@ -3504,9 +3519,9 @@ void HaAutoPanel::fetch_room_aggregates_() {
 // only (logged for debugging) - the actual room-card arc
 // % comes from the individual entity brightness values
 // via compute_room_brightness_pct_().
-void HaAutoPanel::apply_room_aggregates_(const std::string& json) {
+void HaAutoPanel::apply_room_aggregates_(std::string_view json) {
   PsramJsonDocument doc(&s_psram_allocator);
-  DeserializationError err = deserializeJson(doc, json);
+  DeserializationError err = deserializeJson(doc, json.data(), json.size());
   if (err) {
     ESP_LOGW(TAG, "[aggregate] parse failed: %s", err.c_str());
     return;
@@ -3517,18 +3532,22 @@ void HaAutoPanel::apply_room_aggregates_(const std::string& json) {
     return;
   }
   size_t n_rooms = 0, n_entities = 0;
-  for (JsonObject r : rooms) {
-    const char* aid = r["area_id"] | nullptr;
+  for (size_t i = 0; i < rooms.size(); i++) {
+    JsonObject r = rooms[i].as<JsonObject>();
+    // ArduinoJson 7: r["area_id"] | nullptr returns nullptr
+    // unconditionally (the operator|(JsonVariant, nullptr)
+    // overload doesn't return the string value). Use
+    // as<const char*>() + a separate is<const char*>() check.
+    const char* aid = nullptr;
+    if (r["area_id"].is<const char*>()) {
+      aid = r["area_id"].as<const char*>();
+    }
     if (aid == nullptr) continue;
     RoomAggregate& agg = this->room_aggregates_[aid];
     agg.area_id = aid;
-    if (const char* nm = r["name"] | nullptr) {
-      agg.name = nm;
+    if (r["name"].is<const char*>()) {
+      agg.name = r["name"].as<const char*>();
     }
-    int on_count = r["on_count"] | 0;
-    int max_pct = r["max_pct"] | 0;
-    ESP_LOGD(TAG, "[aggregate]   %s: %d on, max_pct=%d",
-             aid, on_count, max_pct);
     agg.entities.clear();
     JsonObject states = r["states"].as<JsonObject>();
     if (states.isNull()) {
@@ -3540,9 +3559,11 @@ void HaAutoPanel::apply_room_aggregates_(const std::string& json) {
       if (eid_str == nullptr) continue;
       RoomAggregate::Entry e;
       JsonObject s = kv.value().as<JsonObject>();
-      e.state = s["s"] | "";
+      if (s["s"].is<const char*>()) {
+        e.state = s["s"].as<const char*>();
+      }
       e.brightness = (uint8_t) (s["b"] | 0);
-      e.has_brightness = (s["b"] != nullptr);
+      e.has_brightness = (s["b"].is<int>() || s["b"].is<unsigned int>());
       // intern() the entity_id into the arena; the returned
       // string_view stays valid for the component's lifetime.
       std::string_view eid = entity_arena().intern(eid_str);
@@ -3608,9 +3629,9 @@ bool HaAutoPanel::setup_render_template_subscriptions_() {
       : R"DELIM({{ now().strftime('%-I:%M %p') }})DELIM";
   this->clock_sub_id_ = this->template_api_.subscribe(
       clock_tmpl,
-      [this](const std::string& rendered) {
+      [this](const char* rendered) {
         if (this->ws_client_) {
-          this->ws_client_->push_clock_event_(rendered.c_str());
+          this->ws_client_->push_clock_event_(rendered);
         }
       });
   if (this->clock_sub_id_ == 0) {
@@ -3637,9 +3658,9 @@ bool HaAutoPanel::setup_render_template_subscriptions_() {
   }
   this->aggregate_sub_id_ = this->template_api_.subscribe_with_vars(
       this->room_aggregate_template_, this->room_aggregate_variables_,
-      [this](const std::string& rendered) {
+      [this](const char* rendered) {
         if (this->ws_client_) {
-          this->ws_client_->push_aggregate_event_(rendered.c_str());
+          this->ws_client_->push_aggregate_event_(rendered);
         }
       });
   if (this->aggregate_sub_id_ == 0) {
