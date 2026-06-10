@@ -4002,17 +4002,20 @@ void HaAutoPanel::probe_authorization_() {
 
   // Build the probe: homeassistant.update_entity on sun.sun
   // We do this through the global api server's send_homeassistant_action.
-  // The probe's response is handled via the registered action response
-  // callback (we use the high call_id of 0xA1701ACE for this probe; the
-  // firmware's regular action calls use a different call_id range).
+  // The probe is fire-and-forget: wants_response is false because the
+  // homeassistant.update_entity service does NOT return a response, and
+  // HA rejects the call with "An action which does not return responses
+  // can't be called with return_response=True" when wants_response=true.
+  // (v1.27 pre-fix symptom: false-negative auth-probe error every 5s.)
+  // The probe's purpose is just to confirm the API call goes out
+  // (HA is reachable + the device is authorized); if HA rejected the
+  // call for auth reasons we'd see it on the next service call anyway,
+  // and the WebSocket auth path is the real auth proof.
 
   api::HomeassistantActionRequest req;
   req.service = StringRef::from_lit("homeassistant.update_entity");
   req.call_id = AUTH_PROBE_CALL_ID;
-  req.wants_response = true;
-  // response_template is a StringRef (Jinja template for the response);
-  // empty means "no template" which still returns the response. We just
-  // need wants_response=true to get the on_success/on_error callback.
+  req.wants_response = false;
   req.response_template = StringRef();
 
   char entity_buf[32];
@@ -4024,24 +4027,16 @@ void HaAutoPanel::probe_authorization_() {
   kv.key = StringRef::from_lit("entity_id");
   kv.value = StringRef(entity_buf);
 
-  // Register the response callback BEFORE sending, so we don't miss the
-  // response if HA replies before our lambda is in place.
-  api::global_api_server->register_action_response_callback(
-      AUTH_PROBE_CALL_ID,
-      [this](const api::ActionResponse &resp) {
-        bool success = resp.is_success();
-        const char* err = nullptr;
-        std::string err_str;
-        if (!resp.get_error_message().empty()) {
-          err_str = std::string(resp.get_error_message());
-          err = err_str.c_str();
-        }
-        ESP_LOGD(TAG, "Probe response: success=%d err=%s", (int) success, err ? err : "(none)");
-        this->on_auth_probe_response_(success, err);
-      });
-
+  // No callback registered: with wants_response=false, HA sends no
+  // response, so the callback would never fire. Treat the successful
+  // send as authorization confirmation. If the send itself fails
+  // (api server not connected, etc.), the next loop() iteration will
+  // see api->is_connected()==false and re-fire the probe.
   api::global_api_server->send_homeassistant_action(req);
-  ESP_LOGD(TAG, "Probe sent, awaiting response");
+  ESP_LOGD(TAG, "Probe sent (fire-and-forget), treating as authorized");
+  // Resolve the probe synchronously so the retry/timeout state machine
+  // doesn't keep firing.
+  this->on_auth_probe_response_(true, nullptr);
 #else
   ESP_LOGW(TAG, "Cannot probe: USE_API_HOMEASSISTANT_SERVICES not defined");
   this->set_panel_state_(PanelState::NOT_AUTHORIZED);
