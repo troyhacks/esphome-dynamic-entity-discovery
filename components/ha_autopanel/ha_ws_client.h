@@ -522,23 +522,28 @@ inline void HaWsClient::start() {
 
   // Create parse_task. It subscribes itself to the TWDT at the
   // top of parse_task_loop_().
-  BaseType_t r = xTaskCreatePinnedToCore(
-      HaWsClient::parse_task_trampoline_, "ha_ws_parse",
-      PARSE_TASK_STACK, this, PARSE_TASK_PRIO,
-      &this->parse_task_handle_, PARSE_TASK_CORE);
-  if (r != pdPASS) {
-    ESP_LOGE(HA_WS_TAG, "xTaskCreatePinnedToCore(parse_task) failed: %d", r);
-    esp_websocket_client_destroy(this->client_);
-    this->client_ = nullptr;
-    return;
+  // v1.27 reconnect fix: if we're being re-entered (parse_task
+  // already exists), skip task creation - the existing one
+  // will pick up the new client.
+  if (this->parse_task_handle_ == nullptr) {
+    BaseType_t r = xTaskCreatePinnedToCore(
+        HaWsClient::parse_task_trampoline_, "ha_ws_parse",
+        PARSE_TASK_STACK, this, PARSE_TASK_PRIO,
+        &this->parse_task_handle_, PARSE_TASK_CORE);
+    if (r != pdPASS) {
+      ESP_LOGE(HA_WS_TAG, "xTaskCreatePinnedToCore(parse_task) failed: %d", r);
+      esp_websocket_client_destroy(this->client_);
+      this->client_ = nullptr;
+      return;
+    }
   }
   this->raw_queue_.set_task_to_notify(this->parse_task_handle_);
 
   // Start the WS client
   this->ws_state_.store(HaWsState::CONNECTING, std::memory_order_release);
   esp_websocket_client_start(this->client_);
-  ESP_LOGI(HA_WS_TAG, "start: client started, parse task created on core %d",
-           PARSE_TASK_CORE);
+  ESP_LOGI(HA_WS_TAG, "start: client started, parse task on core %d%s",
+           PARSE_TASK_CORE, this->parse_task_handle_ != nullptr ? " (re-used)" : " (new)");
 }
 
 inline void HaWsClient::stop_() {
@@ -695,6 +700,37 @@ inline void HaWsClient::on_ws_data_chunk_(const esp_websocket_event_data_t* ev) 
 inline void HaWsClient::on_ws_closed_() {
   ESP_LOGI(HA_WS_TAG, "WEBSOCKET_EVENT_CLOSED");
   this->ws_state_.store(HaWsState::DISCONNECTED, std::memory_order_release);
+  // v1.27 reconnect fix: the esp_websocket_client's
+  // auto-reconnect (cfg.disable_auto_reconnect = false) isn't
+  // triggering in our setup - we see a single CONNECTED,
+  // a 9.5s wait for auth_required, then an immediate CLOSE
+  // 4ms after auth. After CLOSE, no further CONNECTED ever
+  // fires. The WS stays dead and the panel loses all
+  // state_changed + render_template events (clock, light
+  // state, etc.).
+  //
+  // Workaround: schedule a manual re-start after a short
+  // backoff. We use set_timeout (which runs on loopTask) so
+  // we don't spin in the IDF event handler. The start() guard
+  // (if (this->client_ != nullptr) return) prevents
+  // double-start, so we tear down the dead client first.
+  if (this->stopping_.load(std::memory_order_acquire)) return;
+  if (this->client_ == nullptr) return;
+  // Capture pointers locally; set_timeout runs on loopTask
+  // after we're back in the IDF event loop, so we need to be
+  // careful about ordering.
+  esp_websocket_client_handle_t dead = this->client_;
+  this->client_ = nullptr;
+  this->set_timeout("ha_ws_reconnect", 2000, [this, dead]() {
+    if (this->stopping_.load(std::memory_order_acquire)) return;
+    if (this->client_ != nullptr) return;  // already restarted
+    if (dead != nullptr) {
+      esp_websocket_client_stop(dead);
+      esp_websocket_client_destroy(dead);
+    }
+    ESP_LOGW(HA_WS_TAG, "reconnect: re-starting websocket client");
+    this->start();
+  });
 }
 
 inline void HaWsClient::on_ws_error_() {
