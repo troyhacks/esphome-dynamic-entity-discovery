@@ -4474,7 +4474,38 @@ void HaAutoPanel::apply_config_file_(const std::string &body) {
     return;
   }
   if (doc["api_url"].is<const char*>()) {
-    this->ha_api_url_ = doc["api_url"].as<std::string>();
+    std::string stored = doc["api_url"].as<std::string>();
+    // v1.27: validate the stored URL. The /autopanel web
+    // form has been observed to save a URL with a leading
+    // colon after the scheme (e.g. "http://:host:8123" -
+    // looks like the form's value="<host>" attribute got
+    // prefixed with "http://:" somewhere). The IDF http_client
+    // then passes host=":host" to getaddrinfo() and fails with
+    // EAI_NONAME (202). Same value gets picked up by the
+    // WebSocket transport (more tolerant), so the symptom is
+    // the http_request's home/weather template fetch failing
+    // while the panel still appears to come up.
+    //
+    // Validation: URL must start with "http://" or "https://",
+    // and the character immediately after "://" must NOT be ":"
+    // (or whitespace, or end of string).
+    bool valid = false;
+    if (stored.rfind("http://", 0) == 0 || stored.rfind("https://", 0) == 0) {
+      size_t scheme_end = stored.find("://") + 3;
+      if (scheme_end < stored.size() && stored[scheme_end] != ':' &&
+          stored[scheme_end] != '/' && stored[scheme_end] != ' ' &&
+          stored[scheme_end] != '\0') {
+        valid = true;
+      }
+    }
+    if (valid) {
+      this->ha_api_url_ = stored;
+      ESP_LOGI(TAG, "Config applied: api_url=%s (from storage)", stored.c_str());
+    } else {
+      ESP_LOGE(TAG, "Config rejected: api_url='%s' malformed, "
+                    "falling back to YAML default='%s'",
+                    stored.c_str(), this->ha_api_url_.c_str());
+    }
   }
   if (doc["api_token"].is<const char*>()) {
     this->ha_api_password_ = doc["api_token"].as<std::string>();
