@@ -28,10 +28,15 @@
 // pointer target must have C linkage so it matches the
 // osi_funcs_t signature (which is declared extern "C"-friendly
 // in the managed component).
+extern "C" void* ha_autopanel_hosted_malloc_internal(size_t size) {
+  return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+// Forward-declare the osi_funcs struct and the global instance
+// the managed component owns. The struct is defined in
+// managed_components/espressif__esp_hosted/host/esp_hosted_os_abstraction.h.
 extern "C" {
-  void* ha_autopanel_hosted_malloc_internal(size_t size) {
-    return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  }
+extern hosted_osi_funcs_t g_hosted_osi_funcs;
 }
 #include "esphome/core/string_ref.h"
 #include "esphome/components/json/json_util.h"
@@ -290,9 +295,6 @@ void HaAutoPanel::setup() {
   // packets are short-lived (consumed and freed in the same
   // task tick) so the cost is in-flight only.
   {
-    extern "C" {
-      extern hosted_osi_funcs_t g_hosted_osi_funcs;
-    }
     g_hosted_osi_funcs._h_malloc = ha_autopanel_hosted_malloc_internal;
     ESP_LOGI(TAG, "ESP Hosted: _h_malloc overridden with heap_caps_malloc(MALLOC_CAP_INTERNAL)");
   }
