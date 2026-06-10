@@ -11,6 +11,11 @@
 // from esp_hosted at boot so we can rule out (or in) the
 // slave firmware as a cause of the SDIO/heap issues.
 #include "esp_hosted.h"
+// v1.27 fix: override the ESP Hosted osi_funcs._h_malloc with
+// a heap_caps_malloc(MALLOC_CAP_INTERNAL) so SDIO payload
+// copies (sdio_process_rx_task in sdio_drv.c) always land in
+// DMA-capable internal SRAM, not PSRAM.
+#include "esp_heap_caps.h"
 
 #include "esphome/core/log.h"
 #include "esphome/core/string_ref.h"
@@ -254,6 +259,28 @@ struct RoomControlData {
 void HaAutoPanel::setup() {
   ESP_LOGI(TAG, "Dynamic Entity Discovery starting...");
   s_instance = this;
+
+  // v1.27 fix: override ESP Hosted's _h_malloc with an
+  // internal-SRAM-only allocator. The SDIO RX task
+  // (sdio_process_rx_task in sdio_drv.c:1335) allocates the
+  // payload copy buffer via g_h.funcs->_h_malloc(...). The
+  // default hosted_malloc is just plain malloc(), which can
+  // return a PSRAM pointer when internal SRAM is fragmented.
+  // The SDIO DMA engine needs DMA-capable memory (== internal
+  // SRAM); a PSRAM pointer triggers
+  //     assert failed: sdio_process_rx_task sdio_drv.c:1336 (copy_payload)
+  // which crashes the P4 and reboots. Forcing MALLOC_CAP_INTERNAL
+  // keeps the SDIO payload out of the fragmented heap. Costs us
+  // a small amount of internal SRAM per SDIO packet, but those
+  // packets are short-lived (consumed and freed in the same
+  // task tick) so the cost is in-flight only.
+  {
+    extern hosted_osi_funcs_t g_hosted_osi_funcs;
+    g_hosted_osi_funcs._h_malloc = [](size_t size) -> void* {
+      return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    };
+    ESP_LOGI(TAG, "ESP Hosted: _h_malloc overridden with heap_caps_malloc(MALLOC_CAP_INTERNAL)");
+  }
 
   // v1.27 debug: print host library + C6 (slave) firmware
   // versions so we know what's running. The C6 firmware is
