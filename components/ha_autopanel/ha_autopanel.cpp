@@ -799,6 +799,19 @@ void HaAutoPanel::fetch_home_name_() {
              (unsigned)HOME_FETCH_INTERVAL_MS);
     return;
   }
+  // v1.27: stamp the throttle BEFORE the network call (not
+  // after). The previous code only updated last_home_fetch_ms_
+  // on the success path, so a failure (template render error,
+  // DNS, http_request timeout) would leave the timestamp
+  // unchanged and the periodic loop() call would retry on
+  // EVERY loop() iteration - which, combined with the 7s
+  // http_request timeout, produced the observed "fetch every
+  // 7s" pattern and SDIO transport starvation. Setting it
+  // here means a failed fetch still throttles the next
+  // attempt to one per HOME_FETCH_INTERVAL_MS, exactly like
+  // a successful one. Success-path code below is now a
+  // no-op assignment (kept for clarity).
+  this->last_home_fetch_ms_ = now;
 
   ESP_LOGI(TAG, "[home] fetching zone.home friendly_name via /api/template");
 
@@ -896,6 +909,10 @@ void HaAutoPanel::fetch_weather_() {
       (now - this->last_weather_fetch_ms_) < WEATHER_FETCH_INTERVAL_MS) {
     return;
   }
+  // v1.27: stamp the throttle BEFORE the network call (not
+  // after) so a failed fetch still throttles the next
+  // attempt. See fetch_home_name_() for the full rationale.
+  this->last_weather_fetch_ms_ = now;
 
   // v1.27: build the Jinja2 template. The entity_id is
   // interpolated from the yaml knob (default

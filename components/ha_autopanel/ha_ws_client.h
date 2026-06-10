@@ -504,7 +504,13 @@ inline void HaWsClient::start() {
   ESP_LOGI(HA_WS_TAG, "start: %zu entity_ids snapshotted, connecting to %s",
            this->our_entity_ids_.size(), this->ws_uri_.c_str());
 
-  // esp_websocket_client config
+  // v1.27: bump network_timeout_ms 10s -> 30s. The previous value
+  // caused the WebSocket to drop on a single 10s SDIO transport
+  // silence (which happens during the home/weather template
+  // fetch retries, and during periodic state events). 30s gives
+  // the SDIO time to recover without disconnecting the session.
+  // The on_ws_closed_() reconnect logic still handles the case
+  // where the connection really is dead.
   esp_websocket_client_config_t cfg = {};
   cfg.uri               = this->ws_uri_.c_str();
   cfg.task_prio         = WS_TASK_PRIO;
@@ -512,7 +518,7 @@ inline void HaWsClient::start() {
   cfg.buffer_size       = WS_RX_BUFFER_BYTES;
   cfg.user_context      = this;
   cfg.disable_auto_reconnect = false;
-  cfg.network_timeout_ms = 10000;
+  cfg.network_timeout_ms = 30000;
   cfg.ping_interval_sec  = PING_INTERVAL_SEC;
   cfg.pingpong_timeout_sec = PING_TIMEOUT_SEC;
   cfg.transport = WEBSOCKET_TRANSPORT_OVER_TCP;
@@ -1005,7 +1011,6 @@ inline bool HaWsClient::derive_ws_uri_() {
   // http://x:8123 -> ws://x:8123/api/websocket
   // https://x:8123 -> wss://x:8123/api/websocket
   const std::string& u = this->http_url_;
-  ESP_LOGW(HA_WS_TAG, "derive_ws_uri_: http_url_='%s' (len=%u)", u.c_str(), (unsigned) u.size());
   if (u.rfind("https://", 0) == 0) {
     this->ws_uri_ = "wss://" + u.substr(8) + "/api/websocket";
   } else if (u.rfind("http://", 0) == 0) {
@@ -1013,7 +1018,6 @@ inline bool HaWsClient::derive_ws_uri_() {
   } else {
     return false;
   }
-  ESP_LOGW(HA_WS_TAG, "derive_ws_uri_: ws_uri_='%s'", this->ws_uri_.c_str());
   return true;
 }
 
