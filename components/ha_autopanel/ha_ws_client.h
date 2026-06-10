@@ -1005,6 +1005,7 @@ inline bool HaWsClient::derive_ws_uri_() {
   // http://x:8123 -> ws://x:8123/api/websocket
   // https://x:8123 -> wss://x:8123/api/websocket
   const std::string& u = this->http_url_;
+  ESP_LOGW(HA_WS_TAG, "derive_ws_uri_: http_url_='%s' (len=%u)", u.c_str(), (unsigned) u.size());
   if (u.rfind("https://", 0) == 0) {
     this->ws_uri_ = "wss://" + u.substr(8) + "/api/websocket";
   } else if (u.rfind("http://", 0) == 0) {
@@ -1012,6 +1013,7 @@ inline bool HaWsClient::derive_ws_uri_() {
   } else {
     return false;
   }
+  ESP_LOGW(HA_WS_TAG, "derive_ws_uri_: ws_uri_='%s'", this->ws_uri_.c_str());
   return true;
 }
 
