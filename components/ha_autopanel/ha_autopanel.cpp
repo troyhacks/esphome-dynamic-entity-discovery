@@ -18,6 +18,21 @@
 #include "esp_heap_caps.h"
 
 #include "esphome/core/log.h"
+
+// v1.27 fix: internal-SRAM-only malloc that we wire into the
+// ESP Hosted osi_funcs._h_malloc slot from HaAutoPanel::setup().
+// The SDIO RX task allocates a payload copy buffer through this
+// hook; if it lands in PSRAM the SDIO DMA engine can't use it
+// and asserts at sdio_drv.c:1336. Keeping it on internal SRAM
+// is the only way to guarantee DMA-capable memory. Function
+// pointer target must have C linkage so it matches the
+// osi_funcs_t signature (which is declared extern "C"-friendly
+// in the managed component).
+extern "C" {
+  void* ha_autopanel_hosted_malloc_internal(size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+}
 #include "esphome/core/string_ref.h"
 #include "esphome/components/json/json_util.h"
 // v1.22s: font-related (originally needed for externs but those
@@ -275,10 +290,10 @@ void HaAutoPanel::setup() {
   // packets are short-lived (consumed and freed in the same
   // task tick) so the cost is in-flight only.
   {
-    extern hosted_osi_funcs_t g_hosted_osi_funcs;
-    g_hosted_osi_funcs._h_malloc = [](size_t size) -> void* {
-      return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    };
+    extern "C" {
+      extern hosted_osi_funcs_t g_hosted_osi_funcs;
+    }
+    g_hosted_osi_funcs._h_malloc = ha_autopanel_hosted_malloc_internal;
     ESP_LOGI(TAG, "ESP Hosted: _h_malloc overridden with heap_caps_malloc(MALLOC_CAP_INTERNAL)");
   }
 
