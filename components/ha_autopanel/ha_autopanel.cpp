@@ -32,6 +32,21 @@ extern "C" void* ha_autopanel_hosted_malloc_internal(size_t size) {
   return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
+// v1.27 fix: aligned variant. The SDIO driver also calls
+// _h_malloc_align for the RX double-buffer (sdio_rx_get_buffer
+// in sdio_drv.c:952). The default hosted_malloc_align is
+// heap_caps_aligned_alloc(align, size, MALLOC_CAP_INTERNAL |
+// MALLOC_CAP_DMA | MALLOC_CAP_8BIT). When the internal SRAM is
+// fragmented, even the aligned alloc returns NULL and the
+// assert at line 953 fires. We swap to heap_caps_aligned_alloc
+// with just MALLOC_CAP_INTERNAL (no DMA flag, no 8BIT - the
+// P4's internal SRAM is all DMA-capable, but asking for it
+// adds an extra capability that constrains the allocator's
+// choice of free block).
+extern "C" void* ha_autopanel_hosted_malloc_align_internal(size_t size, size_t align) {
+  return heap_caps_aligned_alloc(align, size, MALLOC_CAP_INTERNAL);
+}
+
 // Forward-declare the osi_funcs struct and the global instance
 // the managed component owns. The struct is defined in
 // managed_components/espressif__esp_hosted/host/esp_hosted_os_abstraction.h.
@@ -296,7 +311,8 @@ void HaAutoPanel::setup() {
   // task tick) so the cost is in-flight only.
   {
     g_hosted_osi_funcs._h_malloc = ha_autopanel_hosted_malloc_internal;
-    ESP_LOGI(TAG, "ESP Hosted: _h_malloc overridden with heap_caps_malloc(MALLOC_CAP_INTERNAL)");
+    g_hosted_osi_funcs._h_malloc_align = ha_autopanel_hosted_malloc_align_internal;
+    ESP_LOGI(TAG, "ESP Hosted: _h_malloc and _h_malloc_align overridden with heap_caps MALLOC_CAP_INTERNAL");
   }
 
   // v1.27 debug: print host library + C6 (slave) firmware
