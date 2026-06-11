@@ -11,40 +11,102 @@
 // from esp_hosted at boot so we can rule out (or in) the
 // slave firmware as a cause of the SDIO/heap issues.
 #include "esp_hosted.h"
-// v1.27 fix: override the ESP Hosted osi_funcs._h_malloc with
-// a heap_caps_malloc(MALLOC_CAP_INTERNAL) so SDIO payload
-// copies (sdio_process_rx_task in sdio_drv.c) always land in
-// DMA-capable internal SRAM, not PSRAM.
+// v1.28 fix: override the ESP Hosted osi_funcs._h_malloc with
+// a cache-line-aligned PSRAM allocator (with internal-SRAM
+// fallback). See the ha_autopanel_hosted_malloc*() function
+// comments below for the full design.
 #include "esp_heap_caps.h"
+// v1.28 fix: ESP-IDF private header for esp_cache_get_alignment()
+// - the only way to get the cache-line size the SDMMC layer's
+// esp_cache_msync() will validate. Not in the public esp_cache.h.
+#include "esp_private/esp_cache_private.h"
 
 #include "esphome/core/log.h"
 
-// v1.27 fix: internal-SRAM-only malloc that we wire into the
-// ESP Hosted osi_funcs._h_malloc slot from HaAutoPanel::setup().
-// The SDIO RX task allocates a payload copy buffer through this
-// hook; if it lands in PSRAM the SDIO DMA engine can't use it
-// and asserts at sdio_drv.c:1336. Keeping it on internal SRAM
-// is the only way to guarantee DMA-capable memory. Function
-// pointer target must have C linkage so it matches the
-// osi_funcs_t signature (which is declared extern "C"-friendly
-// in the managed component).
-extern "C" void* ha_autopanel_hosted_malloc_internal(size_t size) {
-  return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+// v1.28 SDIO/DMA + P4 cache-alignment fix (replaces the
+// v1.27 "force MALLOC_CAP_INTERNAL" crutch).
+//
+// Background:
+//   The ESP-Hosted SDIO driver allocates a ~15KB+ payload
+//   copy buffer via _h_malloc when HA pushes the per-area
+//   aggregate render_template event. On P4:
+//     - The DMA controller can physically access PSRAM, so
+//       the default hosted_malloc (which lands in PSRAM when
+//       internal SRAM is fragmented) actually does work for
+//       the DMA transfer itself.
+//     - BUT the SDMMC hardware layer runs esp_cache_msync()
+//       on the buffer before/after the DMA. This function
+//       requires both the base address AND the size to be
+//       exact multiples of the L2 cache-line size. A plain
+//       heap_caps_malloc(PSRAM) gives you neither guarantee,
+//       so esp_cache_msync() panics with:
+//         "cache: esp_cache_msync(113): invalid addr or null pointer"
+//   The v1.27 crutch forced MALLOC_CAP_INTERNAL to dodge the
+//   cache-sync issue (internal SRAM doesn't need msync), but
+//   15KB out of 384KB of internal heap OOMs once any other
+//   subsystem (LVGL, JSON parse, http buffers) fragments the
+//   internal heap, returning NULL and tripping the same
+//   esp_cache_msync(NULL) panic downstream.
+//
+// Fix: ask the cache layer for its required alignment, then
+// heap_caps_aligned_alloc() with that alignment, padded size,
+// and the right caps. PSRAM with MALLOC_CAP_DMA works on P4
+// (P4's DMA crosses the cache through dedicated paths, hence
+// the msync requirement). Falls back to aligned internal SRAM
+// if PSRAM is exhausted.
+static size_t ha_autopanel_cache_line_size_() {
+  // The function is private in esp_cache_private.h but the
+  // signature is stable across IDF 5.x. Returns the L1/L2
+  // data-cache line size for the requested memory region.
+  // For PSRAM (MALLOC_CAP_SPIRAM) on P4 this is 64 bytes;
+  // for internal SRAM it's 32 bytes.
+  size_t align = 0;
+  if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                              &align) == ESP_OK && align > 0) {
+    return align;
+  }
+  return 64;  // P4 default cache line
 }
 
-// v1.27 fix: aligned variant. The SDIO driver also calls
-// _h_malloc_align for the RX double-buffer (sdio_rx_get_buffer
-// in sdio_drv.c:952). The default hosted_malloc_align is
-// heap_caps_aligned_alloc(align, size, MALLOC_CAP_INTERNAL |
-// MALLOC_CAP_DMA | MALLOC_CAP_8BIT). When the internal SRAM is
-// fragmented, even the aligned alloc returns NULL and the
-// assert at line 953 fires. We swap to heap_caps_aligned_alloc
-// with just MALLOC_CAP_INTERNAL (no DMA flag, no 8BIT - the
-// P4's internal SRAM is all DMA-capable, but asking for it
-// adds an extra capability that constrains the allocator's
-// choice of free block).
-extern "C" void* ha_autopanel_hosted_malloc_align_internal(size_t size, size_t align) {
-  return heap_caps_aligned_alloc(align, size, MALLOC_CAP_INTERNAL);
+static size_t ha_autopanel_align_up_(size_t n, size_t a) {
+  return (n + a - 1) & ~(a - 1);
+}
+
+// v1.28: PSRAM-first, cache-aligned, with internal-SRAM
+// fallback. Function pointer target must have C linkage so it
+// matches the osi_funcs_t signature (extern "C" in the
+// managed component).
+extern "C" void* ha_autopanel_hosted_malloc(size_t size) {
+  if (size == 0) return nullptr;
+  const size_t align = ha_autopanel_cache_line_size_();
+  const size_t padded = ha_autopanel_align_up_(size, align);
+  // PSRAM first - 32MB on the Waveshare 10.1" panel, plenty
+  // of room for a 15KB SDIO RX buffer. MALLOC_CAP_DMA is
+  // valid for P4 PSRAM (the DMA controller can reach it via
+  // the dedicated cache-coherent path).
+  void* p = heap_caps_aligned_alloc(align, padded,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  if (p != nullptr) return p;
+  // PSRAM exhausted: fall back to aligned internal SRAM. Still
+  // cache-line-aligned in case the SDMMC layer ever runs a
+  // msync on the buffer (defensive - the P4's internal SRAM
+  // doesn't strictly need it).
+  return heap_caps_aligned_alloc(align, padded, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+// v1.28: aligned variant. The SDIO driver calls _h_malloc_align
+// for the RX double-buffer (sdio_rx_get_buffer in sdio_drv.c:952).
+// Honour the caller's alignment if stricter than the cache line.
+extern "C" void* ha_autopanel_hosted_malloc_align(size_t size, size_t align) {
+  if (size == 0) return nullptr;
+  const size_t cache_align = ha_autopanel_cache_line_size_();
+  const size_t use_align = (align > cache_align) ? align : cache_align;
+  const size_t padded = ha_autopanel_align_up_(size, use_align);
+  void* p = heap_caps_aligned_alloc(use_align, padded,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  if (p != nullptr) return p;
+  return heap_caps_aligned_alloc(use_align, padded,
+                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 // Forward-declare the osi_funcs struct and the global instance
@@ -295,24 +357,23 @@ void HaAutoPanel::setup() {
   ESP_LOGI(TAG, "Dynamic Entity Discovery starting...");
   s_instance = this;
 
-  // v1.27 fix: override ESP Hosted's _h_malloc with an
-  // internal-SRAM-only allocator. The SDIO RX task
+  // v1.28 fix: override ESP Hosted's _h_malloc with a
+  // cache-line-aligned PSRAM allocator. The SDIO RX task
   // (sdio_process_rx_task in sdio_drv.c:1335) allocates the
-  // payload copy buffer via g_h.funcs->_h_malloc(...). The
-  // default hosted_malloc is just plain malloc(), which can
-  // return a PSRAM pointer when internal SRAM is fragmented.
-  // The SDIO DMA engine needs DMA-capable memory (== internal
-  // SRAM); a PSRAM pointer triggers
-  //     assert failed: sdio_process_rx_task sdio_drv.c:1336 (copy_payload)
-  // which crashes the P4 and reboots. Forcing MALLOC_CAP_INTERNAL
-  // keeps the SDIO payload out of the fragmented heap. Costs us
-  // a small amount of internal SRAM per SDIO packet, but those
-  // packets are short-lived (consumed and freed in the same
-  // task tick) so the cost is in-flight only.
+  // payload copy buffer via g_h.funcs->_h_malloc(...). On P4,
+  // the SDMMC layer runs esp_cache_msync() on the buffer,
+  // which requires both the base address and the size to be
+  // multiples of the cache-line size. PSRAM is the right
+  // memory to use (32MB available) but needs the alignment
+  // guarantee; internal SRAM is the fallback. See the
+  // ha_autopanel_hosted_malloc*() function comments above
+  // for the full design.
   {
-    g_hosted_osi_funcs._h_malloc = ha_autopanel_hosted_malloc_internal;
-    g_hosted_osi_funcs._h_malloc_align = ha_autopanel_hosted_malloc_align_internal;
-    ESP_LOGI(TAG, "ESP Hosted: _h_malloc and _h_malloc_align overridden with heap_caps MALLOC_CAP_INTERNAL");
+    g_hosted_osi_funcs._h_malloc = ha_autopanel_hosted_malloc;
+    g_hosted_osi_funcs._h_malloc_align = ha_autopanel_hosted_malloc_align;
+    size_t align = ha_autopanel_cache_line_size_();
+    ESP_LOGI(TAG, "ESP Hosted: _h_malloc overridden (PSRAM cache-aligned, cache_line=%u)",
+             (unsigned) align);
   }
 
   // v1.27 debug: print host library + C6 (slave) firmware
