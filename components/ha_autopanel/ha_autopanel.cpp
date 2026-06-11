@@ -155,6 +155,7 @@ extern hosted_osi_funcs_t g_hosted_osi_funcs;
 #include <lvgl.h>
 #include <climits>  // for INT_MAX in split_room_name_to_fit_
 #include <cmath>    // v1.22s: std::lround, std::isnan (weather temp parse)
+#include <algorithm>  // std::min in call_ha_service_
 // v1.22y: re-introduce the C6 reset GPIO via driver/gpio.h.
 // v1.22u had this (it was the dedicated wedge_detector_task's
 // recovery action: drive GPIO32 low for 100ms then release).
@@ -3367,6 +3368,33 @@ void HaAutoPanel::call_ha_service_(std::string_view service,
              (int) service.size(), service.data(),
              (int) target_type.size(), target_type.data(),
              (int) target_id.size(), target_id.data());
+    return;
+  }
+
+  // v1.28 diagnostic gate: the service-call path (esp.
+  // RepeatedPtrField::init / emplace_back and
+  // send_homeassistant_action) allocates via C++ operator new,
+  // which calls __cxa_throw on failure. The throw bubbles up to
+  // cxx_exception_stubs which assert()s and reboots the P4 (per
+  // memory project_crowpanel_cxx_throw_abort.md). With this
+  // component built -fno-exceptions, try/catch won't compile.
+  // Best alternative: check the internal heap BEFORE the alloc;
+  // if the largest contiguous block is too small for a protobuf
+  // message (~512B is plenty), skip the call and log. The HA
+  // action is silently dropped, the panel survives, and the log
+  // tells us whether fragmentation is the actual root cause.
+  // Threshold: 1KB. The protobuf message itself is small
+  // (~50-100B), but FixedVector realloc doubles capacity, and
+  // other subsystems (LVGL, JSON) compete for the same heap.
+  constexpr size_t HEAP_HEADROOM_BYTES = 1024;
+  size_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  if (int_largest < HEAP_HEADROOM_BYTES) {
+    size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t int_min  = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    size_t ps_free  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGE(TAG, "call_ha_service_: SKIPPED (heap fragmented) for %s %s=%.*s - int_free=%u int_largest=%u int_min_ever=%u psram_free=%u",
+             service.data(), target_type.data(), (int) target_id.size(), target_id.data(),
+             (unsigned) int_free, (unsigned) int_largest, (unsigned) int_min, (unsigned) ps_free);
     return;
   }
 

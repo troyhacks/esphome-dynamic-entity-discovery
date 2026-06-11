@@ -134,6 +134,13 @@ struct PsramStlAllocator {
 // payload, it just gives Entity cheap reference storage.
 class StringArena {
  public:
+  StringArena() {
+    // Pre-allocate so the first ~2048 intern() calls don't
+    // realloc. Capacity covers ~415 entities * 4-5 strings
+    // each with headroom. PSRAM has 32MB so this is cheap.
+    strings_.reserve(2048);
+  }
+
   // Intern a C string + length. Returns a view into arena-owned
   // storage; the view remains valid until the arena is destroyed
   // (component lifetime).
@@ -143,12 +150,13 @@ class StringArena {
     // icon). Hand back a view of a static "" to avoid burning arena
     // slots on duplicates.
     if (n == 0) return std::string_view("", 0);
-    // Construct the std::string in the deque. If its payload is
-    // short enough for SSO, no separate alloc happens; the SSO
-    // buffer is part of the string struct inside the deque slot
-    // and is therefore stable. If longer, std::string allocates
-    // its own buffer from the default heap, which is also stable
-    // as long as the std::string is alive.
+    // Construct the std::string in the vector. The vector was
+    // reserve()d in the ctor, so emplace_back is a pointer
+    // bump and string addresses stay stable. If the string
+    // payload is short (entity_id ~17 chars, domain ~6, name
+    // ~12, area_id ~10) SSO keeps it inline in the struct;
+    // longer strings fall back to a separate heap alloc but
+    // the std::string itself is still stable in the vector.
     strings_.emplace_back(s, n);
     return std::string_view(strings_.back().data(), n);
   }
@@ -184,7 +192,25 @@ class StringArena {
   }
 
  private:
-  std::deque<std::string> strings_;
+  // v1.28: PSRAM-backed vector (reserved upfront to avoid
+  // realloc). The previous std::deque<std::string> with the
+  // default allocator was throwing std::bad_alloc on
+  // fragmented internal heap when the deque grew - the throw
+  // bubbled to cxx_exception_stubs which assert()s and
+  // reboots. With 32MB of PSRAM available, the vector's
+  // backing array (and the std::string SSO buffers inside
+  // it) live in PSRAM. reserve(2048) covers ~415 entities *
+  // 4-5 strings each (entity_id, domain, name, area_id)
+  // with headroom. If we ever exceed 2048, the realloc will
+  // move all elements and invalidate the string_views -
+  // upstream code already handles this via the
+  // start_discovery_() flow which re-interns everything, so
+  // realloc is acceptable as a "growth event" boundary.
+  // std::string SSO keeps entity_id (~17 chars), domain
+  // (~6), name (~12), area_id (~10) all in the struct, so
+  // no separate string-allocator allocs happen either.
+  std::vector<std::string, PsramStlAllocator<std::string>> strings_{
+      PsramStlAllocator<std::string>()};
 };
 
 // One global arena, owned by the singleton instance. The Entity
