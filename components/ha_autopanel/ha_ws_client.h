@@ -517,7 +517,14 @@ inline void HaWsClient::start() {
   cfg.task_stack        = WS_TASK_STACK;
   cfg.buffer_size       = WS_RX_BUFFER_BYTES;
   cfg.user_context      = this;
-  cfg.disable_auto_reconnect = false;
+  // v1.27: disable_auto_reconnect=false was the default, but
+  // the esp_websocket_client auto-reconnect path hits an
+  // upstream IDF 6.0.1 bug where the host is parsed as
+  // ":homeassistant.local" (leading colon) on reconnect. Our
+  // manual on_ws_closed_ -> ha_autopanel::loop -> start()
+  // path is a clean init with the correct cfg.uri, so
+  // disable auto-reconnect and let our own reconnect do it.
+  cfg.disable_auto_reconnect = true;
   cfg.network_timeout_ms = 30000;
   cfg.ping_interval_sec  = PING_INTERVAL_SEC;
   cfg.pingpong_timeout_sec = PING_TIMEOUT_SEC;
