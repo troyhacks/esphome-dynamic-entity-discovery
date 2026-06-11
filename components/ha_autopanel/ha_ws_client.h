@@ -666,6 +666,39 @@ inline void HaWsClient::on_ws_disconnected_() {
     this->inflight_cap_ = 0;
     this->inflight_len_ = 0;
   }
+  // v1.27 reconnect fix (take 2): in the IDF 6.0.1 transport-
+  // error path (no PONG, dropped TCP, etc.) the websocket_task
+  // sets client->run = false and dispatches DISCONNECTED, but
+  // it does NOT dispatch CLOSED. CLOSED is only fired from the
+  // WEBSOCKET_STATE_CLOSING branch (esp_websocket_client.c:1132),
+  // which we never enter on a transport error (set_error_state
+  // jumps straight to UNKNOW). So on_ws_closed_() never runs
+  // and the teardown logic that used to live there never fires
+  // - the WS stays dead and the panel loses clock + state
+  // updates for the rest of uptime. The previous "fix" was to
+  // put the teardown in on_ws_closed_(), which never runs in
+  // this scenario. Move it here.
+  //
+  // We can't call esp_websocket_client_stop() from this event
+  // handler: the handler runs on the websocket_task and stop()
+  // refuses to run from the same task (stop_wait_task() returns
+  // ESP_FAIL on the same-task guard at line 456). Use
+  // esp_websocket_client_destroy_on_exit() instead - it's a
+  // non-blocking flag set; the websocket_task will see
+  // client->run = false (set by set_error_state), exit its
+  // main loop, then call destroy_and_free_resources() itself
+  // because selected_for_destroying is now true. We just
+  // release our C++ reference (client_ = nullptr) and let
+  // ha_autopanel::loop() create a new client after a backoff.
+  if (!this->stopping_.load(std::memory_order_acquire) &&
+      this->client_ != nullptr) {
+    esp_websocket_client_handle_t dead = this->client_;
+    this->client_ = nullptr;
+    esp_websocket_client_destroy_on_exit(dead);
+    this->last_closed_ms_.store((uint32_t) millis(), std::memory_order_release);
+    this->needs_reconnect_.store(true, std::memory_order_release);
+    ESP_LOGW(HA_WS_TAG, "ws: deferred destroy requested; parent loop will reconnect");
+  }
 }
 
 inline void HaWsClient::on_ws_data_chunk_(const esp_websocket_event_data_t* ev) {
@@ -725,31 +758,35 @@ inline void HaWsClient::on_ws_data_chunk_(const esp_websocket_event_data_t* ev) 
 inline void HaWsClient::on_ws_closed_() {
   ESP_LOGI(HA_WS_TAG, "WEBSOCKET_EVENT_CLOSED");
   this->ws_state_.store(HaWsState::DISCONNECTED, std::memory_order_release);
-  // v1.27 reconnect fix: the esp_websocket_client's
-  // auto-reconnect (cfg.disable_auto_reconnect = false) isn't
-  // triggering in our setup - we see a single CONNECTED,
-  // a 9.5s wait for auth_required, then an immediate CLOSE
-  // 4ms after auth. After CLOSE, no further CONNECTED ever
-  // fires. The WS stays dead and the panel loses all
-  // state_changed + render_template events (clock, light
-  // state, etc.).
-  //
-  // HaWsClient doesn't inherit from Component (no
-  // set_timeout), so we just tear down the dead client here
-  // and let ha_autopanel::loop() notice the DISCONNECTED
-  // state, do a backoff, and call start() to re-create the
-  // client. The start() guard (if (this->client_ != nullptr)
-  // return) prevents double-start.
-  if (this->stopping_.load(std::memory_order_acquire)) return;
-  if (this->client_ == nullptr) return;
-  esp_websocket_client_handle_t dead = this->client_;
-  this->client_ = nullptr;
-  if (dead != nullptr) {
-    esp_websocket_client_stop(dead);
-    esp_websocket_client_destroy(dead);
+  if (this->inflight_buf_ != nullptr) {
+    heap_caps_free(this->inflight_buf_);
+    this->inflight_buf_ = nullptr;
+    this->inflight_cap_ = 0;
+    this->inflight_len_ = 0;
   }
-  this->last_closed_ms_.store((uint32_t) millis(), std::memory_order_release);
-  this->needs_reconnect_.store(true, std::memory_order_release);
+  // v1.27: in the IDF 6.0.1 transport-error path CLOSED
+  // doesn't fire (see comment in on_ws_disconnected_()). The
+  // teardown now lives there. This handler is kept as a
+  // safety net for the clean-shutdown path: if CLOSED does
+  // fire (e.g. server-initiated close), do the same teardown.
+  // Idempotent: skips if client_ is already null (DISCONNECTED
+  // ran first and handled it).
+  //
+  // Note: the old code called esp_websocket_client_stop() and
+  // esp_websocket_client_destroy() here, but both refuse to
+  // run from the websocket_task (stop_wait_task() same-task
+  // guard, destroy() then calls stop_wait_task again). The
+  // destroy_on_exit() pattern is the only safe way to tear
+  // down from this context.
+  if (!this->stopping_.load(std::memory_order_acquire) &&
+      this->client_ != nullptr) {
+    esp_websocket_client_handle_t dead = this->client_;
+    this->client_ = nullptr;
+    esp_websocket_client_destroy_on_exit(dead);
+    this->last_closed_ms_.store((uint32_t) millis(), std::memory_order_release);
+    this->needs_reconnect_.store(true, std::memory_order_release);
+    ESP_LOGW(HA_WS_TAG, "ws: deferred destroy requested (via CLOSED path); parent loop will reconnect");
+  }
 }
 
 inline void HaWsClient::on_ws_error_() {
