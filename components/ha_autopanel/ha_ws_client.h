@@ -375,7 +375,9 @@ class HaWsClient {
   // in start() (after fetch_areas_ completes, before parse_task
   // is created). parse_task reads this on its own context; the
   // HaAutoPanel never modifies it after start() returns.
-  std::set<std::string> our_entity_ids_;
+  // v1.28: PSRAM-backed. ~415 entries (one per entity).
+  std::set<std::string, std::less<>, PsramStlAllocator<std::string>>
+      our_entity_ids_;
 
   // ===== Counters =====
   std::atomic<uint32_t> events_received_{0};

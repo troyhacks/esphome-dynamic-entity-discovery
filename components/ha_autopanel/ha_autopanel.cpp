@@ -809,7 +809,7 @@ void HaAutoPanel::fetch_areas_() {
       // with minimal Entity stubs derived from the template's entity_ids
       // list. State and brightness are populated lazily by the
       // api.on_state subscription (see subscribe_to_all_entities_).
-      std::vector<Entity, PsramStlAllocator<Entity>> &bucket = this->entities_by_area_[a.area_id];
+      std::vector<Entity> &bucket = this->entities_by_area_[a.area_id];
       bucket.reserve(a.entity_ids.size());
       for (const auto &eid : a.entity_ids) {
         Entity e;

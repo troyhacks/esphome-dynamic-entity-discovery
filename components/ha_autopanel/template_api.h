@@ -377,6 +377,11 @@ class TemplateApi {
 
   // Subscription registry. Read-mostly (the hot path is
   // on_ws_event_ on parse_task), so a shared_mutex.
+  // v1.28: not PSRAM'd here - would require #include
+  // "ha_autopanel.h" just for PsramStlAllocator's full
+  // definition, and subs_ is at most a handful of entries
+  // (clock + aggregate) where std::function's SBO handles
+  // most callbacks. Internal heap can absorb ~200B.
   std::map<uint32_t, std::function<void(const char*)>> subs_;
   mutable std::shared_mutex subs_mu_;
 

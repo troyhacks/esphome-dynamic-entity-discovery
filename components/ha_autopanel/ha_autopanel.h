@@ -334,9 +334,17 @@ static_assert(sizeof(StoredConfig) <= 512, "StoredConfig must fit in a single NV
 struct CustomizationConfig {
   std::set<std::string, std::less<>> hidden_rooms;
   std::set<std::string, std::less<>> hidden_entities;
+  // v1.28: not PSRAM'd. ~15 strings, infrequent growth
+  // (only on re-discovery). PSRAM would force sort_local_order_
+  // to also use PsramStlAllocator to keep types compatible.
   std::vector<std::string> room_order;
-  // entity_order is per-area, keyed by area_id
-  std::map<std::string, std::vector<std::string>> entity_order;
+  // entity_order is per-area, keyed by area_id. v1.28:
+  // PSRAM-backed outer map (inner vector's allocator has to
+  // match the default std::allocator to satisfy the
+  // "value_type matches allocator" static_assert in libstdc++).
+  std::map<std::string, std::vector<std::string>, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, std::vector<std::string>>>>
+      entity_order;
   bool loaded{false};
 };
 
@@ -478,15 +486,28 @@ class HaAutoPanel : public Component {
   int start_y_{12};
   int default_on_pct_{30};
 
-  std::vector<Area> discovered_areas_;
+  // v1.28: PSRAM-backed. ~15 entries, grown during fetch_areas_().
+  std::vector<Area, PsramStlAllocator<Area>> discovered_areas_;
   // entities_by_area_ uses the PSRAM-preferring allocator so all
   // Entity storage (the bulk of ha_autopanel's RAM) lands in PSRAM
   // on boards that have it, and falls back to internal SRAM on
   // boards that don't. The Entity structs themselves use
   // string_view fields pointing into entity_arena(), so the
   // std::string payloads share a single arena container.
-  std::map<std::string, std::vector<Entity, PsramStlAllocator<Entity>>> entities_by_area_;
-  std::vector<RoomCard> room_cards_;
+  // v1.28: also PSRAM the outer map (inner vector's allocator
+  // v1.28: PSRAM-backed outer map. The inner vector's
+  // allocator MUST be the default std::allocator to satisfy
+  // the libstdc++ "value_type matches allocator" static_assert
+  // (the map's value_type and the allocator's value_type must
+  // be EXACTLY the same type - they can't differ in inner
+  // template arguments). So the inner vector uses default
+  // alloc (its strings are short enough for SSO anyway, so
+  // no separate heap alloc).
+  std::map<std::string, std::vector<Entity>, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, std::vector<Entity>>>>
+      entities_by_area_;
+  // v1.28: PSRAM-backed. ~15 entries, each ~80B.
+  std::vector<RoomCard, PsramStlAllocator<RoomCard>> room_cards_;
 
   // v1.27: per-room aggregate from the render_template
   // subscription. Keyed by area_id (the same key as
@@ -494,7 +515,14 @@ class HaAutoPanel : public Component {
   // state snapshots; sync_entities_from_aggregates_()
   // copies them back into Entity records and repaints the
   // room cards.
-  std::map<std::string, RoomAggregate, std::less<>> room_aggregates_;
+  // v1.28: PSRAM-backed map. The default std::allocator was
+  // throwing std::bad_alloc on fragmented internal heap when
+  // operator[] created a new tree node - the throw bubbled to
+  // cxx_exception_stubs and rebooted the P4. With 32MB of
+  // PSRAM, the tree nodes land there instead.
+  std::map<std::string, RoomAggregate, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, RoomAggregate>>>
+      room_aggregates_;
 
   // v1.27: the per-area aggregate template body. Built
   // once by build_room_aggregate_template_() after
@@ -516,16 +544,28 @@ class HaAutoPanel : public Component {
   int current_room_index_{-1};
 
   // Per-render registries (component-owned, no heap, no LV_EVENT_DELETE)
-  std::vector<ArcRecord> arc_records_;
-  std::vector<ControlRecord> control_records_;
+  // v1.28: PSRAM-backed. ~15 entries + per-entity entries; could
+  // OOM the internal heap on boot-time growth after many rediscovers.
+  std::vector<ArcRecord, PsramStlAllocator<ArcRecord>> arc_records_;
+  std::vector<ControlRecord, PsramStlAllocator<ControlRecord>> control_records_;
 
   // Live-update widget maps (keyed by stable string id)
-  std::map<std::string, lv_obj_t*> room_arc_widgets_;                  // area_id -> big 240px arc
-  std::map<std::string, std::pair<lv_obj_t*, lv_obj_t*>> room_btn_widgets_;  // area_id -> (btn, label)
-  std::map<std::string, lv_obj_t*> room_label_btn_widgets_;            // area_id -> transparent room-name button
+  // v1.28: PSRAM-backed. ~15 entries each at boot.
+  std::map<std::string, lv_obj_t*, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, lv_obj_t*>>>
+      room_arc_widgets_;                  // area_id -> big 240px arc
+  std::map<std::string, std::pair<lv_obj_t*, lv_obj_t*>, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, std::pair<lv_obj_t*, lv_obj_t*>>>>
+      room_btn_widgets_;  // area_id -> (btn, label)
+  std::map<std::string, lv_obj_t*, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, lv_obj_t*>>>
+      room_label_btn_widgets_;            // area_id -> transparent room-name button
 
   // Bounce-back storage: last non-zero brightness for each area
-  std::map<std::string, uint8_t> last_brightness_pct_;
+  // v1.28: PSRAM-backed. ~15 entries, written per user interaction.
+  std::map<std::string, uint8_t, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, uint8_t>>>
+      last_brightness_pct_;
 
   // Track which entity_ids we've subscribed to (avoids double-subscribe)
   // std::less<> (transparent comparator) enables heterogeneous
@@ -715,7 +755,11 @@ class HaAutoPanel : public Component {
     uint32_t blocked_since_ms{0};
     TaskSnapshot() = default;
   };
-  std::map<TaskHandle_t, TaskSnapshot> task_snapshots_;
+  // v1.28: PSRAM-backed. ~16-20 entries (one per FreeRTOS
+  // task), written once per loop iteration.
+  std::map<TaskHandle_t, TaskSnapshot, std::less<>,
+           PsramStlAllocator<std::pair<const TaskHandle_t, TaskSnapshot>>>
+      task_snapshots_;
   // v1.22v: max recoveries per window before falling back to
   // App.reboot(). 3 is enough to give the C6 a fair chance
   // to re-init the SDIO link without looping forever.
@@ -879,7 +923,10 @@ class HaAutoPanel : public Component {
   // is documented in [[project_state_sync_bug]].
   lv_obj_t* media_banner_{nullptr};
   // Map: entity_id (as string) -> tile widget. Cleared on rebuild.
-  std::map<std::string, lv_obj_t*> media_tiles_;
+  // v1.28: PSRAM-backed.
+  std::map<std::string, lv_obj_t*, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, lv_obj_t*>>>
+      media_tiles_;
 
   // Authorization probe state
   bool auth_probe_pending_{false};
