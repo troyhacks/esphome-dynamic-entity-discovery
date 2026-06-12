@@ -288,7 +288,15 @@ struct RoomAggregate {
   // std::less<> (transparent) enables heterogeneous lookup
   // against Entity::entity_id without allocating a
   // std::string key.
-  std::map<std::string_view, Entry, std::less<>> entities;
+  // v1.28: PSRAM-backed. The default std::allocator was throwing
+  // std::bad_alloc on fragmented internal heap when operator[]
+  // created a new tree node (the throw bubbled to
+  // cxx_exception_stubs and rebooted the P4). The outer
+  // room_aggregates_ map is also PSRAM-backed; this completes
+  // the chain so ALL map nodes for the aggregate live in PSRAM.
+  std::map<std::string_view, Entry, std::less<>,
+           PsramStlAllocator<std::pair<const std::string_view, Entry>>>
+      entities;
 };
 
 // Per-arc registry entry - replaces heap-allocated ArcCallbackData.
