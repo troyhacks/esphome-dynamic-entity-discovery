@@ -119,6 +119,54 @@ struct PsramStlAllocator {
   bool operator!=(const PsramStlAllocator &) const noexcept { return false; }
 };
 
+// Convenience aliases. std::vector<Entity, PsramStlAllocator<Entity>>
+// is verbose enough to obscure intent at the call site; psram_xxx
+// is shorthand and is what most of the project uses for new code.
+// The aliases below are NOT used by PsramStlAllocator itself; they
+// are the recommended spelling for downstream container types so
+// the PSRAM-routing decision is visible at the type level.
+template <typename T>
+using psram_vector = std::vector<T, PsramStlAllocator<T>>;
+using psram_string = std::basic_string<char, std::char_traits<char>,
+                                       PsramStlAllocator<char>>;
+template <typename T>
+using psram_set = std::set<T, std::less<>, PsramStlAllocator<T>>;
+template <typename K, typename V>
+using psram_map = std::map<K, V, std::less<>,
+                           PsramStlAllocator<std::pair<const K, V>>>;
+
+// Heap-allocate a psram_string in PSRAM, forwarding the
+// constructor args. Use with destroy_psram_string() to
+// avoid the global operator delete (which would call free()
+// on a pointer heap_caps_malloc'd - usually fine, but the
+// explicit destroy is safer and matches the allocator).
+//
+// The site pattern is "store a string in LVGL user_data,
+// free it on LV_EVENT_DELETE". Typical payloads are
+// entity_ids (~17 chars) or short packed buffers
+// ("domain\0entity_id"). All fit the libstdc++ SSO
+// threshold of 22 chars, so the psram_string object and
+// its payload both live in PSRAM with no second alloc.
+inline psram_string *make_psram_string() {
+  PsramStlAllocator<psram_string> alloc;
+  psram_string *p = alloc.allocate(1);
+  new (p) psram_string();
+  return p;
+}
+template <typename... Args>
+psram_string *make_psram_string(Args &&...args) {
+  PsramStlAllocator<psram_string> alloc;
+  psram_string *p = alloc.allocate(1);
+  new (p) psram_string(std::forward<Args>(args)...);
+  return p;
+}
+inline void destroy_psram_string(psram_string *p) {
+  if (p == nullptr) return;
+  p->~basic_string();
+  PsramStlAllocator<psram_string> alloc;
+  alloc.deallocate(p, 1);
+}
+
 // Stable-address string arena. Entity's string fields are
 // std::string_view (16 B each) pointing into this arena instead of
 // std::string (32 B each, 5x = 160 B). For 419 entities the savings
@@ -135,10 +183,12 @@ struct PsramStlAllocator {
 class StringArena {
  public:
   StringArena() {
-    // Pre-allocate so the first ~2048 intern() calls don't
-    // realloc. Capacity covers ~415 entities * 4-5 strings
-    // each with headroom. PSRAM has 32MB so this is cheap.
-    strings_.reserve(2048);
+    // No-op. std::deque grows in chunks (~512 elements by
+    // default in libstdc++); references to existing elements
+    // are stable across emplace_back(), so the intern() function
+    // can hand out string_views safely for the arena's whole
+    // lifetime. (The previous std::vector used reserve(2048)
+    // to delay reallocation; std::deque doesn't need that.)
   }
 
   // Intern a C string + length. Returns a view into arena-owned
@@ -202,15 +252,43 @@ class StringArena {
   // it) live in PSRAM. reserve(2048) covers ~415 entities *
   // 4-5 strings each (entity_id, domain, name, area_id)
   // with headroom. If we ever exceed 2048, the realloc will
-  // move all elements and invalidate the string_views -
-  // upstream code already handles this via the
-  // start_discovery_() flow which re-interns everything, so
-  // realloc is acceptable as a "growth event" boundary.
+  // move all elements and invalidate the string_views.
   // std::string SSO keeps entity_id (~17 chars), domain
   // (~6), name (~12), area_id (~10) all in the struct, so
   // no separate string-allocator allocs happen either.
-  std::vector<std::string, PsramStlAllocator<std::string>> strings_{
-      PsramStlAllocator<std::string>()};
+  //
+  // v1.28 fix: was std::vector; switched to std::deque.
+  // std::vector's reallocation moves every std::string in
+  // the container to a fresh heap allocation, which transfers
+  // each string's payload pointer. Every string_view
+  // previously returned by intern() (and stored in
+  // Entity::entity_id / .domain / .name / .area_id, or
+  // RoomAggregate::Entry's eid, or agg.entities keys) was
+  // pointing at the OLD allocation and silently dangles the
+  // moment the next growth boundary fires. The 2048-element
+  // ctor reserve() set the bar, but 419 entities * 4-5 strings
+  // each (~1800-2100) blew past it during fetch_areas_(), so
+  // by sync_entities_from_aggregates_() the e.domain views
+  // were already pointing at freed PSRAM. std::deque's
+  // chunked growth never invalidates references to existing
+  // elements, which is what the long-standing comment two
+  // paragraphs up already said ("std::deque<std::string>").
+  //
+  // Note on the allocator: the deque's TEMPLATE allocator arg
+  // is std::allocator<std::string>, NOT
+  // PsramStlAllocator<std::string>. libstdc++ has a known
+  // issue with stateful allocators and deque
+  // (bits/stl_deque.h's _Map_alloc_type rebind fails to
+  // construct with the stateful allocator's extra state
+  // - "too many initializers for _Map_alloc_type" error).
+  // The std::string PAYLOADS still go to PSRAM because the
+  // allocator on the std::string type itself is
+  // PsramStlAllocator<char> (inherited from the previous
+  // std::vector<std::string, PsramStlAllocator<std::string>>
+  // type - std::vector propagates the allocator to its
+  // elements). Only the deque's internal chunk-pointer
+  // array goes to internal RAM, which is a few KB max.
+  std::deque<std::string, std::allocator<std::string>> strings_;
 };
 
 // One global arena, owned by the singleton instance. The Entity
@@ -243,7 +321,21 @@ struct Entity {
   std::string_view domain;
   std::string_view area_id;
   std::string_view icon;
-  std::string state;        // "on" / "off" / etc. - mutates at runtime
+  // v1.28: psram_string. The state field is the only one that
+  // mutates at runtime (HA pushes state changes via the WS
+  // subscription; aggregate push updates also write here).
+  // With 419 entities, the default std::string payloads were
+  // the largest source of internal-RAM fragmentation during
+  // heavy state-update bursts - every state push allocated
+  // (or SSO'd) into internal heap, and the OOM aborted
+  // reached cxx_exception_stubs. psram_string routes the
+  // payload to PSRAM via PsramStlAllocator<char>. The
+  // operator==(const char*), operator=(const char*),
+  // operator=(const std::string&), c_str(), empty() etc.
+  // surface is identical to std::string, so all the
+  // existing read/write sites (e.state == "on", e.state =
+  // "on", e.state = new_state, etc.) compile unchanged.
+  psram_string state;        // "on" / "off" / etc. - mutates at runtime
   uint8_t brightness{0};    // 0-255, valid only when state == "on" and has_brightness
   bool has_brightness{false};
   bool is_hue_group{false};
@@ -273,14 +365,39 @@ struct RoomCard {
 // aggregate is ~12 KB on the heap - much smaller than the
 // 200KB+ get_states response it replaces.
 struct RoomAggregate {
-  std::string area_id;
-  std::string name;
+  // v1.28: psram_string for the three string fields. The
+  // outer room_aggregates_ map (key=std::string) is still
+  // std::string-keyed so cross-map lookups via rkv.first
+  // against entities_by_area_ (also std::string-keyed)
+  // don't need a conversion. But the *payload* strings
+  // here are the ones that grow: state values can be any
+  // string from HA (some sensors report long state
+  // strings, attributes arrive as JSON blobs, etc.). When
+  // any of these exceeds the libstdc++ SSO threshold of
+  // ~22 chars the std::string default allocator routes
+  // the buffer to internal RAM and operator[]'s throw
+  // reaches cxx_exception_stubs. The psram_string variant
+  // routes the same buffer to PSRAM via
+  // PsramStlAllocator<char>::allocate, so the entire
+  // payload (object + buffer) lands in the 32MB OPI
+  // PSRAM and the internal-heap pressure that was
+  // triggering the abort is gone.
+  //
+  // Note: psram_string and std::string both expose the
+  // same operator==(const char*) and operator=(const char*)
+  // surface that the call sites use, so the assignment
+  // sites in apply_room_aggregates_() and the read sites
+  // in sync_entities_from_aggregates_() don't need any
+  // changes - they pass through the standard
+  // basic_string interface.
+  psram_string area_id;
+  psram_string name;
   // Per-entity state snapshot. Populated from the
   // aggregate's "states" map. The Entry holds a copy of
   // the state string (it's mutable at runtime) and the
   // raw brightness 0-255.
   struct Entry {
-    std::string state;
+    psram_string state;
     uint8_t brightness{0};
     bool has_brightness{false};
   };
@@ -339,19 +456,26 @@ static_assert(sizeof(StoredConfig) <= 512, "StoredConfig must fit in a single NV
 
 // User customizations persisted as JSON on LittleFS at
 // /storage/customizations.cfg. Plain key-value fields, not NVS.
+//
+// All containers here are PSRAM-backed (the vector/set/map
+// storage is in PSRAM). The string elements stay std::string
+// (default allocator) because they fit the SSO threshold
+// (~22 chars) for typical room/entity IDs, and because Area
+// also uses std::string - mixing the two in the customization
+// struct (e.g. hidden_rooms vs Area::name) would require
+// per-call conversions. The container allocator handles the
+// bigger win: keeping the tree nodes and vector array in
+// PSRAM so re-discovery doesn't fragment internal RAM.
 struct CustomizationConfig {
-  std::set<std::string, std::less<>> hidden_rooms;
-  std::set<std::string, std::less<>> hidden_entities;
-  // v1.28: not PSRAM'd. ~15 strings, infrequent growth
-  // (only on re-discovery). PSRAM would force sort_local_order_
-  // to also use PsramStlAllocator to keep types compatible.
-  std::vector<std::string> room_order;
-  // entity_order is per-area, keyed by area_id. v1.28:
-  // PSRAM-backed outer map (inner vector's allocator has to
-  // match the default std::allocator to satisfy the
-  // "value_type matches allocator" static_assert in libstdc++).
-  std::map<std::string, std::vector<std::string>, std::less<>,
-           PsramStlAllocator<std::pair<const std::string, std::vector<std::string>>>>
+  psram_set<std::string> hidden_rooms;
+  psram_set<std::string> hidden_entities;
+  psram_vector<std::string> room_order;
+  // entity_order is per-area, keyed by area_id. Outer map
+  // nodes and inner vector's array are in PSRAM; the strings
+  // themselves stay std::string (SSO covers entity_ids).
+  std::map<std::string, psram_vector<std::string>, std::less<>,
+           PsramStlAllocator<std::pair<const std::string,
+                                       psram_vector<std::string>>>>
       entity_order;
   bool loaded{false};
 };
@@ -897,12 +1021,14 @@ class HaAutoPanel : public Component {
   lv_obj_t* sort_panel_{nullptr};
   // Local copy of the room order while the sort panel is open. On
   // Apply, this is what we persist to customizations_.room_order.
-  // Cleared on close.
-  std::vector<std::string> sort_local_order_;
+  // Cleared on close. PSRAM-backed (outer vector array in PSRAM;
+  // string elements stay std::string so the assignment at apply
+  // time doesn't require per-element conversion).
+  psram_vector<std::string> sort_local_order_;
   // Local copy of which rooms are hidden while the sort panel is
   // open. On Apply, this is what we persist to customizations_.
   // hidden_rooms. Cleared on close.
-  std::set<std::string> sort_local_hidden_;
+  psram_set<std::string> sort_local_hidden_;
   // v1.11: edit_mode_, in_edit_session_, and edit_baseline_ were
   // removed. The Sort panel is now the single customization entry
   // point, so there is no need for a separate "Edit" toggle on the
@@ -1138,7 +1264,7 @@ class HaAutoPanel : public Component {
   // Returns the custom display order for a room/area, or an empty
   // vector if none is set (callers should fall back to alphabetical
   // or HA's order).
-  const std::vector<std::string> *get_entity_order_(const std::string &area_id) const;
+  const psram_vector<std::string> *get_entity_order_(std::string_view area_id) const;
 
   static const uint32_t ROOM_COLORS_[];
   static const int MAX_ROOM_COLORS_ = 8;

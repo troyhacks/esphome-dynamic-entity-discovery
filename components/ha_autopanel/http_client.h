@@ -61,7 +61,16 @@ struct HttpResult {
   int http_code{0};
   // Body is only populated when status == OK. Caller is
   // responsible for the parse — see http_client.h comment.
-  std::string body;
+  // v1.28: psram_string. The body can be 25+ KB (the
+  // aggregate template response, the /api/states burst, etc.)
+  // - with std::string that payload landed in the precious
+  // 384 KB internal heap and was the #1 contributor to the
+  // cxx_exception_stubs OOM aborts. psram_string keeps the
+  // body in PSRAM. Callers that bind `std::string& x = result.body`
+  // must switch to `auto& x = result.body` (the converting
+  // ctor from psram_string to std::string is explicit because
+  // PsramStlAllocator != std::allocator).
+  psram_string body;
 };
 
 // Thin wrapper. Lifetime is tied to the http_request component

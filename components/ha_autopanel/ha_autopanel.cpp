@@ -349,7 +349,18 @@ static HaAutoPanel* s_instance = nullptr;
 // can recover the right area_id. We allocate a small struct, store its
 // pointer in lv_obj_set_user_data, and free it in LV_EVENT_DELETE.
 struct RoomControlData {
-  std::string area_id;
+  // v1.28: psram_string. The widget's user_data stores this
+  // heap-allocated struct so the click/arc/button handler
+  // closure can recover the area_id. ~30 of these on screen
+  // at once (one per room's arc + button + X). The default
+  // std::string landed in internal RAM; psram_string keeps
+  // the payload out of the precious internal heap. The
+  // assign-from-std::string ctor (used at the new site:
+  // new RoomControlData{psram_string(room.area.area_id), nullptr}) and
+  // implicit conversion to std::string_view (used at
+  // call_ha_service_(... data->area_id ...)) both work via
+  // the standard basic_string interface.
+  psram_string area_id;
   lv_obj_t* pct_label;   // null for room arc / room button
 };
 
@@ -726,7 +737,10 @@ void HaAutoPanel::fetch_areas_() {
              http_status_to_str(result.status), result.http_code);
     return;
   }
-  std::string& response = result.body;
+  // result.body is psram_string. auto& deduces to psram_string&,
+  // preserving PSRAM storage. (.size(), .empty(), .c_str() all
+  // work; .substr() returns psram_string.)
+  auto& response = result.body;
   if (response.empty()) {
     ESP_LOGW(TAG, "Areas response is empty");
     return;
@@ -735,10 +749,10 @@ void HaAutoPanel::fetch_areas_() {
   ESP_LOGI(TAG, "Areas response: %d bytes", (int)response.size());
   // Diagnostic: log first 200 chars (and last 50) to see actual format
   {
-    std::string head = response.substr(0, std::min<size_t>(200, response.size()));
+    auto head = response.substr(0, std::min<size_t>(200, response.size()));
     ESP_LOGD(TAG, "  head: %s", head.c_str());
     if (response.size() > 50) {
-      std::string tail = response.substr(response.size() - 50);
+      auto tail = response.substr(response.size() - 50);
       ESP_LOGD(TAG, "  tail: %s", tail.c_str());
     }
   }
@@ -761,7 +775,12 @@ void HaAutoPanel::fetch_areas_() {
   // this handles the ESPHome one.
   App.feed_wdt();
 
-  DeserializationError parse_err = deserializeJson(doc, response);
+  // Use the (data, size) overload of deserializeJson because
+  // result.body is psram_string, not std::string - ArduinoJson
+  // does not have a psram_string overload (only std::string and
+  // std::string_view). data()/size() is the documented escape
+  // hatch.
+  DeserializationError parse_err = deserializeJson(doc, response.data(), response.size());
   if (parse_err) {
     ESP_LOGE(TAG, "Failed to parse areas JSON: %s", parse_err.c_str());
     return;
@@ -2157,7 +2176,7 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // high). The 32x position is what the user meant by "slightly too
   // small" - the button was sized right but offset upward, so it
   // didn't visually line up with the other chrome.
-  // v1.22e: width is data-driven via button_width_for_text_() against
+  // v1.22e: width isdetail data-driven via button_width_for_text_() against
   // "< Back". "<" + " " + "Back" is wider than the v1.22b hand-tuned
   // 75px at larger fonts; the helper fixes that.
   lv_obj_set_width(this->title_back_btn_,
@@ -2294,7 +2313,7 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
 
   // Heap-allocated control data - the user_data is a raw pointer that stays
   // valid for the lifetime of the widget. The struct owns the area_id string.
-  RoomControlData* arc_data = new RoomControlData{room.area.area_id, nullptr};
+  RoomControlData* arc_data = new RoomControlData{psram_string(room.area.area_id), nullptr};
   lv_obj_set_user_data(arc, arc_data);
 
   // Stash widget pointer for live state updates
@@ -2321,26 +2340,38 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
     }
     int value = lv_arc_get_value(arc);
     ESP_LOGI(TAG, "room arc release: area=%s value=%d", data->area_id.c_str(), value);
+    // data->area_id is psram_string; the maps below are keyed
+    // on std::string. Heterogeneous find() via std::string_view
+    // is no-alloc; operator[] would need an explicit std::string
+    // conversion.
+    const std::string_view area_id_v(data->area_id);
+    const std::string area_id_s(data->area_id.data(), data->area_id.size());
     if (value <= 0) {
       s_instance->call_ha_service_("light.turn_off", "area_id", data->area_id, -1);
       // Optimistic: mark lights off so the button color flips immediately
-      for (auto& e : s_instance->entities_by_area_[data->area_id]) {
-        if (e.domain == "light" && !e.is_hue_group) {
-          e.state = "off";
+      auto it = s_instance->entities_by_area_.find(area_id_v);
+      if (it != s_instance->entities_by_area_.end()) {
+        for (auto& e : it->second) {
+          if (e.domain == "light" && !e.is_hue_group) {
+            e.state = "off";
+          }
         }
       }
-      s_instance->update_room_card_visual_state_for_area_(data->area_id);
+      s_instance->update_room_card_visual_state_for_area_(area_id_s);
     } else {
-      s_instance->last_brightness_pct_[data->area_id] = (uint8_t) value;
+      s_instance->last_brightness_pct_[area_id_s] = (uint8_t) value;
       s_instance->call_ha_service_("light.turn_on", "area_id", data->area_id, value);
       // Optimistic: mark lights on at the dragged brightness
-      for (auto& e : s_instance->entities_by_area_[data->area_id]) {
-        if (e.domain == "light" && !e.is_hue_group) {
-          e.state = "on";
-          e.brightness = static_cast<uint8_t>((value * 255) / 100);
+      auto it = s_instance->entities_by_area_.find(area_id_v);
+      if (it != s_instance->entities_by_area_.end()) {
+        for (auto& e : it->second) {
+          if (e.domain == "light" && !e.is_hue_group) {
+            e.state = "on";
+            e.brightness = static_cast<uint8_t>((value * 255) / 100);
+          }
         }
       }
-      s_instance->update_room_card_visual_state_for_area_(data->area_id);
+      s_instance->update_room_card_visual_state_for_area_(area_id_s);
     }
   }, LV_EVENT_RELEASED, nullptr);
 
@@ -2401,7 +2432,7 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   lv_obj_set_scrollbar_mode(btn, LV_SCROLLBAR_MODE_OFF);
 
   // Heap-allocated control data - stable pointer, owned by us, freed in DELETE
-  RoomControlData* btn_data = new RoomControlData{room.area.area_id, nullptr};
+  RoomControlData* btn_data = new RoomControlData{psram_string(room.area.area_id), nullptr};
   lv_obj_set_user_data(btn, btn_data);
 
   // Stash for live state updates
@@ -2415,22 +2446,35 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
     lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
     RoomControlData* data = (RoomControlData*)lv_obj_get_user_data(btn);
     if (s_instance == nullptr || data == nullptr) return;
-    bool is_on = s_instance->is_room_any_light_on_(data->area_id);
+    // data->area_id is psram_string; the maps below are keyed
+    // on std::string. Heterogeneous find() via std::string_view
+    // is no-alloc; operator[] would need an explicit std::string
+    // conversion (we don't operator[] in this handler, only find).
+    const std::string_view area_id_v(data->area_id);
+    // is_room_any_light_on_ and update_room_card_visual_state_for_area_
+    // both take const std::string& (not std::string_view), so we
+    // construct a temporary std::string. These are user-click paths
+    // (not hot), so the small alloc is fine.
+    const std::string area_id_s(data->area_id.data(), data->area_id.size());
+    bool is_on = s_instance->is_room_any_light_on_(area_id_s);
     if (is_on) {
       s_instance->call_ha_service_("light.turn_off", "area_id", data->area_id, -1);
       // Optimistic UI: flip immediately. Will be re-synced when HA pushes
       // the state change back via the subscription.
-      for (auto& e : s_instance->entities_by_area_[data->area_id]) {
-        if (e.domain == "light" && !e.is_hue_group) {
-          e.state = "off";
+      auto it = s_instance->entities_by_area_.find(area_id_v);
+      if (it != s_instance->entities_by_area_.end()) {
+        for (auto& e : it->second) {
+          if (e.domain == "light" && !e.is_hue_group) {
+            e.state = "off";
+          }
         }
       }
-      s_instance->update_room_card_visual_state_for_area_(data->area_id);
+      s_instance->update_room_card_visual_state_for_area_(area_id_s);
     } else {
       // Bounce-back: use last non-zero brightness for this area, otherwise
       // the configured default_on_pct.
       uint8_t pct = (uint8_t) s_instance->default_on_pct_;
-      auto it = s_instance->last_brightness_pct_.find(data->area_id);
+      auto it = s_instance->last_brightness_pct_.find(area_id_v);
       if (it != s_instance->last_brightness_pct_.end() && it->second > 0) {
         pct = it->second;
       }
@@ -2438,13 +2482,16 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
       // Optimistic UI: mark lights on at the bounced-back brightness so the
       // visual update sees the new state. The subscription will refine the
       // brightness to whatever HA actually reports.
-      for (auto& e : s_instance->entities_by_area_[data->area_id]) {
-        if (e.domain == "light" && !e.is_hue_group) {
-          e.state = "on";
-          e.brightness = static_cast<uint8_t>((pct * 255) / 100);
+      auto it_e = s_instance->entities_by_area_.find(area_id_v);
+      if (it_e != s_instance->entities_by_area_.end()) {
+        for (auto& e : it_e->second) {
+          if (e.domain == "light" && !e.is_hue_group) {
+            e.state = "on";
+            e.brightness = static_cast<uint8_t>((pct * 255) / 100);
+          }
         }
       }
-      s_instance->update_room_card_visual_state_for_area_(data->area_id);
+      s_instance->update_room_card_visual_state_for_area_(area_id_s);
     }
   }, LV_EVENT_CLICKED, nullptr);
 
@@ -2734,6 +2781,9 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   // two pages feel visually consistent.
   int y_offset = 70;
   for (size_t i = 0; i < room.entities.size(); i++) {
+    if (this->is_entity_hidden_(room.entities[i].entity_id)) {
+      continue;
+    }
     create_entity_control_(this->detail_container_, room.entities[i], (int)i, y_offset, room.color);
     y_offset += 80;
   }
@@ -3300,7 +3350,7 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
     std::string* p = (std::string*)lv_obj_get_user_data(btn);
     if (s_instance == nullptr || p == nullptr) return;
     ESP_LOGI(TAG, "Hide entity: %s", p->c_str());
-    s_instance->customizations_.hidden_entities.insert(*p);
+    s_instance->customizations_.hidden_entities.insert(std::string(p->data(), p->size()));
     s_instance->write_customizations_file_();
     if (s_instance->current_room_index_ >= 0 &&
         s_instance->current_room_index_ < (int) s_instance->room_cards_.size()) {
@@ -4682,32 +4732,32 @@ bool HaAutoPanel::read_customizations_file_() {
   if (doc["hidden_rooms"].is<JsonArray>()) {
     for (JsonVariant v : doc["hidden_rooms"].as<JsonArray>()) {
       if (v.is<const char*>()) {
-        this->customizations_.hidden_rooms.insert(v.as<std::string>());
+        this->customizations_.hidden_rooms.insert(std::string(v.as<const char*>()));
       }
     }
   }
   if (doc["hidden_entities"].is<JsonArray>()) {
     for (JsonVariant v : doc["hidden_entities"].as<JsonArray>()) {
       if (v.is<const char*>()) {
-        this->customizations_.hidden_entities.insert(v.as<std::string>());
+        this->customizations_.hidden_entities.insert(std::string(v.as<const char*>()));
       }
     }
   }
   if (doc["room_order"].is<JsonArray>()) {
     for (JsonVariant v : doc["room_order"].as<JsonArray>()) {
       if (v.is<const char*>()) {
-        this->customizations_.room_order.push_back(v.as<std::string>());
+        this->customizations_.room_order.push_back(std::string(v.as<const char*>()));
       }
     }
   }
   if (doc["entity_order"].is<JsonObject>()) {
     for (JsonPair kv : doc["entity_order"].as<JsonObject>()) {
       std::string area_id = kv.key().c_str();
-      std::vector<std::string> &order = this->customizations_.entity_order[area_id];
+      psram_vector<std::string> &order = this->customizations_.entity_order[area_id];
       if (kv.value().is<JsonArray>()) {
         for (JsonVariant v : kv.value().as<JsonArray>()) {
           if (v.is<const char*>()) {
-            order.push_back(v.as<std::string>());
+            order.push_back(std::string(v.as<const char*>()));
           }
         }
       }
@@ -4792,32 +4842,32 @@ void HaAutoPanel::apply_customizations_file_(const std::string &body) {
   if (doc["hidden_rooms"].is<JsonArray>()) {
     for (JsonVariant v : doc["hidden_rooms"].as<JsonArray>()) {
       if (v.is<const char*>()) {
-        this->customizations_.hidden_rooms.insert(v.as<std::string>());
+        this->customizations_.hidden_rooms.insert(std::string(v.as<const char*>()));
       }
     }
   }
   if (doc["hidden_entities"].is<JsonArray>()) {
     for (JsonVariant v : doc["hidden_entities"].as<JsonArray>()) {
       if (v.is<const char*>()) {
-        this->customizations_.hidden_entities.insert(v.as<std::string>());
+        this->customizations_.hidden_entities.insert(std::string(v.as<const char*>()));
       }
     }
   }
   if (doc["room_order"].is<JsonArray>()) {
     for (JsonVariant v : doc["room_order"].as<JsonArray>()) {
       if (v.is<const char*>()) {
-        this->customizations_.room_order.push_back(v.as<std::string>());
+        this->customizations_.room_order.push_back(std::string(v.as<const char*>()));
       }
     }
   }
   if (doc["entity_order"].is<JsonObject>()) {
     for (JsonPair kv : doc["entity_order"].as<JsonObject>()) {
       std::string area_id = kv.key().c_str();
-      std::vector<std::string> &order = this->customizations_.entity_order[area_id];
+      psram_vector<std::string> &order = this->customizations_.entity_order[area_id];
       if (kv.value().is<JsonArray>()) {
         for (JsonVariant v : kv.value().as<JsonArray>()) {
           if (v.is<const char*>()) {
-            order.push_back(v.as<std::string>());
+            order.push_back(std::string(v.as<const char*>()));
           }
         }
       }
@@ -4842,7 +4892,7 @@ bool HaAutoPanel::is_entity_hidden_(std::string_view entity_id) const {
   return this->customizations_.hidden_entities.count(entity_id) > 0;
 }
 
-const std::vector<std::string> *HaAutoPanel::get_entity_order_(const std::string &area_id) const {
+const psram_vector<std::string> *HaAutoPanel::get_entity_order_(std::string_view area_id) const {
   // Returns the custom display order for an area, or nullptr if none is
   // set (or it's empty). Callers should fall back to alphabetical or
   // HA's natural order when this returns nullptr.
@@ -6010,7 +6060,7 @@ void HaAutoPanel::apply_sort_panel_() {
   // apply path needs to map back: for each hidden name, find the
   // matching area's area_id. If the user has never renamed rooms
   // in HA, the name == area_id (HA defaults). Build the set.
-  std::set<std::string, std::less<>> hidden_by_id;
+  psram_set<std::string> hidden_by_id;
   for (const auto& name : this->sort_local_hidden_) {
     // Find the area_id whose name matches.
     for (const auto& area : this->discovered_areas_) {
