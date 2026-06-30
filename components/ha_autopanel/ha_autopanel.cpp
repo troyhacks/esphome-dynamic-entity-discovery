@@ -1,3 +1,4 @@
+#include "esphome/core/defines.h"   // pulls in USE_ESP32_HOSTED (set by esp32_hosted component)
 #include "ha_autopanel.h"
 // v1.24: include ha_ws_client.h AFTER ha_autopanel.h so the
 // .h-inline method bodies (which reference HaAutoPanel's
@@ -10,7 +11,9 @@
 // v1.27 debug: read C6 firmware version + host library version
 // from esp_hosted at boot so we can rule out (or in) the
 // slave firmware as a cause of the SDIO/heap issues.
+#ifdef USE_ESP32_HOSTED
 #include "esp_hosted.h"
+#endif
 // v1.28 fix: override the ESP Hosted osi_funcs._h_malloc with
 // a cache-line-aligned PSRAM allocator (with internal-SRAM
 // fallback). See the ha_autopanel_hosted_malloc*() function
@@ -19,7 +22,12 @@
 // v1.28 fix: ESP-IDF private header for esp_cache_get_alignment()
 // - the only way to get the cache-line size the SDMMC layer's
 // esp_cache_msync() will validate. Not in the public esp_cache.h.
+// P4-only: the private header only exists on the P4 IDF install
+// that esp_hosted drags in, and esp_cache_msync() is only
+// relevant on the P4+C6 SDIO path.
+#ifdef USE_ESP32_HOSTED
 #include "esp_private/esp_cache_private.h"
+#endif
 
 #include "esphome/core/log.h"
 
@@ -54,6 +62,7 @@
 // (P4's DMA crosses the cache through dedicated paths, hence
 // the msync requirement). Falls back to aligned internal SRAM
 // if PSRAM is exhausted.
+#ifdef USE_ESP32_HOSTED
 static size_t ha_autopanel_cache_line_size_() {
   // The function is private in esp_cache_private.h but the
   // signature is stable across IDF 5.x. Returns the L1/L2
@@ -67,6 +76,7 @@ static size_t ha_autopanel_cache_line_size_() {
   }
   return 64;  // P4 default cache line
 }
+#endif  // USE_ESP32_HOSTED
 
 static size_t ha_autopanel_align_up_(size_t n, size_t a) {
   return (n + a - 1) & ~(a - 1);
@@ -76,6 +86,7 @@ static size_t ha_autopanel_align_up_(size_t n, size_t a) {
 // fallback. Function pointer target must have C linkage so it
 // matches the osi_funcs_t signature (extern "C" in the
 // managed component).
+#ifdef USE_ESP32_HOSTED
 extern "C" void* ha_autopanel_hosted_malloc(size_t size) {
   if (size == 0) return nullptr;
   const size_t align = ha_autopanel_cache_line_size_();
@@ -108,13 +119,16 @@ extern "C" void* ha_autopanel_hosted_malloc_align(size_t size, size_t align) {
   return heap_caps_aligned_alloc(use_align, padded,
                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
+#endif  // USE_ESP32_HOSTED
 
 // Forward-declare the osi_funcs struct and the global instance
 // the managed component owns. The struct is defined in
 // managed_components/espressif__esp_hosted/host/esp_hosted_os_abstraction.h.
+#ifdef USE_ESP32_HOSTED
 extern "C" {
 extern hosted_osi_funcs_t g_hosted_osi_funcs;
 }
+#endif  // USE_ESP32_HOSTED
 #include "esphome/core/string_ref.h"
 #include "esphome/components/json/json_util.h"
 // v1.22s: font-related (originally needed for externs but those
@@ -369,6 +383,7 @@ void HaAutoPanel::setup() {
   ESP_LOGI(TAG, "Dynamic Entity Discovery starting...");
   s_instance = this;
 
+#ifdef USE_ESP32_HOSTED
   // v1.28 fix: override ESP Hosted's _h_malloc with a
   // cache-line-aligned PSRAM allocator. The SDIO RX task
   // (sdio_process_rx_task in sdio_drv.c:1335) allocates the
@@ -408,6 +423,15 @@ void HaAutoPanel::setup() {
                ESP_HOSTED_VERSION_PATCH_1);
     }
   }
+#else
+  // Native-WiFi board (e.g. ESP32-S3, S2, classic ESP32). No
+  // C6 co-processor -> no esp_hosted to override, no SDIO
+  // SD-card DMA path. This branch is intentionally empty so
+  // the S3 build doesn't pull in esp_hosted.h. The
+  // discovery / WS / HTTP paths above all work the same way;
+  // only the v1.27/1.28 P4-SDIO hardening is skipped.
+  ESP_LOGI(TAG, "ESP Hosted: not configured (native WiFi)");
+#endif  // USE_ESP32_HOSTED
 
   // v1.20: build the firmware_version_ string from the baked-in
   // constants. The format is "v1.20-dev 2026-06-05 12:34:56" -
