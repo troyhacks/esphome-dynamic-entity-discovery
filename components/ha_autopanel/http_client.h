@@ -13,10 +13,6 @@
 // the wrapper would force a one-size-fits-all parser that
 // would actually be MORE code than the current duplicates.
 //
-// v1.23: extracted from ha_autopanel.cpp during the
-// readability refactor. See memory
-// `ha-autopanel-v123-refactor` for the full rationale.
-//
 // NOTE on inline implementation: ESPHome's build system
 // only compiles the component's main .cpp file (the one
 // matching the component name). To keep this header
@@ -61,7 +57,7 @@ struct HttpResult {
   int http_code{0};
   // Body is only populated when status == OK. Caller is
   // responsible for the parse — see http_client.h comment.
-  // v1.28: psram_string. The body can be 25+ KB (the
+  // psram_string: the body can be 25+ KB (the
   // aggregate template response, the /api/states burst, etc.)
   // - with std::string that payload landed in the precious
   // 384 KB internal heap and was the #1 contributor to the
@@ -154,10 +150,21 @@ class HttpClient {
     static const char* TAG = "ha_http";
     auto* container = static_cast<http_request::HttpContainer*>(container_v);
 
+    // Upper bound on the response we will buffer. Anything bigger
+    // is rejected to defend against a malicious or buggy backend
+    // that advertises a huge content_length (the initial alloc
+    // would OOM). 256 KB covers the largest legitimate payload
+    // we currently fetch (the per-area aggregate template).
+    static constexpr size_t MAX_RESPONSE_BYTES = 256 * 1024;
+    // Initial allocation: prefer the server's content_length when
+    // present (saves reallocs), but clamp to MAX_RESPONSE_BYTES.
+    // Fall back to 32 KB for chunked / unknown-size responses -
+    // the grow path handles anything larger.
     size_t expected = container->content_length;
-    if (expected == 0) expected = 32768;
+    if (expected == 0 || expected > MAX_RESPONSE_BYTES) expected = 32 * 1024;
+    if (expected > MAX_RESPONSE_BYTES) expected = MAX_RESPONSE_BYTES;
 
-    // v1.12: PSRAM first, internal heap fallback. The 200KB+
+    // PSRAM first, internal heap fallback. The 200KB+
     // /api/states response would OOM the S3 (no PSRAM, ~384KB
     // internal heap) on a plain malloc; heap_caps_malloc_prefer
     // puts the buffer in PSRAM on the Crowpanel / P4 and falls
@@ -167,30 +174,53 @@ class HttpClient {
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (response == nullptr) {
-      ESP_LOGE(TAG, "OOM allocating %u-byte response buffer",
-               (unsigned)(expected + 1));
+      ESP_LOGE(TAG, "OOM allocating %zu-byte response buffer",
+               expected + 1);
       return {HttpStatus::OOM, 0, ""};
     }
 
     size_t response_len = 0;
     uint8_t buf[512];
+    // Total-read deadline (in addition to the per-stall timeout
+    // below): a slow trickle that never trips the per-stall
+    // check could otherwise hold the call indefinitely.
+    const uint32_t start_ms = millis();
+    const uint32_t total_timeout_ms = 30000;
     uint32_t last_data_time = millis();
-    const uint32_t timeout = 20000;
+    const uint32_t stall_timeout = 20000;
     int iter_count = 0;
 
-    while (container->get_bytes_read() < container->content_length) {
+    // Loop until the connection closes (chunked / unknown size)
+    // OR we've read at least content_length bytes (sized
+    // responses). Previous implementation trusted content_length
+    // verbatim, which terminated the read early on 0 / -1.
+    while (true) {
+      // Stop once the server's advertised length is satisfied.
+      if (container->content_length > 0 &&
+          container->get_bytes_read() >= (size_t) container->content_length) {
+        break;
+      }
       App.feed_wdt();
       yield();
       int read = container->read(buf, sizeof(buf));
       if (read > 0) {
         if (response_len + (size_t)read + 1 > expected + 1) {
-          size_t new_size = (expected + read + 1) * 2;
+          if (expected >= MAX_RESPONSE_BYTES) {
+            ESP_LOGE(TAG, "Response exceeds %zu-byte cap, rejecting",
+                     MAX_RESPONSE_BYTES);
+            heap_caps_free(response);
+            return {HttpStatus::HTTP_ERROR, 0, ""};
+          }
+          size_t new_size = expected + (size_t)read + 1;
+          if (new_size > MAX_RESPONSE_BYTES) new_size = MAX_RESPONSE_BYTES;
+          new_size = (new_size * 2);
+          if (new_size > MAX_RESPONSE_BYTES) new_size = MAX_RESPONSE_BYTES;
           char* grown = (char*)heap_caps_malloc_prefer(
               new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
           if (grown == nullptr) {
-            ESP_LOGE(TAG, "OOM growing response buffer to %u bytes",
-                     (unsigned)new_size);
+            ESP_LOGE(TAG, "OOM growing response buffer to %zu bytes",
+                     new_size);
             heap_caps_free(response);
             return {HttpStatus::OOM, 0, ""};
           }
@@ -205,12 +235,25 @@ class HttpClient {
         iter_count = 0;
       } else if (read == http_request::HTTP_ERROR_CONNECTION_CLOSED) {
         break;
+      } else if (read < 0) {
+        // Any other negative read value is a real error - bail
+        // out instead of spinning until the stall timeout. (read
+        // == 0 is a transient "no data yet" and continues to
+        // yield.)
+        ESP_LOGW(TAG, "Read error %d, aborting", read);
+        heap_caps_free(response);
+        return {HttpStatus::HTTP_ERROR, 0, ""};
       } else {
         iter_count++;
         if (iter_count % 10 == 0) App.feed_wdt();
       }
-      if (millis() - last_data_time > timeout) {
-        ESP_LOGW(TAG, "Timeout reading response");
+      if (millis() - last_data_time > stall_timeout) {
+        ESP_LOGW(TAG, "Stall timeout reading response");
+        heap_caps_free(response);
+        return {HttpStatus::TIMEOUT, 0, ""};
+      }
+      if (millis() - start_ms > total_timeout_ms) {
+        ESP_LOGW(TAG, "Total-read timeout reading response");
         heap_caps_free(response);
         return {HttpStatus::TIMEOUT, 0, ""};
       }

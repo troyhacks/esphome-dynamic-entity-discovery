@@ -82,65 +82,32 @@ CONFIG_SCHEMA = cv.Schema(
         # the security bar meaningfully (an attacker on the LAN with
         # the same WiFi key can already see the panel's full state).
         cv.Optional("agent_debug", default=False): cv.boolean,
-        # v1.22s: title bar time format. False (default) keeps the
+        # Title bar time format. False (default) keeps the
         # 12-hour "10:52 PM" style; True renders 24-hour "22:52".
-        # The 12-hour default matches the v1.22r screenshot the user
-        # signed off on; 24h is opt-in.
         cv.Optional("use_24h_time", default=False): cv.boolean,
-        # v1.22s: show/hide the title bar time label entirely. Default
+        # Show/hide the title bar time label entirely. Default
         # True (visible). Set False to keep the title bar minimal -
         # useful for digital photo-frame / kiosk style deployments
         # where the wall-clock isn't relevant.
         cv.Optional("show_time", default=True): cv.boolean,
-        # v1.22s: HA weather entity id to fetch for the title bar
+        # HA weather entity id to fetch for the title bar
         # weather label. Default "weather.home" matches HA's
         # auto-created weather entity. Set to "" to disable the
         # weather label entirely (the label is hidden until a
         # successful fetch anyway, so a bad/missing entity_id is
         # silently no-op rather than an error spam).
         cv.Optional("weather_entity_id", default="weather.home"): cv.string,
-        # v1.22w: subscription scope. The "all" mode subscribes
-        # to every entity + 5s bulk poll - the v1.22u behavior.
-        # "none" disables all subscriptions (rely on the bulk
-        # poll). "per_room" subscribes only to entities in the
-        # currently-displayed room + global media_players, with
-        # maybe_poll_current_room_states_() running a 3s per-room
-        # poll.
-        #
-        # v1.22w: default CHANGED from "all" to "per_room". The
-        # v1.22v "all" default allocates ~200+ std::function
-        # callbacks in a row (one per subscribe_home_assistant_state
-        # call) during a single trigger_subscription() invocation.
-        # When the C6 SDIO is wedged (the priority-inversion
-        # deadlock documented in
-        # [[project_crowpanel_sdio_is_symptom]]), the heap is
-        # too fragmented to hold all of them and one allocation
-        # throws std::bad_alloc. -fno-exceptions turns the throw
-        # into a direct abort() at PC 0x480dbxxx. The first live
-        # evidence was at 12:21:05.762 on the user's panel -
-        # see [[feedback_yaml_lambda_std_function_throw]].
-        # "per_room" caps the count at ~5 callbacks (the lights
-        # in the visible room + media_players), so the abort
-        # path is closed for typical use. v1.24: removed -
-        # the WebSocket subscribe_events stream delivers all
-        # state changes server-side, no per-room filter
-        # needed (and no PC 0x480dxxxx allocation either).
-        # v1.22v: WLED-pattern stuck-task recovery knob. When
-        # true, the stuck-task detector also takes corrective
-        # action (drop httpd worker priority, then C6 reset).
-        # When false (default), the detector is pure
-        # observability - the user can see the stuck state in
-        # the log without the detector doing anything
-        # destructive. Per the user's note: "I am providing
-        # it as another 'knob' we can turn and monitor" - the
-        # user wants visibility first, recovery second.
+        # Stuck-task recovery knob (kept for future use). The
+        # current task monitor is pure observability and never
+        # takes corrective action. Per the user's note: "I am
+        # providing it as another 'knob' we can turn and monitor"
+        # - visibility first, recovery second.
         cv.Optional("enable_stuck_task_recovery", default=False): cv.boolean,
-        # v1.25c7: WLED-style task state monitor. When true
-        # (default), the component polls uxTaskGetSystemState()
-        # once per second and logs state/priority/HWM changes
-        # for every task. Pure observability - the monitor
-        # never takes corrective action. Set false to disable
-        # the polling entirely (zero overhead).
+        # WLED-style task state monitor. When true (default), the
+        # component polls uxTaskGetSystemState() once per second
+        # and logs state/priority/HWM changes for every task. Pure
+        # observability - the monitor never takes corrective action.
+        # Set false to disable the polling entirely (zero overhead).
         cv.Optional("enable_task_monitor", default=True): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
@@ -176,14 +143,12 @@ async def to_code(config):
         repo="https://github.com/joltwallet/esp_littlefs.git",
     )
 
-    # v1.24: ESP-IDF's esp_websocket_client. We open a raw WebSocket
-    # to Home Assistant at <api_url> converted to ws:// + /api/websocket,
-    # authenticate with the long-lived access token, and use HA's
-    # get_states + subscribe_events messages for state sync. This
-    # REPLACES the v1.22w esphome-native-API subscribe_home_assistant_state
-    # path (which triggered PC 0x480dxxxx abort ~300ms after Panel READY
-    # due to std::function allocation under heap pressure). The WS path
-    # does no std::function allocations in the httpd worker.
+    # Raw WebSocket-to-Home-Assistant client (ESP-IDF's
+    # esp_websocket_client). We open a WS to <api_url> converted
+    # to ws:// + /api/websocket, authenticate with the long-lived
+    # access token, and use HA's render_template subscriptions
+    # for the clock + per-area aggregate (one subscription each,
+    # no per-entity std::function allocations in the httpd worker).
     add_idf_component(
         name="espressif/esp_websocket_client",
         ref="~1.4.0",
@@ -225,16 +190,12 @@ async def to_code(config):
     # AGENT_DEBUG: see schema comment. Off by default for production
     # safety. Test yaml flips it on.
     cg.add(var.set_agent_debug(config["agent_debug"]))
-    # v1.22s: title bar time + weather knobs.
+    # Title bar time + weather knobs.
     cg.add(var.set_use_24h_time(config["use_24h_time"]))
     cg.add(var.set_show_time(config["show_time"]))
     cg.add(var.set_weather_entity_id(config["weather_entity_id"]))
-    # v1.24: removed set_subscribe_mode() - the v1.22v
-    # per-room subscription scope is gone (the WebSocket
-    # subscribe_events stream delivers all state changes
-    # server-side, no per-room filter needed).
-    # v1.22v: stuck-task recovery knob (default OFF - the user
-    # wants visibility first, recovery second).
+    # Stuck-task recovery knob (default OFF - the user wants
+    # visibility first, recovery second).
     cg.add(var.set_enable_stuck_task_recovery(config["enable_stuck_task_recovery"]))
-    # v1.25c7: WLED-style task monitor. Default true.
+    # WLED-style task monitor (default ON).
     cg.add(var.set_enable_task_monitor(config["enable_task_monitor"]))

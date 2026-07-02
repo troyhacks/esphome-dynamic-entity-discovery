@@ -95,13 +95,11 @@ class TemplateApi {
     this->ws_sender_ = std::move(sender);
   }
 
-  // v1.27: set the HTTP component used for the one-shot
-  // /api/template REST calls. Called from setup() AFTER
-  // set_http_request() has wired http_request_ (the
-  // constructor's http_ pointer is captured too early
-  // for it to be useful - the in-class initializer for
-  // template_api_ runs before YAML's set_http_request
-  // call).
+  // Late-bind the HTTP component for one-shot /api/template calls.
+  // Called from setup() AFTER set_http_request() because the
+  // constructor's http_ pointer is captured too early to be
+  // useful (the in-class initializer for template_api_ runs before
+  // YAML's set_http_request call).
   void set_http(http_request::HttpRequestComponent* http) {
     std::lock_guard<std::mutex> lk(write_mu_);
     this->http_ = http;
@@ -142,7 +140,7 @@ class TemplateApi {
     return this->subscribe_impl_(tmpl, "", std::move(cb));
   }
 
-  // v1.27: subscribe with render-time variables. The variables
+  // Subscribe with render-time variables. The variables
   // argument is a pre-serialized JSON object string (e.g.
   // `{"included_areas": ["kitchen"]}`). The subscribe body
   // becomes:
@@ -291,13 +289,19 @@ class TemplateApi {
   std::optional<std::string> do_post_(const std::string& tmpl,
                                       const std::string& variables_json) {
     static const char* TAG = HA_TPL_TAG;
-    if (this->http_ == nullptr) return std::nullopt;
+    // Snapshot all three mutable fields (http_, base_url_, token_)
+    // under write_mu_ in one critical section. set_http() can
+    // run concurrently (e.g. setup() invoking it from another
+    // task), and reading http_ outside the lock was a data race.
+    http_request::HttpRequestComponent* http;
     std::string base_url, token;
     {
       std::lock_guard<std::mutex> lk(write_mu_);
+      http = this->http_;
       base_url = this->base_url_;
       token = this->token_;
     }
+    if (http == nullptr) return std::nullopt;
     if (base_url.empty() || token.empty()) {
       ESP_LOGW(TAG, "render: base_url or token empty");
       return std::nullopt;
@@ -331,7 +335,7 @@ class TemplateApi {
     headers.push_back({"Content-Type", "application/json"});
     headers.push_back({"Authorization", "Bearer " + token});
 
-    auto container = this->http_->post(base_url + "/api/template", body, headers);
+    auto container = http->post(base_url + "/api/template", body, headers);
     if (container == nullptr) {
       ESP_LOGW(TAG, "render: null container (http_request internal error)");
       return std::nullopt;
@@ -377,7 +381,7 @@ class TemplateApi {
 
   // Subscription registry. Read-mostly (the hot path is
   // on_ws_event_ on parse_task), so a shared_mutex.
-  // v1.28: not PSRAM'd here - would require #include
+  // Not PSRAM'd here - would require #include
   // "ha_autopanel.h" just for PsramStlAllocator's full
   // definition, and subs_ is at most a handful of entries
   // (clock + aggregate) where std::function's SBO handles

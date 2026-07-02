@@ -1,6 +1,6 @@
 #include "esphome/core/defines.h"   // pulls in USE_ESP32_HOSTED (set by esp32_hosted component)
 #include "ha_autopanel.h"
-// v1.24: include ha_ws_client.h AFTER ha_autopanel.h so the
+// Include ha_ws_client.h AFTER ha_autopanel.h so the
 // .h-inline method bodies (which reference HaAutoPanel's
 // members directly) see the full HaAutoPanel definition. The
 // unique_ptr<HaWsClient> ws_client_ member is also valid here
@@ -131,69 +131,45 @@ extern hosted_osi_funcs_t g_hosted_osi_funcs;
 #endif  // USE_ESP32_HOSTED
 #include "esphome/core/string_ref.h"
 #include "esphome/components/json/json_util.h"
-// v1.22s: font-related (originally needed for externs but those
-// were removed - see [[feedback_esphome_font_static_linkage]]).
-// The font::Font class is still useful for type safety in
-// get_lv_font() calls, so we keep the include. The actual
-// font size selection happens at runtime via
-// lv_obj_get_style_text_font() - see pick_room_name_font_().
-#include "esphome/components/font/font.h"
-
-// v1.22l: font ladder for the room-name auto-fit picker.
-// v1.22s REFACTOR: ESPHome's auto-generated font::Font*
-// symbols in main.cpp have FILE-STATIC linkage (see
-// [[feedback_esphome_font_static_linkage]]), so we cannot
-// `extern` them from a custom component. The auto-fit
-// font picker is therefore DEFERRED in v1.22s; the
-// pick_room_name_font_() helper still exists (so the
-// create_room_card_() call site doesn't change) but it
-// returns the LVGL default text font (set by
-// `lvgl.text_font: font_xl` in the yaml) regardless of
-// the room name length. Long names still wrap via
-// split_room_name_to_fit_() to two lines.
-//
-// A future v1.22t+ could implement the ladder by either
+// font::Font is still useful for type safety in
+// get_lv_font() calls. Auto-fit font picker is currently
+// deferred: ESPHome's auto-generated font::Font* symbols
+// in main.cpp have FILE-STATIC linkage, so we cannot
+// `extern` them from a custom component. The
+// pick_room_name_font_() helper returns the LVGL default
+// text font (set by `lvgl.text_font: font_xl` in the yaml)
+// regardless of the room name length; long names still
+// wrap via split_room_name_to_fit_() to two lines. A
+// future pass could implement the ladder by either
 // (a) extending the yaml to expose a `font_lv_lg` etc.
 //    that IS externally linkable, or
 // (b) using a hidden helper label that the user sets
 //    the smaller font on at create time, then reading
 //    the font pointer from the label's style.
-// For now we ship v1.22s with weather + 24h time +
-// show/hide time, and the font picker remains a TODO.
+#include "esphome/components/font/font.h"
+
 #include "esphome/components/api/api_server.h"
 #include "esphome/components/api/api_pb2.h"
 #include "esphome/components/api/homeassistant_service.h"
-#include "http_client.h"  // v1.23: HttpClient consolidates the
-                          // get/post + read loop pattern that
-                          // was duplicated 8+ times in this file
+#include "http_client.h"  // consolidates the get/post + read loop
+                          // pattern that was duplicated 8+ times
 #include <lvgl.h>
 #include <climits>  // for INT_MAX in split_room_name_to_fit_
-#include <cmath>    // v1.22s: std::lround, std::isnan (weather temp parse)
+#include <cmath>    // std::lround, std::isnan (weather temp parse)
 #include <algorithm>  // std::min in call_ha_service_
-// v1.22y: re-introduce the C6 reset GPIO via driver/gpio.h.
-// v1.22u had this (it was the dedicated wedge_detector_task's
-// recovery action: drive GPIO32 low for 100ms then release).
-// v1.22v removed it on the theory that "the SDIO wedge is a
-// SYMPTOM not cause" and the httpd mutex contention was the
-// root issue - the per-room poll + httpd hardening in v1.22v
-// address the cause, but the wedge STILL happens and the
-// only software recovery is to reset the C6 co-processor
-// (a hardware power cycle is the alternative). The C6 reset
-// GPIO is shared with the esp32_hosted config's reset_pin
-// (GPIO32 per the YAML); driving it low for 100ms boots the
-// C6 cleanly on release. The driver/gpio.h header is
-// available in the esp-idf framework that's already on the
-// include path (framework: esp-idf in the YAML) - v1.22v's
-// concern about it being a "dependency" was misplaced.
+// C6 reset GPIO. Shared with the esp32_hosted config's
+// reset_pin (GPIO32 per the YAML); driving it low for 100ms
+// boots the C6 cleanly on release. driver/gpio.h is available
+// in the esp-idf framework that's already on the include path.
 #include "driver/gpio.h"
-#include <cctype>   // v1.22s: std::toupper (weather state capitalization)
-#include "esp_task_wdt.h"  // v1.22p: IDF task watchdog (separate from App.feed_wdt)
-#include "freertos/FreeRTOS.h"  // v1.22p: xTaskGetCurrentTaskHandle()
+#include <cctype>   // std::toupper (weather state capitalization)
+#include "esp_task_wdt.h"  // IDF task watchdog (separate from App.feed_wdt)
+#include "freertos/FreeRTOS.h"  // xTaskGetCurrentTaskHandle()
 
-// --- v1.22p: IDF task watchdog RAII guard ---
+// --- IDF task watchdog RAII guard ---
 //
 // The IDF freeRTOS task watchdog (TWDT) is SEPARATE from
-// ESPHome's main loop watchdog (App.feed_wdt). v1.22o
+// ESPHome's main loop watchdog (App.feed_wdt).
 // added App.feed_wdt() before the long blocking parse
 // calls, but the user reported the panel was still
 // resetting:
@@ -259,22 +235,11 @@ class TwdtGuard {
 #include <algorithm>
 #include <cstring>
 
-// v1.22u removed: dedicated SDIO wedge detector task. The user
-// correctly identified that the SDIO wedge is a SYMPTOM of a
-// priority-inversion deadlock, not a root cause (see
-// [[project_crowpanel_sdio_is_symptom]]). The detector task
-// watched loopTask's heartbeat, but loopTask was never the
-// wedged task (the httpd worker was). v1.22v fixes the cause
-// (per-room poll + httpd hardening) instead of treating the
-// symptom. The watchdog approach is preserved in
-// [[project_crowpanel_c6_sdio_loop]] as a known issue with
-// a known recovery (hard power cycle) but no firmware-only fix.
-
 
 namespace esphome {
 namespace ha_autopanel {
 
-// v1.24: PIMPL destructor. Declared in ha_autopanel.h so the
+// PIMPL destructor. Declared in ha_autopanel.h so the
 // unique_ptr<HaWsClient> ws_client_ member has a complete
 // type at the point of destruction. Defaulted here where
 // HaWsClient is complete (via the include above).
@@ -314,10 +279,7 @@ static PsramAllocator s_psram_allocator;
 
 static const char* TAG = "ha_autopanel";
 
-// v1.23: helper to render HttpStatus as a string for log
-// messages. Defined here in the file's existing namespace
-// (the whole file is wrapped in `namespace esphome::ha_autopanel`,
-// see line 144). No additional namespace wrapper needed.
+// Helper to render HttpStatus as a string for log messages.
 const char* http_status_to_str(HttpStatus s) {
   switch (s) {
     case HttpStatus::OK:                 return "OK";
@@ -332,9 +294,9 @@ const char* http_status_to_str(HttpStatus s) {
   return "unknown";
 }
 
-// v1.20: firmware version baked into the binary. The string is
-// also reported by /autopanel/test/state so the test harness
-// can sanity-check that the device is running the build the test
+// Firmware version baked into the binary. The string is also
+// reported by /autopanel/test/state so the test harness can
+// sanity-check that the device is running the build the test
 // was written against. Update this constant in lockstep with
 // the v1.X commit; the __DATE__ / __TIME__ macros give each
 // build a unique fingerprint even between two builds of the
@@ -433,12 +395,12 @@ void HaAutoPanel::setup() {
   ESP_LOGI(TAG, "ESP Hosted: not configured (native WiFi)");
 #endif  // USE_ESP32_HOSTED
 
-  // v1.20: build the firmware_version_ string from the baked-in
-  // constants. The format is "v1.20-dev 2026-06-05 12:34:56" -
-  // version + date + time. We log it on every boot so the device
-  // log shows which build is running, and also surface it via
-  // /autopanel/test/state and a small title-bar label so the
-  // test harness and the user can both see it.
+  // Build the firmware_version_ string from the baked-in constants.
+  // The format is "v1.27-dev 2026-06-05 12:34:56" - version + date
+  // + time. We log it on every boot so the device log shows which
+  // build is running, and also surface it via /autopanel/test/state
+  // and a small title-bar label so the test harness and the user
+  // can both see it.
   {
     char buf[80];
     snprintf(buf, sizeof(buf), "%s built %s %s",
@@ -522,13 +484,10 @@ void HaAutoPanel::setup() {
 
     this->splash_label_ = lv_label_create(this->splash_container_);
     if (this->splash_label_ != nullptr) {
-      // v1.22e: was hardcoded "HA AutoPanel v1.0" - the user
-      // pointed out the boot splash should show the actual
-      // firmware version, not a stale literal. We use the
-      // FIRMWARE_VERSION macro so the splash always matches
-      // what the build was compiled with. Format:
-      //   "HA AutoPanel v1.22e"
-      // (FIRMWARE_VERSION is the bare "v1.22e" form.)
+      // Use the FIRMWARE_VERSION macro so the splash always
+      // matches what the build was compiled with. Format:
+      //   "HA AutoPanel v1.27"
+      // (FIRMWARE_VERSION is the bare "v1.27" form.)
       std::string splash_text = std::string("HA AutoPanel ") + FIRMWARE_VERSION;
       set_label_text_if_changed(this->splash_label_, splash_text);
       // Pure red (0xFF0000) per the spec. Default font is fine here —
@@ -581,26 +540,14 @@ void HaAutoPanel::setup() {
   this->template_api_.set_http(this->http_request_);
   this->template_api_.update(this->ha_api_url_, this->ha_api_password_);
 
-  // v1.22u removed: SDIO wedge detector task spawn.
-  // The dedicated FreeRTOS task was the wrong abstraction;
-  // it watched loopTask's heartbeat but the actual
-  // deadlock was in a different task. v1.22v fixes the
-  // cause (per-room poll + httpd hardening) instead.
-  // See [[project_crowpanel_sdio_is_symptom]].
+  // (The dedicated SDIO wedge detector task was the wrong
+  // abstraction - it watched loopTask's heartbeat but the
+  // actual deadlock was in a different task. Removed.)
 }
 
-// v1.22u removed: heartbeat method. The detector task no
-// longer exists, so the heartbeat is no longer needed.
-// Removed entirely in v1.22v.
-
-// v1.22u removed: drive GPIO32 (the C6 reset line) for wedge
-// recovery. The dedicated detector task was the wrong
-// abstraction. v1.22v fixes the priority-inversion cause
-// instead. See [[project_crowpanel_sdio_is_symptom]].
-
-// v1.22u removed: last-resort recovery. App.reboot() is no
-// longer invoked by the wedge detector. Replaced by the
-// priority-inversion fix in v1.22v.
+// (Heartbeat, GPIO32 drive, and last-resort App.reboot()
+// methods all removed when the wedge detector task was
+// removed - they had no caller.)
 
 void HaAutoPanel::trigger_discovery() {
   ESP_LOGI(TAG, "trigger_discovery() called");
@@ -615,25 +562,20 @@ void HaAutoPanel::trigger_discovery() {
 
 
 void HaAutoPanel::trigger_auth_probe() {
-  // v1.22w: same deferral pattern as trigger_subscription().
-  // The YAML lambda allocates a std::function ONCE at parse
-  // time, but if the httpd worker invokes it and probe_authorization_()
-  // throws (it can, on a wedged C6 with a fragmented heap),
-  // the abort lands in the worker context. Setting a flag
-  // here and doing the probe in loop() means the heavy
-  // service-call construction happens on the main task.
+  // Deferred-trigger pattern: setting a flag here and doing
+  // the probe in loop() means the heavy service-call construction
+  // happens on the main task rather than the httpd worker
+  // (where a throw from a wedged C6 with a fragmented heap
+  // would land in the worker context and -fno-exceptions would
+  // abort()).
   ESP_LOGI(TAG, "trigger_auth_probe() called (deferred to loop)");
   if (s_instance == nullptr) return;
   s_instance->pending_auth_probe_ = true;
 }
 
 void HaAutoPanel::fetch_areas_() {
-  // v1.23: migrated to HttpClient. The previous implementation
-  // was 80+ lines of status-code checks + a manual chunked
-  // read loop (duplicated 8+ times in this file). HttpClient
-  // handles both. The Jinja template + JSON parse logic
-  // (below) is unchanged - that's the part that's specific
-  // to this endpoint.
+  // The HTTP layer is HttpClient; the Jinja template + JSON
+  // parse logic below is the part specific to this endpoint.
   if (this->http_request_ == nullptr) {
     ESP_LOGE(TAG, "http_request_ is null - cannot fetch areas");
     return;
@@ -743,10 +685,8 @@ void HaAutoPanel::fetch_areas_() {
 
   ESP_LOGD(TAG, "Template body length: %d", (int)body.size());
 
-  // v1.23: HttpClient consolidates the get/post + read loop
-  // + status-code boilerplate. The result.body is the raw
-  // response (or empty on error). Auth failure transitions
-  // the panel state - same as before.
+  // HttpClient result.body is the raw response (or empty on
+  // error). Auth failure transitions the panel state.
   HttpClient http(this->http_request_);
   auto auth = http.bearer_auth(this->ha_api_password_);
   auth.push_back({"Content-Type", "application/json"});
@@ -790,17 +730,17 @@ void HaAutoPanel::fetch_areas_() {
   // array in some configurations and was previously discarding all data.
   PsramJsonDocument doc(&s_psram_allocator);
 
-  // v1.22p: unsubscribe the loopTask from the IDF TWDT
-  // for the duration of the bulk parse. App.feed_wdt()
-  // (the v1.22n fix) only feeds the ESPHome main loop
-  // watchdog, not the IDF freeRTOS task watchdog. The
-  // TWDT still fires on the long deserializeJson call.
-  // The guard re-subscribes on scope exit, so an early
-  // return from a parse error still cleans up.
+  // Unsubscribe the loopTask from the IDF TWDT for the
+  // duration of the bulk parse. App.feed_wdt() only feeds
+  // the ESPHome main loop watchdog, not the IDF freeRTOS
+  // task watchdog. The TWDT still fires on the long
+  // deserializeJson call. The guard re-subscribes on scope
+  // exit, so an early return from a parse error still cleans
+  // up.
   TwdtGuard twdt_guard;
-  // v1.22n: feed the ESPHome loop watchdog too (belt +
-  // suspenders). The TwdtGuard handles the IDF TWDT;
-  // this handles the ESPHome one.
+  // Feed the ESPHome loop watchdog too (belt + suspenders).
+  // The TwdtGuard handles the IDF TWDT; this handles the
+  // ESPHome one.
   App.feed_wdt();
 
   // Use the (data, size) overload of deserializeJson because
@@ -979,25 +919,14 @@ void HaAutoPanel::fetch_home_name_() {
 }
 
 void HaAutoPanel::fetch_weather_() {
-  // v1.25c7: weather via HA /api/template. The server does
-  // the localization (state_translated -> "Partly Cloudy"),
+  // Weather via HA /api/template. The server does the
+  // localization (state_translated -> "Partly Cloudy"),
   // the casing (| title), the rounding (| round | int), and
   // the unit attachment (reads temperature_unit from the
-  // entity attributes). All the client-side mapping table
-  // + camelCase fallback + UTF-8 unit walking that the
-  // v1.25c1 commit added is now unnecessary - HA's
-  // weather.translate_state service already maps the
-  // weather.<provider>.state values to the user's locale.
-  //
-  // v1.27: switched to TemplateApi::render() to centralize
-  // the {"template": "..."} JSON wrapping + Bearer auth.
-  // The body construction, header assembly, and HTTP post
-  // are now inside the helper. The defensive ArduinoJson
-  // parse is gone - HA returns the rendered string as bare
-  // text (verified via curl/Invoke-RestMethod in
-  // [[ha-autopanel-v127-template-api]]); we still strip
-  // surrounding JSON quotes as a belt-and-suspenders guard
-  // in case a future HA version returns JSON-quoted text.
+  // entity attributes). HA returns the rendered string as
+  // bare text; we strip surrounding JSON quotes as a
+  // belt-and-suspenders guard in case a future HA version
+  // returns JSON-quoted text.
   if (this->title_weather_label_ == nullptr) return;
   if (this->weather_entity_id_.empty()) {
     ESP_LOGD(TAG, "[weather] disabled (weather_entity_id is empty)");
@@ -1115,13 +1044,9 @@ void HaAutoPanel::fetch_weather_() {
 // periodic baseline refresh fetch.
 
 void HaAutoPanel::monitor_task_states_() {
-  // v1.25c7: WLED-style task state monitor. Replaces the v1.22v
-  // check_stuck_tasks_() which only watched sdio_write and
-  // spammed "[stuck] sdio_write BLOCKED for X ms" every 30s
-  // (the sdio_write task is in eBlocked whenever idle, so
-  // the log was pure noise). The new monitor walks every
-  // task via uxTaskGetSystemState, diffs against the previous
-  // snapshot, and logs only meaningful changes.
+  // WLED-style task state monitor. Walks every task via
+  // uxTaskGetSystemState, diffs against the previous snapshot,
+  // and logs only meaningful changes.
   //
   // What it logs (at INFO by default):
   //   - First sighting of a task: "tracking <name> state=X
@@ -1132,23 +1057,10 @@ void HaAutoPanel::monitor_task_states_() {
   //   - Stack HWM drop below 512 (WARN) or 256 (ERROR)
   //   - Task deletion
   //
-  // What it does NOT do (vs the v1.22v detector):
-  //   - Watch sdio_write specifically (it's expected to be
-  //     eBlocked whenever idle)
-  //   - Auto-fire C6 reset (wedge_trigger_c6_reset_ is kept
-  //     as a callable for future use; the monitor is pure
-  //     observation). Recovery remains a yaml knob that no
-  //     code path currently consumes.
-  //
-  // What this buys us:
-  //   - Priority-inversion visibility: the timeline of "httpd
-  //     went Running→Blocked at T+50ms" + "lvgl went
-  //     Ready→Running at T+50ms" + a long eBlocked gives
-  //     the postmortem signal that the httpd/lvgl mutex pair
-  //     is contended. The sdio_write-only v1.22v check
-  //     couldn't see this.
-  //   - Stack-overflow pre-warning: a 256-byte HWM drop fires
-  //     ERROR before the actual overflow crashes the device.
+  // The monitor never takes corrective action; wedge_trigger_c6_reset_()
+  // remains as a callable for future use. Priority-inversion
+  // visibility (high-prio task in eBlocked while mid-prio task
+  // is eRunning) is the main benefit.
   if (!this->enable_task_monitor_) return;
   uint32_t now = millis();
   if (this->last_task_monitor_ms_ != 0 &&
@@ -1244,37 +1156,22 @@ void HaAutoPanel::monitor_task_states_() {
 }
 
 void HaAutoPanel::wedge_trigger_c6_reset_() {
-  // v1.22y: actually reset the C6 co-processor. The C6 is
-  // the ESP32-C6 wifi/SDIO co-processor on the P4 module;
-  // it has its own firmware and its own SDIO link to the
-  // P4 host. The "wedge" is a state where the C6 is alive
-  // (the SDIO interrupt still fires) but the SDIO buffer
-  // pool is empty - host tasks aren't draining fast enough
-  // and sdio_rx_get_buffer() asserts in sdio_drv.c:896
-  // (*buf == NULL). The cheapest software recovery is a
-  // hard C6 reset via the GPIO32 reset line shared with
-  // the esp32_hosted config's reset_pin. Drive low for
-  // 100ms then release; the C6 boots cleanly on release
-  // and the SDIO link re-initializes on the P4 side.
+  // Reset the C6 co-processor. The C6 is the ESP32-C6
+  // wifi/SDIO co-processor on the P4 module; it has its own
+  // firmware and its own SDIO link to the P4 host. The "wedge"
+  // is a state where the C6 is alive (the SDIO interrupt still
+  // fires) but the SDIO buffer pool is empty - host tasks
+  // aren't draining fast enough and sdio_rx_get_buffer() asserts
+  // in sdio_drv.c:896 (*buf == NULL). The cheapest software
+  // recovery is a hard C6 reset via the GPIO32 reset line
+  // shared with the esp32_hosted config's reset_pin. Drive
+  // low for 100ms then release; the C6 boots cleanly on
+  // release and the SDIO link re-initializes on the P4 side.
   //
-  // Implementation notes:
-  // - gpio_reset_pin() releases any previous driver hold
-  //   on the pin (the esp32_hosted component usually
-  //   claims it during its own init; calling reset here
-  //   ensures we have control).
-  // - gpio_set_direction(OUTPUT) before set_level() is
-  //   required - set_level on an input is a no-op.
-  // - Busy-wait instead of vTaskDelay: the wedge_detector
-  //   (or in v1.22y, check_stuck_tasks_) is running on the
-  //   main loopTask. vTaskDelay(100) would yield to other
-  //   tasks, including the wedged sdio_write task - which
-  //   can't help us, and would extend the recovery latency.
-  //   100ms is well under the IDF TWDT default of 30s (we
-  //   bumped to 30s in the sdkconfig too).
-  // - The GPIO_NUM_32 constant is the same pin declared in
-  //   the YAML's esp32_hosted.reset_pin: GPIO32. If the
-  //   user ever changes that pin, this hardcoded constant
-  //   needs to follow.
+  // Busy-wait instead of vTaskDelay: 100ms is well under the
+  // IDF TWDT default of 30s (set in sdkconfig). vTaskDelay(100)
+  // would yield to other tasks including a wedged sdio_write
+  // task which can't help us.
   ESP_LOGE(TAG, "[stuck] driving GPIO32 low for %u ms (C6 reset)",
            (unsigned)WEDGE_C6_RESET_LOW_MS);
   gpio_reset_pin(GPIO_NUM_32);
@@ -1320,21 +1217,10 @@ void HaAutoPanel::start_discovery_() {
     ESP_LOGW(TAG, "Aborting discovery: auth failed during area fetch");
     return;
   }
-  // v1.24: removed the v1.22aa fetch_entities_template_() call
-  // (and its fallback fetch_entities_()). The 200KB+ /api/states
-  // burst has been replaced by HaWsClient::get_states over a
-  // raw WebSocket (opened below), which returns the same state
-  // data without the SDIO wedge trigger. Stub Entity records
-  // are still populated by fetch_areas_() (entity_id, domain,
-  // name, area_id); the WebSocket path fills in state +
-  // brightness via the get_states response and the
-  // subscribe_events stream.
-  //
-  // v1.27 (Phase 4): BOTH paths above have been replaced by
-  // the per-area aggregate template. fetch_room_aggregates_()
-  // below does a one-shot POST /api/template to populate the
-  // initial state, and the WS render_template subscription
-  // (set up in parse_auth_ok_) keeps it fresh.
+  // Stub Entity records are populated by fetch_areas_()
+  // (entity_id, domain, name, area_id); the per-area aggregate
+  // template (one-shot fetch_room_aggregates_() + WS push via
+  // render_template) populates state + brightness.
 
   // Build the per-area aggregate template now that we know
   // the area list. The template body is the Jinja2 we
@@ -1358,6 +1244,8 @@ void HaAutoPanel::start_discovery_() {
   }
 
   filter_and_build_room_cards_();
+  // Rebuild the entity->area reverse map for find_area_id_for_entity_().
+  this->rebuild_entity_to_area_map_();
 
   // Create the UI
   create_ui_from_room_cards_();
@@ -1370,15 +1258,11 @@ void HaAutoPanel::start_discovery_() {
 
   ESP_LOGI(TAG, "=== Discovery Complete ===");
 
-  // v1.24: kick off the raw WebSocket-to-HA client. It opens
-  // a connection, authenticates, fetches all current states
-  // via get_states, and subscribes to live state_changed events
-  // via subscribe_events. State updates flow through the
-  // event_queue_ and are drained in loop() via
-  // drain_state_events(). This REPLACES the v1.22w
-  // subscribe_home_assistant_state path. In commit 3 the HTTP
-  // bulk fetches still run in parallel (race is benign, last
-  // writer wins); commit 4 removes the HTTP fetches.
+  // Kick off the raw WebSocket-to-HA client. It opens a
+  // connection, authenticates, and subscribes to the clock +
+  // per-area aggregate render_template events (which deliver
+  // all state changes server-side, no per-entity std::function
+  // allocations in the httpd worker).
   if (!this->ws_client_) {
     this->ws_client_ = std::make_unique<HaWsClient>(this);
     this->ws_client_->set_url(this->ha_api_url_);
@@ -1398,14 +1282,9 @@ void HaAutoPanel::start_discovery_() {
   }
   this->ws_client_->start();
 
-  // v1.22l: gate the periodic state poll on this. Set AFTER
-  // fetch_entities_() has populated entities_by_area_ for
-  // the first time. Before this flag, the poll would fire
-  // during the initial discovery window and either:
-  //   - race with fetch_entities_() and overwrite a partial
-  //     result, or
-  //   - find an empty entities_by_area_ and do nothing
-  //     useful (but still consume the network bandwidth).
+  // Set AFTER entities_by_area_ has been populated for the
+  // first time. Lets downstream work distinguish "discovery
+  // complete" from "still fetching".
   this->entities_by_area_ready_ = true;
 
   // Mark panel as READY - we have rooms to show.
@@ -1631,16 +1510,14 @@ void HaAutoPanel::start_ui_build_() {
   // grid is a full surface.
   lv_obj_set_style_bg_color(this->main_container_, lv_color_hex(0x0f1620), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(this->main_container_, LV_OPA_COVER, LV_PART_MAIN);
-  // v1.15: scrollbar mode is now AUTO (was OFF). With 15+ rooms
-  // (Back Room, Back Yard, Back Stairs, Basement Hall, Bathroom,
-  // Closet, Front Porch, Front Room, Garage, Kitchen, Living
-  // Room, Kelly's Room, Spa, Stairs, Troy's Room) at 4 per row
-  // = 4 rows = 1072px tall, the grid overflows the 600px screen
-  // by ~470px. The container IS scrollable (LVGL default), but
-  // with LV_SCROLLBAR_MODE_OFF the user has no visual hint that
-  // more content exists below. AUTO shows a thin scrollbar
-  // during scroll then hides it - the user knows to drag, and
-  // the screen stays clean when idle.
+  // Scrollbar mode is AUTO. With 15+ rooms (Back Room, Back Yard,
+  // Back Stairs, Basement Hall, Bathroom, Closet, Front Porch,
+  // Front Room, Garage, Kitchen, Living Room, Kelly's Room, Spa,
+  // Stairs, Troy's Room) at 4 per row = 4 rows = 1072px tall,
+  // the grid overflows the 600px screen by ~470px. The container
+  // IS scrollable (LVGL default), but with LV_SCROLLBAR_MODE_OFF
+  // the user has no visual hint that more content exists below.
+  // AUTO shows a thin scrollbar during scroll then hides it.
   lv_obj_set_scrollbar_mode(this->main_container_, LV_SCROLLBAR_MODE_AUTO);
   lv_obj_set_style_pad_all(this->main_container_, 0, 0);  // No padding
   lv_obj_set_style_border_width(this->main_container_, 0, 0);  // No border
@@ -1799,8 +1676,7 @@ void HaAutoPanel::force_refresh_if_due_() {
 }
 
 void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
-  // v1.22r: header bar redesign.
-  //
+  // Title bar redesign.
   // Layout (left to right):
   //   [LEFT_CLUSTER]  [HOME_NAME (centered)]  [RIGHT_CLUSTER]
   //         |                                    |
@@ -1919,9 +1795,11 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_remove_flag(this->title_right_cluster_, LV_OBJ_FLAG_CLICKABLE);
 
   // Local clock (HH:MM AM/PM). Right cluster child. Updated by
-  // update_title_time_() called from loop() (~1Hz) once NTP sync
-  // has completed. v1.22r: the time label is CLICKABLE - tapping
-  // it toggles the Edit + Reboot buttons (title_chrome_visible_).
+  // Local clock (HH:MM AM/PM). Right cluster child. Updated by
+  // the on_clock_update_() callback (driven by the WS
+  // render_template subscription, fires once per minute).
+  // The time label is CLICKABLE - tapping it toggles the Edit +
+  // Reboot buttons (title_chrome_visible_).
   // Width is data-driven via button_width_for_text_().
   this->title_time_label_ = lv_label_create(this->title_right_cluster_);
   lv_label_set_text(this->title_time_label_, "--:--");
@@ -1933,12 +1811,11 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_set_width(this->title_time_label_,
                    button_width_for_text_("--:--", time_font, 4));
   lv_obj_set_height(this->title_time_label_, LV_SIZE_CONTENT);
-  // v1.22s: apply the show_time_ knob at create-time. When
-  // false the label is hidden from the start; the right
-  // cluster auto-collapses to just the DBG button. The
-  // click handler is still attached below (a no-op since
-  // the label is hidden, but kept for symmetry with the
-  // show-time path).
+  // Apply the show_time_ knob at create-time. When false the
+  // label is hidden from the start; the right cluster
+  // auto-collapses to just the DBG button. The click handler
+  // is still attached below (a no-op since the label is
+  // hidden, but kept for symmetry with the show-time path).
   if (!this->show_time_) {
     lv_obj_add_flag(this->title_time_label_, LV_OBJ_FLAG_HIDDEN);
   }
@@ -1949,14 +1826,11 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // tap target is comfortable - the label text is small
   // (14pt) but the user wants a forgiving touch area.
   lv_obj_set_style_pad_all(this->title_time_label_, 6, 0);
-  // v1.22r: click handler for the time toggle. Tapping the
-  // time shows/hides the Edit + Reboot buttons in the right
-  // cluster (the "tidy by default" rule). Debounced by 250ms
-  // via last_title_tap_ms_ so a finger drag across the title
-  // bar doesn't trigger multiple toggles. The buttons were
-  // created above as default-hidden; this handler just flips
-  // their LV_OBJ_FLAG_HIDDEN bit and updates
-  // title_chrome_visible_ for the next show_room_grid_() pass.
+  // Click handler for the time toggle. Tapping the time shows/
+  // hides the Edit + Reboot buttons in the right cluster (the
+  // "tidy by default" rule). Debounced by 250ms via
+  // last_title_tap_ms_ so a finger drag across the title bar
+  // doesn't trigger multiple toggles.
   lv_obj_add_event_cb(this->title_time_label_, [](lv_event_t* event) {
     if (s_instance == nullptr) return;
     uint32_t now_ms = millis();
@@ -1982,10 +1856,9 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   }, LV_EVENT_CLICKED, nullptr);
 
   // Debug button (50px wide "DBG"). Right cluster child. Visible
-  // only when the panel is in any non-READY state. In the new
-  // v1.22r layout it's always part of the right cluster; the
-  // cluster itself may be hidden on small screens, but on a
-  // 7" panel we have the room.
+  // Only visible when the panel is in any non-READY state.
+  // Part of the right cluster; the cluster itself may be
+  // hidden on small screens, but on a 7" panel we have the room.
   this->title_debug_btn_ = lv_obj_create(this->title_right_cluster_);
   lv_obj_set_size(this->title_debug_btn_, 50, 28);
   lv_obj_set_style_bg_color(this->title_debug_btn_, lv_color_hex(0x374151), 0);
@@ -2015,12 +1888,10 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // sort+hide list (the user-preferred way to reorder rooms, which
   // replaces the drag-to-reorder gesture).
   //
-  // v1.22b: bumped from 28 to 32 high to match the back button
-  // (Fix #5 button audit).
-  // v1.22e: width is data-driven. v1.22b had 60 hard-coded which
-  // is fine for "Edit" but would clip "Edit Rooms" or any future
-  // relabel. We measure the actual text and add 14px of horizontal
-  // padding (7px each side) for a comfortable touch target.
+  // 32px high to match the back button (height consistency).
+  // Width is data-driven via button_width_for_text_(); the
+  // previous hard-coded 60px would clip "Edit Rooms" or any
+  // future relabel.
   this->title_sort_btn_ = lv_obj_create(this->title_right_cluster_);
   lv_obj_set_width(this->title_sort_btn_,
                    button_width_for_text_("Edit", &lv_font_montserrat_14));
@@ -2029,7 +1900,7 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   lv_obj_set_style_radius(this->title_sort_btn_, 6, 0);
   lv_obj_set_style_border_width(this->title_sort_btn_, 0, 0);
   lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_CLICKABLE);
-  // v1.22r: hidden by default. The time-tap toggle in
+  // Hidden by default. The time-tap toggle in
   // show_room_grid_() shows/hides it based on
   // title_chrome_visible_.
   lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
@@ -2056,27 +1927,20 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // it from the normal grid view too. The user pointed this out
   // during v1.5 review.
 
-  // v1.11: Edit + Cancel buttons were removed. The Sort button
-  // (created above) is the single entry point for room customization
-  // (both reorder and show/hide). The X badges that used to appear
-  // on each room card in edit mode are also gone - the Sort
-  // panel's per-row hide toggle is the only hide path now. The
-  // title bar's right cluster is now: [... Sort] only (no Edit
-  // between Sort and Done), so the layout reads as
+  // The Sort button (created above) is the single entry point
+  // for room customization (both reorder and show/hide). The
+  // title bar's right cluster reads as:
   // "406 Brock Ave" centered + "Sort" right + status indicators
   // left.
 
-  // v1.17: AUTO-TEST banner. A small bright-orange pill in the
+  // AUTO-TEST banner. A small bright-orange pill in the
   // bottom-right corner of the title bar that appears when the
   // test harness flips test_banner_active_ on via
   // /autopanel/test/banner?on=1. Hides itself on ?on=0 and
   // whenever the panel reboots (test_banner_active_ starts
   // false). This is the "do not touch the panel" indicator for
-  // the user - it shows that the bft.py / run_tests.py harness
-  // is driving the panel and any touch will be intercepted by
-  // the test commands. Position: bottom-right of the title bar,
-  // just past the Sort button. The label is small (3-4 chars
-  // "TEST") so the bar still looks balanced.
+  // the user - it shows that the test harness is driving the
+  // panel and any touch will be intercepted by the test commands.
   this->title_test_banner_ = lv_label_create(this->title_bar_);
   lv_label_set_text(this->title_test_banner_, "TEST");
   lv_obj_set_style_text_color(this->title_test_banner_, lv_color_hex(0x111827), 0);
@@ -2100,30 +1964,25 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // (If the user wants it INSIDE the title bar instead, change
   // y=38 to y=2; the label will fit in the 36px bar.)
 
-  // v1.19: Save and Cancel buttons in the title bar. They live
-  // in the right cluster with the Edit button. Both are HIDDEN
-  // by default and show_sort_panel_() un-hides them while
+  // Save and Cancel buttons in the title bar. They live in the
+  // right cluster with the Edit button. Both are HIDDEN by
+  // default and show_sort_panel_() un-hides them while
   // hide_sort_panel_() re-hides them. Putting them in the title
   // bar (rather than at the bottom of the sort panel) means
   // the user always knows where the apply/discard actions are,
-  // even if the room list is long enough that the panel
-  // bottom is scrolled off-screen.
+  // even if the room list is long enough that the panel bottom
+  // is scrolled off-screen.
   //
   // Position: the right cluster is a flex row. Save is just
   // left of the Edit button, Cancel is to the left of Save.
   // When all three are visible: [Cancel] [Save] [Edit].
-  // The cluster's flex layout auto-positions them; we just
-  // create the widgets and the row handles the spacing.
   //
-  // Save is YELLOW (primary action) with dark text - matches
-  // the existing accent color. Cancel is RED (destructive
-  // discard) with white text. Edit is the cool gray of the
-  // existing chrome.
+  // Save is YELLOW (primary action) with dark text. Cancel
+  // is RED (destructive discard) with white text. Edit is the
+  // cool gray of the existing chrome.
   //
-  // v1.22b: bumped from 28 to 32 high to match the back button
-  // (Fix #5 button audit - mixed heights in the title bar looked
-  // ragged).
-  // v1.22e: data-driven width via button_width_for_text_().
+  // 32px high to match the back button (height consistency).
+  // Data-driven width via button_width_for_text_().
   this->title_save_btn_ = lv_obj_create(this->title_right_cluster_);
   lv_obj_set_width(this->title_save_btn_,
                    button_width_for_text_("Save", &lv_font_montserrat_14));
@@ -2147,9 +2006,7 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   }, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_flag(this->title_save_btn_, LV_OBJ_FLAG_HIDDEN);
 
-  // v1.22b: bumped from 28 to 32 high to match the back button
-  // (Fix #5 button audit).
-  // v1.22e: data-driven width via button_width_for_text_().
+  // 32px high to match the back button. Data-driven width.
   this->title_cancel_btn_ = lv_obj_create(this->title_right_cluster_);
   lv_obj_set_width(this->title_cancel_btn_,
                    button_width_for_text_("Cancel", &lv_font_montserrat_14));
@@ -2172,29 +2029,18 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   }, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_flag(this->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
 
-  // v1.21: Reboot button. Only created when agent_debug_ is true
-  // (so production builds don't expose a soft-reboot path to the
-  // user). The Crowpanel is now battery-powered and the case
-  // makes the physical reset button hard to reach, so the
-  // user needs a panel-side way to soft-reboot during testing
-  // and recovery. The button is RED, sits in the right cluster
-  // to the LEFT of Cancel (Cancel and Save and Edit and Reboot
-  // are all in the right cluster when visible). The tap handler
-  // is a direct App.reboot() - we don't bother with a
-  // confirm-tap pattern because agent_debug builds are not
-  // user-facing (only the test harness / developer should be
-  // hitting Reboot).
+  // Reboot button. Only created when agent_debug_ is true (so
+  // production builds don't expose a soft-reboot path). The
+  // Crowpanel is battery-powered and the case makes the physical
+  // reset button hard to reach, so the user needs a panel-side
+  // way to soft-reboot during testing and recovery. The button
+  // is RED, sits in the right cluster to the LEFT of Cancel.
+  // The tap handler is a direct App.reboot() - no confirm-tap
+  // pattern because agent_debug builds are not user-facing.
   //
-  // v1.22b: bumped from 28 to 32 high to match the back button
-  // (which was already 32). Mix-and-match heights in the title
-  // bar looked ragged; the user pointed this out in Fix #5.
+  // 32px high to match the back button. Data-driven width.
   if (this->agent_debug_) {
     this->title_reboot_btn_ = lv_obj_create(this->title_right_cluster_);
-    // v1.22e: width is data-driven via button_width_for_text_().
-    // The previous 70px hard-coded value clipped "Reboot" to
-    // "Reboo"; the 85px v1.22e value was still a guess. Now
-    // the button is exactly the right size for whatever the
-    // label says, plus 14px touch padding.
     lv_obj_set_width(this->title_reboot_btn_,
                      button_width_for_text_("Reboot", &lv_font_montserrat_14));
     lv_obj_set_height(this->title_reboot_btn_, 32);
@@ -2202,7 +2048,7 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
     lv_obj_set_style_radius(this->title_reboot_btn_, 6, 0);
     lv_obj_set_style_border_width(this->title_reboot_btn_, 0, 0);
     lv_obj_add_flag(this->title_reboot_btn_, LV_OBJ_FLAG_CLICKABLE);
-    // v1.22r: hidden by default (the time-tap toggle shows it).
+    // Hidden by default (the time-tap toggle shows it).
     lv_obj_add_flag(this->title_reboot_btn_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(this->title_reboot_btn_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t* reboot_label = lv_label_create(this->title_reboot_btn_);
@@ -2224,12 +2070,9 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
     this->title_reboot_btn_ = nullptr;
   }
 
-  // v1.20: version label at the bottom-left of the title bar
-  // area. Hidden by default; flip agent_debug's /autopanel/test/state
-  // and the harness can ask the user to "show me the version" by
-  // tapping a hidden hot spot, OR we can just enable it for the
-  // build with the right config. For now it's hidden - the harness
-  // gets the version via the test/state endpoint and a log line
+  // Version label at the bottom-left of the title bar area.
+// Hidden by default; the harness gets the version via the
+// test/state endpoint and a log line
   // is printed on every boot, so the test result captures the
   // build identity.
   this->title_version_label_ = lv_label_create(this->title_bar_);
@@ -2248,15 +2091,10 @@ void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
   // entity detail page it pops back to the grid.
   this->title_back_btn_ = lv_obj_create(this->title_bar_);
   // Bumped from 70x28 to 75x32 per user request ("about 5px bigger")
-  // for an easier tap target. v1.22b: re-centered vertically in the
-  // 36px-tall title bar (y=4 leaves 2px top + 2px bottom margin and
-  // lines up with the right-cluster buttons which are now also 32
-  // high). The 32x position is what the user meant by "slightly too
-  // small" - the button was sized right but offset upward, so it
-  // didn't visually line up with the other chrome.
-  // v1.22e: width isdetail data-driven via button_width_for_text_() against
-  // "< Back". "<" + " " + "Back" is wider than the v1.22b hand-tuned
-  // 75px at larger fonts; the helper fixes that.
+  // for an easier tap target. Re-centered vertically in the 36px-tall
+  // title bar (y=4 leaves 2px top + 2px bottom margin and lines up
+  // with the right-cluster buttons which are also 32 high). Width
+  // is data-driven via button_width_for_text_() against "< Back".
   lv_obj_set_width(this->title_back_btn_,
                    button_width_for_text_("< Back", &lv_font_montserrat_14));
   lv_obj_set_height(this->title_back_btn_, 32);
@@ -2297,17 +2135,15 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
 
   lv_obj_t* card = lv_obj_create((lv_obj_t*) parent);
   lv_obj_set_pos(card, room.x, room.y);
-  lv_obj_set_size(card, this->card_width_, this->card_height_);  // v1.22f: was square; now wider-than-tall to fit arc + ON/OFF button
+  lv_obj_set_size(card, this->card_width_, this->card_height_);  // square cards; arc + ON/OFF button both fit inside
   // Register the card widget so the drag-to-reorder code can find it by
   // area_id. The card is destroyed with the parent on refresh, and this
   // map is cleared in refresh_room_cards_() to match.
   lv_obj_set_style_bg_color(card, lv_color_hex(0x1a1a2e), 0);
   lv_obj_set_style_radius(card, 12, 0);
-  // v1.11: edit-mode yellow border was removed along with the Edit
-  // button. The card is now always borderless. If we ever bring
-  // back an "X marks the spot" affordance, the border is a good
-  // place to put it - but right now the Sort panel is the only
-  // way to hide, and the panel itself is the visual signal.
+  // Edit-mode yellow border was removed along with the Edit button.
+  // The card is now always borderless. The Sort panel is the only
+  // way to hide.
   lv_obj_set_style_border_width(card, 0, 0);
   lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
   lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -2351,7 +2187,7 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // opa=0 fallback (e.g. if the knob widget ignores the parent style).
   lv_obj_add_flag(arc, LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_size(arc, arc_size, arc_size);  // square
-  // v1.22k: arc is in the UPPER portion of the card
+  // Arc is in the upper portion of the card (LV_ALIGN_CENTER, 270°):
   // (LV_ALIGN_TOP_MID with a 12px top margin). The reference
   // shows the arc occupying roughly the top 60% of the card,
   // with the room name at the vertical center BELOW the
@@ -2460,16 +2296,10 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
     delete data;
   }, LV_EVENT_DELETE, nullptr);
 
-  // ON/OFF button. v1.22i: 110x32. Placed INSIDE the arc's
-  // bottom opening.
-  //
-  // v1.22j: positioned with LV_ALIGN_BOTTOM_MID + a y
-  // offset of -8px (8px above the card's bottom edge) -
-  // centering relative to the card, NOT raw pixel coords.
-  // The v1.22i version used lv_obj_set_pos() with hand-
-  // computed coordinates; per the user's design principle,
-  // always anchor to a centering command and only use pixel
-  // offsets for fine adjustments against the centering.
+  // ON/OFF button. 110x32. Placed INSIDE the arc's bottom
+  // opening. Positioned with LV_ALIGN_BOTTOM_MID with a small
+  // y offset - always anchor to a centering command and only
+  // use pixel offsets for fine adjustments.
   lv_obj_t* btn = lv_obj_create(card);
   int btn_w = 110;
   int btn_h = 32;
@@ -2584,7 +2414,7 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // CREATE LAST so it's on TOP in z-order and receives touches
   lv_obj_t* label_btn = lv_obj_create(card);
   lv_obj_remove_style_all(label_btn);  // Start with clean slate to avoid default button styles
-  // v1.22k: label_btn is the width of the arc, centered on
+  // label_btn is the width of the arc, centered on
   // the arc (LV_ALIGN_CENTER via align_to with the arc as
   // the base). The room name label inside is auto-centered
   // by lv_obj_center() (see below). The arc is 270° so the
@@ -2624,7 +2454,7 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // on the arc). lv_label_set_text takes a null-terminated const
   // char*; room.area.name is std::string so .c_str() is safe.
   //
-  // v1.22e: room names like "Front Porch Overhead Light" or
+  // Room names like "Front Porch Overhead Light" or
   // "Master Bedroom Closet" overflow the arc width on 250px
   // cards at 28pt. The previous code just clipped them
   // (LV_LABEL_LONG_CLIP). The user asked: if a name doesn't
@@ -2635,16 +2465,12 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   // "Front\nPorch Overhead Light".
   lv_obj_t* label = lv_label_create(label_btn);
   char name_buf[128];
-  // v1.22s: auto-fit font picker. The label is arc_size
-  // wide minus the 5px pad on each side of label_btn, so
-  // (arc_size - 10) is the budget. pick_room_name_font_()
-  // is currently a no-op (returns nullptr - see
-  // [[feedback_esphome_font_static_linkage]]) so we fall
-  // back to the LVGL default text font (font_xl per the
-  // yaml's `lvgl.text_font:`). When the picker becomes
-  // real, the only change is that picked_font will be
-  // non-null and the explicit set_style_text_font call
-  // below will override the default with the picked size.
+  // Auto-fit font picker. The label is arc_size wide minus the
+  // 5px pad on each side of label_btn, so (arc_size - 10) is
+  // the budget. pick_room_name_font_() is currently a no-op
+  // (returns nullptr - see feedback_esphome_font_static_linkage)
+  // so we fall back to the LVGL default text font (font_xl per
+  // the yaml's `lvgl.text_font:`).
   const int label_width_px = arc_size - 10;
   const lv_font_t* picked_font = this->pick_room_name_font_(
       room.area.name.c_str(), label_width_px);
@@ -2662,13 +2488,11 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
       room_font,
       name_buf, sizeof(name_buf));
   lv_label_set_text(label, name_buf);
-  // v1.22e: room name labels that fit on one line are set with
-  // default (auto) line-height. Two-line splits need
-  // LV_LABEL_LONG_WRAP and a line_height that matches the
-  // font so the two lines sit visually centered on the arc.
-  // We detect a split by the presence of '\n' in the buffer
-  // and switch the long_mode accordingly. We also expand
-  // label_btn's height so the two lines actually fit.
+  // Room name labels that fit on one line use LV_LABEL_LONG_CLIP
+  // (auto line-height). Two-line splits need LV_LABEL_LONG_WRAP
+  // and a line_height that matches the font so the two lines
+  // sit visually centered on the arc. We detect a split by the
+  // presence of '\n' in the buffer and switch accordingly.
   bool is_two_line = (strchr(name_buf, '\n') != nullptr);
   if (is_two_line) {
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
@@ -2683,7 +2507,8 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
   }
   lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
   lv_obj_set_width(label, arc_size - 10);
-  // v1.22k: text was visually left-aligned inside the
+  // Text is centered via the style API (this LVGL build doesn't
+// have lv_label_set_text_align).
   // label_btn (the default for lv_label). The user said
   // "v-centered but not h-centered" - the widget was
   // centered in its parent (lv_obj_center) but the text
@@ -2725,13 +2550,8 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
 
   const RoomCard& room = room_cards_[room_index];
   this->current_room_index_ = room_index;
-  // v1.22v: record the visible room's area_id so the per-room
-  // poll (subscribe_mode_ != "all") knows what to filter on,
-  // and on_entity_state_changed_()'s fast-fail can drop pushes
-  // for entities outside this room. Without this, the all-entity
-  // subscription does an O(N*E) full scan per push, which is the
-  // trigger condition for the priority-inversion deadlock in
-  // [[project_crowpanel_sdio_is_symptom]].
+  // Record the visible room's area_id (used to scope UI
+// affordances to the current room).
   this->current_room_area_id_ = room.area.area_id;
   // Force a per-room poll immediately so the new room's state
   // is fresh within ~50ms of the user tapping in (rather than
@@ -2765,12 +2585,9 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   lv_obj_set_pos(this->detail_container_, 0, 36);
   lv_obj_set_size(this->detail_container_, this->screen_width_, this->screen_height_ - 36);
 
-  // v1.16: hide the Sort button on the detail page. The Sort panel
-  // is for reordering and show/hiding ROOMS - both actions don't
-  // make sense when you're already inside a single room. Showing
-  // the button and letting the user open a panel that does
-  // nothing useful is a confusing UX. (We still show the back
-  // button + the room name in the center; Sort is grid-only.)
+  // Hide the Sort button on the detail page. The Sort panel is
+  // for reordering and show/hiding ROOMS - both actions don't
+  // make sense when you're already inside a single room.
   if (this->title_sort_btn_ != nullptr) {
     lv_obj_add_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
   }
@@ -2780,12 +2597,8 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   if (this->title_back_btn_ != nullptr) {
     lv_obj_remove_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
   }
-  // v1.11: the Edit -> Done label swap on the title bar is gone
-  // because title_edit_btn_ was removed. The detail page no longer
-  // has an Edit/Done button at all - back, sort, and the room
-  // name in the center are the only top-bar elements.
   // (The Sort button is hidden on the detail page by
-  // show_entity_detail_() / show_room_grid_() below.)
+// show_entity_detail_() / show_room_grid_() below.)
 
   // Defense in depth: make sure the title bar is the topmost child of the
   // screen, even after this new detail container was added underneath.
@@ -2796,12 +2609,10 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   // back button visibility changed and we may want to show the room name
   // in the title).
   lv_obj_set_style_bg_color(this->detail_container_, lv_color_hex(0x111827), 0);
-  // v1.15: scrollbar mode is now AUTO (was OFF). With rooms
-  // like Garage (138 entities) the detail page can be 11000+
-  // px tall - well past the 564px visible area. The user needs
-  // a visual hint that more content exists below the fold. AUTO
-  // shows the scrollbar during scroll then fades it. (See the
-  // matching comment on the main_container_ for the rationale.)
+  // Scrollbar mode is AUTO. With rooms like Garage (138 entities)
+// the detail page can be 11000+ px tall - well past the 564px
+// visible area. AUTO shows the scrollbar during scroll then
+// fades it.
   lv_obj_set_scrollbar_mode(this->detail_container_, LV_SCROLLBAR_MODE_AUTO);
   // v1.30: flex-column layout for the entity list. Each control
   // is added as a flex child; the row above set_size(0, 0)
@@ -2923,19 +2734,15 @@ void HaAutoPanel::show_room_grid_() {
   if (this->title_back_btn_ != nullptr) {
     lv_obj_add_flag(this->title_back_btn_, LV_OBJ_FLAG_HIDDEN);
   }
-  // v1.22c (Fix #9): show_entity_detail_() hides title_sort_btn_ at
-  // line 2193 (Sort doesn't make sense on a single-room detail
-  // view), but show_room_grid_() never un-hid it. So after a
-  // Detail -> Back round trip the Sort button stayed missing until
-  // the next reboot, and the user lost the only path into the
-  // customizer. Un-hide it here so the grid returns to its
-  // expected chrome.
-  //
-  // v1.22r: Edit (Sort) + Reboot buttons are now hidden by
-  // default on the grid page (the user wants the title bar
-  // tidy by default). They appear when the user taps the
-  // time label. The current state of title_chrome_visible_
-  // decides whether they're shown.
+  // show_entity_detail_() hides title_sort_btn_ (Sort doesn't make
+// sense on a single-room detail view); we un-hide it here so
+// the grid returns to its expected chrome after a Detail -> Back
+// round trip.
+//
+// Edit (Sort) + Reboot buttons are hidden by default on the
+// grid page (the user wants the title bar tidy by default). They
+// appear when the user taps the time label; the current state of
+// title_chrome_visible_ decides whether they're shown.
   if (this->title_sort_btn_ != nullptr) {
     if (this->title_chrome_visible_) {
       lv_obj_remove_flag(this->title_sort_btn_, LV_OBJ_FLAG_HIDDEN);
@@ -2950,9 +2757,6 @@ void HaAutoPanel::show_room_grid_() {
       lv_obj_add_flag(this->title_reboot_btn_, LV_OBJ_FLAG_HIDDEN);
     }
   }
-  // v1.11: title_edit_btn_ was removed. No label to flip back to
-  // "Edit" on return from the detail page. The title bar on the
-  // grid page is now: [Back hidden] [Home name centered] [Sort].
   if (this->title_room_label_ != nullptr) {
     lv_obj_add_flag(this->title_room_label_, LV_OBJ_FLAG_HIDDEN);
   }
@@ -2975,10 +2779,7 @@ void HaAutoPanel::show_room_grid_() {
   }
 
   this->current_room_index_ = -1;
-  // v1.22v: back to the grid -> clear the visible room so the
-  // per-room poll stops (it requires current_room_area_id_ to
-  // be set). The fast-fail in on_entity_state_changed_() also
-  // stops dropping pushes for invisible rooms.
+  // Back to the grid - clear the visible room.
   this->current_room_area_id_.clear();
 }
 
@@ -3167,14 +2968,10 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
   // Row layout: [Name] [State badge] [Domain] [Arc/%] [Hide X]
 
   // Name (left, vcenter). .data() is null-terminated because the
-  // underlying string_view points into a std::string. v1.14: width
-  // bumped from 260 -> 400px and switched to LV_LABEL_LONG_DOT
-  // (ellipsis on overflow) so the friendly_name from v1.12
-  // ("Kitchen Max Display" instead of "kitchen_max_display") has
-  // room to render. With CLIP on the old 260px box, the
-  // friendly_name was truncating to ~22 chars which felt
-  // arbitrary. DOT shows "..." on overflow which is the more
-  // conventional UX.
+  // 400px wide with LV_LABEL_LONG_DOT (ellipsis on overflow).
+// With CLIP on the old 260px box, friendly_name was truncating
+// to ~22 chars which felt arbitrary. DOT shows "..." on
+// overflow which is the more conventional UX.
   lv_obj_t* name_label = lv_label_create(control);
   lv_label_set_text(name_label, entity.name.data());
   lv_obj_set_style_text_color(name_label, lv_color_hex(0xFFFFFF), 0);
@@ -3185,21 +2982,16 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
   // State badge - rounded pill so the user can read ON/OFF/-- at a
   // glance. The background color contrasts with the dark row bg so
   // the badge stands out from the name and isn't mistaken for a
-  // label. v1.14: bumped from 70x26 to 90x32 so a 14pt font has
-  // room to render "UNAVAILABLE" without the 'L' getting clipped
-  // (the user pointed out that some badges were slightly cut off).
-  // 90px is also big enough to be a comfortable touch target on
-  // a 7" panel (was 70x26 - too small to reliably tap). The arc
-  // and pct_label below shift left to compensate.
-  //
-  // v1.13: state badge is now CLICKABLE for toggle-able entities
-  // (lights, switches, fans). Tapping it calls domain.toggle
-  // (light.toggle, switch.toggle) - a quick way to flip a light
-  // without having to drag the arc to a non-zero value. The
-  // click is gated on the entity's domain; sensors / binary_sensors
-  // have no toggle service, so the badge stays non-clickable for
-  // them (and the tap is absorbed by the row's CLICKABLE flag,
-  // so nothing fires).
+  // 90x32 so a 14pt font has room to render "UNAVAILABLE"
+// without the 'L' getting clipped; also big enough to be a
+// comfortable touch target on a 7" panel.
+//
+// CLICKABLE for toggle-able entities (lights, switches, fans,
+// humidifiers, vacuums, media_players). Tapping it calls
+// domain.toggle - a quick way to flip a light without having to
+// drag the arc to a non-zero value. The click is gated on the
+// entity's domain; sensors / binary_sensors have no toggle
+// service, so the badge stays non-clickable for them.
   lv_obj_t* state_bg = lv_obj_create(control);
   lv_obj_set_size(state_bg, 90, 32);
   lv_obj_align(state_bg, LV_ALIGN_LEFT_MID, 440, 0);
@@ -3216,15 +3008,10 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
              || entity.state == "off"
              || entity.state == "unavailable"
              || entity.state == "unknown") {
-    // v1.22c (Fix #3+4 'no more yellow block'): an empty state
-    // used to fall into the else{} amber branch (because it
-    // doesn't match 'on' or 'off'). The badge text shows '--'
-    // (no state from HA yet) but the bg was amber, so the user
-    // saw every row painted bright orange before HA reported a
-    // real value. Now empty -> dim gray like 'off'. The amber
-    // branch is reserved for real non-on/off states like
-    // media_player "playing" or person "home" - states that
-    // mean "the entity has a real value, just not on or off".
+    // Empty state -> dim gray like 'off' (was amber before, which
+    // made every row paint bright orange before HA reported a
+    // real value). The amber branch is reserved for real non-on/off
+    // states like media_player "playing" or person "home".
     state_bg_color = 0x444444;  // dim gray
     state_text_color = 0xCCCCCC;  // light
   } else {
@@ -3313,10 +3100,9 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
     lv_label_set_text(domain_label, entity.domain.data());
   }
   lv_obj_set_style_text_color(domain_label, lv_color_hex(color), 0);
-  // v1.14: shifted from x=380 to x=540 to make room for the
-  // wider state badge (90px vs 70px) and longer name column
-  // (400px vs 260px). The domain label is 50px wide so it
-  // occupies x=540-590.
+  // Positioned to leave room for the wider state badge (90px)
+// and longer name column (400px). The domain label is 50px
+// wide.
   lv_obj_align(domain_label, LV_ALIGN_LEFT_MID, 540, 0);
 
   if (entity.domain == "light" && entity.has_brightness) {
@@ -3325,9 +3111,7 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
         : 0;
     lv_obj_t* arc = lv_arc_create(control);
     lv_obj_set_size(arc, 50, 50);
-    // v1.14: shifted from -200 to -250 to make room for the
-    // wider pct_label area. The pct_label moved from -100 to
-    // -150 so the arc + label are still readable as a pair.
+    // Positioned so the arc + label are still readable as a pair.
     lv_obj_align(arc, LV_ALIGN_RIGHT_MID, -250, 0);
     lv_arc_set_min_value(arc, 0);
     lv_arc_set_max_value(arc, 100);
@@ -3342,9 +3126,8 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
     lv_obj_t* pct_label = lv_label_create(control);
     set_label_text_if_changed(pct_label, std::to_string(initial_pct) + "%");
     lv_obj_set_style_text_color(pct_label, lv_color_hex(0xFFFFFF), 0);
-    // v1.14: shifted from -100 to -150 to pair with the new
-    // arc position (-250). Together they form a coherent
-    // (arc)(pct%) group on the right of the row.
+    // Pair with the arc position (-250) for a coherent (arc)(pct%)
+// group on the right of the row.
     lv_obj_align(pct_label, LV_ALIGN_RIGHT_MID, -150, 0);
 
     ArcRecord arc_rec;
@@ -3419,14 +3202,11 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
   // view.
   lv_obj_t* hide_btn = lv_obj_create(control);
   lv_obj_set_size(hide_btn, 40, 40);
-  // v1.14: bumped the per-entity hide X from 40x40 to 48x48
-  // for two reasons. First, the user said some buttons were
-  // "slightly cut off" - 40px is on the edge of tappable on a
-  // 7" touchscreen (the OS's hitbox rounding eats a couple of
-  // px). Second, the per-entity hide action is destructive
-  // (persists to /storage/customizations.cfg) so the bigger tap
-  // target means fewer accidental hits. Position is unchanged
-  // (-15 from the right edge).
+  // 48x48 for a comfortable tappable target on a 7" touchscreen
+// (40px was on the edge of tappable; the OS's hitbox rounding
+// eats a couple of px). The per-entity hide action is
+// destructive (persists to /storage/customizations.cfg) so the
+// bigger tap target means fewer accidental hits.
   lv_obj_set_size(hide_btn, 48, 48);
   lv_obj_align(hide_btn, LV_ALIGN_RIGHT_MID, -15, 0);
   lv_obj_set_style_radius(hide_btn, 24, 0);
@@ -3650,17 +3430,12 @@ uint8_t HaAutoPanel::compute_room_brightness_pct_(const std::string& area_id) co
 
 
 void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const char* state) {
-  // v1.24: removed v1.22v per-room fast-fail. The v1.22w
-  // subscription was scoped to a single room (subscribe_mode=2)
-  // to avoid the 200+ std::function allocation burst, which
-  // meant pushes for entities outside the visible room were
-  // never received. The WebSocket subscribe_events path
-  // delivers ALL state_changed events server-side, so the
-  // per-room filter is unnecessary and would just silently
-  // drop updates for entities the user can't currently see.
-  // (The full-scan below is O(N*E) over ~419 entities, which
-  // is sub-millisecond on the P4 and well below the 50ms
-  // loop-warn threshold.)
+  // WebSocket subscribe_events delivers ALL state_changed events
+// server-side, so the per-room filter is unnecessary and would
+// just silently drop updates for entities the user can't currently
+// see. The full-scan below is O(N*E) but backed by a reverse-map
+// cache (rebuild_entity_to_area_map_) so it's effectively O(log N)
+// per push.
   std::string new_state = state ? state : "";
   // LOGI (not LOGD) so we can verify the state-sync path is firing
   // when a light is toggled in HA. The previous LOGD was invisible at
@@ -4039,12 +3814,26 @@ bool HaAutoPanel::setup_render_template_subscriptions_() {
 }
 
 std::string HaAutoPanel::find_area_id_for_entity_(std::string_view entity_id) const {
-  for (const auto& kv : this->entities_by_area_) {
-    for (const auto& e : kv.second) {
-      if (e.entity_id == entity_id) return kv.first;
-    }
+  // Reverse-map lookup. The map is rebuilt in rebuild_entity_to_area_map_()
+  // (called after every fetch_areas_() / filter_and_build_room_cards_()),
+  // so it stays in sync with entities_by_area_ without per-push work.
+  // Without this cache, every WS state push triggers an O(N*M) scan
+  // (N areas * M entities per area), which is the dominant cost on
+  // busy installs (~415 entities).
+  if (auto it = this->entity_to_area_map_.find(entity_id);
+      it != this->entity_to_area_map_.end()) {
+    return std::string(it->second);
   }
   return std::string();
+}
+
+void HaAutoPanel::rebuild_entity_to_area_map_() {
+  this->entity_to_area_map_.clear();
+  for (const auto& kv : this->entities_by_area_) {
+    for (const auto& e : kv.second) {
+      this->entity_to_area_map_[e.entity_id] = kv.first;
+    }
+  }
 }
 
 void HaAutoPanel::update_room_card_visual_state_for_entity_(std::string_view entity_id) {
@@ -4142,12 +3931,12 @@ void HaAutoPanel::set_panel_state_(PanelState new_state) {
     this->set_timeout("home_fetch", 50, [this]() {
       this->fetch_home_name_();
     });
-    // v1.22s: kick off the weather fetch in parallel with the
-    // home-name fetch. Same 50ms deferral pattern for the same
-    // reason (the http_request_ state machine just settled).
-    // The weather label was created hidden; if the entity is
-    // missing or the network fails, the label stays hidden and
-    // we just stop retrying after the 10-min throttle window.
+    // Kick off the weather fetch in parallel with the home-name
+    // fetch. Same 50ms deferral pattern for the same reason
+    // (the http_request_ state machine just settled). The weather
+    // label was created hidden; if the entity is missing or the
+    // network fails, the label stays hidden and we just stop
+    // retrying after the 10-min throttle window.
     this->set_timeout("weather_fetch", 75, [this]() {
       this->fetch_weather_();
     });
@@ -4411,9 +4200,9 @@ void HaAutoPanel::probe_authorization_() {
 void HaAutoPanel::on_auth_probe_response_(bool success, const char* error) {
   if (!this->auth_probe_pending_) return;
   this->auth_probe_pending_ = false;
-  // v1.24: reset retry state on a definitive response (success
-  // OR HA-confirmed error). On timeout we keep the retry
-  // counter and re-arm the next_retry timer in loop().
+  // Reset retry state on a definitive response (success OR
+  // HA-confirmed error). On timeout we keep the retry counter
+  // and re-arm the next_retry timer in loop().
   this->auth_probe_retries_left_ = AUTH_PROBE_MAX_RETRIES;
   this->auth_probe_next_retry_ms_ = 0;
   ESP_LOGI(TAG, "Auth probe response: success=%d error=%s",
@@ -4443,38 +4232,25 @@ void HaAutoPanel::loop() {
   // invalidate the screen to force a re-flush. Cheap.
   this->force_refresh_if_due_();
 
-  // v1.22u removed: SDIO wedge detector heartbeat. The
-  // detector task is gone; the heartbeat is no longer
-  // needed. v1.22v instead polls the actual stuck-task
-  // signature (uxTaskPriorityGet + eTaskGetState) in
-  // the WLED pattern style - see
-  // [[feedback_wled_mm_p4_stuck_task_pattern]] for the
-  // design.
-  // v1.22w: process deferred triggers first. Doing these
-  // BEFORE the auth-probe timeout check keeps the flags
-  // fresh - the httpd worker set them; we honor them
-  // before doing any other heavy work.
+  // The dedicated SDIO wedge detector task and its heartbeat
+  // are gone; the WLED-style monitor_task_states_() polls
+  // every task via uxTaskGetSystemState() instead.
+  //
+  // Process deferred triggers first. Doing these BEFORE the
+  // auth-probe timeout check keeps the flags fresh - the httpd
+  // worker set them; we honor them before doing any other
+  // heavy work.
   if (this->pending_auth_probe_) {
     this->pending_auth_probe_ = false;
     this->probe_authorization_();
   }
-  // v1.24: removed the v1.22w pending_subscription_ drain
-  // and process_chunked_subscription_() call. The chunked
-  // subscription path triggered PC 0x480dxxxx abort ~300ms
-  // after Panel READY due to std::function allocation under
-  // heap pressure. The new path is HaWsClient's
-  // subscribe_events (server-side subscription) + the
-  // drain_state_events() call below.
 
-  // v1.24: drain the per-entity state events queued by the
-  // raw WebSocket-to-HA client (HaWsClient). The
-  // ha_ws_parse task pushes StateEvents into
-  // ws_client_->state_queue_; we pop up to
-  // STATE_DRAIN_PER_TICK per tick and call the existing
+  // Drain the per-entity state events queued by the raw
+  // WebSocket-to-HA client (HaWsClient). The ha_ws_parse task
+  // pushes StateEvents into ws_client_->state_queue_; we pop
+  // up to STATE_DRAIN_PER_TICK per tick and call the existing
   // on_entity_state_changed_ / on_entity_attribute_changed_
-  // handlers. Replaces the v1.22w chunked subscription path
-  // (which triggered PC 0x480dxxxx abort ~300ms after
-  // READY). The ws_client_ is a no-op until
+  // handlers. The ws_client_ is a no-op until
   // start_discovery_() constructs it.
   if (this->ws_client_) {
     this->ws_client_->drain_state_events();
@@ -4505,12 +4281,8 @@ void HaAutoPanel::loop() {
     }
   }
 
-  // v1.24: auth-probe auto-trigger kept (probe uses
-  // esphome-native-API, not the v1.22w subscribe path that
-  // crashed). Removed the ha_subscribed_once_ / subscription
-  // auto-trigger - the WebSocket subscribe_events is fired
-  // once after get_states completes, and there's no per-tick
-  // work to do.
+  // Auth-probe auto-trigger. The probe uses esphome-native-API
+  // (no per-tick subscribe work).
   if (!this->ha_connected_once_ &&
       api::global_api_server != nullptr &&
       api::global_api_server->is_connected()) {
@@ -4519,12 +4291,11 @@ void HaAutoPanel::loop() {
     this->pending_auth_probe_ = true;
   }
 
-  // Check authorization probe timeout. v1.24: instead of
-  // declaring NOT_AUTHORIZED on a single timeout, retry
-  // up to AUTH_PROBE_MAX_RETRIES times with
-  // AUTH_PROBE_RETRY_DELAY_MS between attempts. This
-  // recovers from cold-boot timing where the first
-  // service call may race with the HA API encryption
+  // Check authorization probe timeout. Instead of declaring
+  // NOT_AUTHORIZED on a single timeout, retry up to
+  // AUTH_PROBE_MAX_RETRIES times with AUTH_PROBE_RETRY_DELAY_MS
+  // between attempts. This recovers from cold-boot timing where
+  // the first service call may race with the HA API encryption
   // handshake.
   if (this->auth_probe_pending_) {
     if (millis() - this->auth_probe_started_ms_ > AUTH_PROBE_TIMEOUT_MS) {
@@ -4576,10 +4347,10 @@ void HaAutoPanel::loop() {
     this->fetch_home_name_();
   }
 
-  // v1.22s: periodic weather refresh. fetch_weather_() throttles
-  // itself (WEATHER_FETCH_INTERVAL_MS = 10 min) and bails out
-  // cheaply if the URL/token/entity_id aren't ready. Same
-  // pattern as fetch_home_name_() above.
+  // Periodic weather refresh. fetch_weather_() throttles itself
+  // (WEATHER_FETCH_INTERVAL_MS = 10 min) and bails out cheaply if
+  // the URL/token/entity_id aren't ready. Same pattern as
+  // fetch_home_name_() above.
   if (this->state_ == PanelState::READY) {
     this->fetch_weather_();
   }
@@ -4594,19 +4365,13 @@ void HaAutoPanel::loop() {
   // here to keep the HA-derived time baseline fresh. That
   // machinery is gone.)
 
-  // v1.24: removed the v1.22l bulk entity-state poll
-  // (maybe_poll_entity_states_) and the v1.22v per-room poll
-  // (maybe_poll_current_room_states_). Both were workarounds
-  // for the dropped-push risk in the v1.22w subscription
-  // path. The WebSocket subscribe_events stream is
-  // server-pushed and has no dropped-push risk; the
-  // get_states response on connect covers any initial
-  // freshness. We don't need a periodic poll anymore.
+  // WebSocket subscribe_events is server-pushed and has no
+  // dropped-push risk; the per-area aggregate template covers
+  // initial freshness. No periodic poll is needed.
 
-  // v1.25c7: WLED-style task state monitor. Pure
-  // observability - logs state/priority/HWM changes for all
-  // tasks. Self-throttled to 1 Hz. Replaces the v1.22v
-  // check_stuck_tasks_() which only watched sdio_write.
+  // WLED-style task state monitor. Pure observability - logs
+  // state/priority/HWM changes for all tasks. Self-throttled to
+  // 1 Hz.
   this->monitor_task_states_();
 
   // Pending 2-tap-confirm timeout. If the user armed Reboot or
@@ -5066,13 +4831,13 @@ void HaAutoPanel::handle_customizations_get_(AsyncWebServerRequest *request) {
   std::string body;
   serializeJson(doc, body);
 
-  // v1.22v: the PsramJsonDocument can overflow if entity_order
-  // has many rooms with many entities (200 rooms × 50 entities
-  // ≈ 400 KB worst case; the default capacity is 16 KB). A
-  // bad body that overflows throws bad_alloc on this build
-  // (no -fexceptions), which is one of the C++ throws
-  // documented in [[project_crowpanel_cxx_throw_abort]]. Detect
-  // the overflow and return 500 instead of aborting the panel.
+  // The PsramJsonDocument can overflow if entity_order has many
+  // rooms with many entities (200 rooms * 50 entities ~ 400 KB
+  // worst case; the default capacity is 16 KB). A bad body
+  // that overflows throws bad_alloc on this build (no
+  // -fexceptions), which is one of the C++ throws that abort
+  // the panel. Detect the overflow and return 500 instead of
+  // aborting the panel.
   if (doc.overflowed()) {
     ESP_LOGE(TAG, "customizations JSON overflowed - data is corrupt");
     request->send(500, "text/plain", "Customizations JSON overflowed");
@@ -5096,16 +4861,14 @@ void HaAutoPanel::handle_customizations_post_(AsyncWebServerRequest *request) {
     request->send(400, "text/plain", "Empty body");
     return;
   }
-  // v1.22v: bound the body at the I/O boundary. The build uses
+  // Bound the body at the I/O boundary. The build uses
   // -fno-exceptions per ESPHome core, so a std::bad_alloc in
   // apply_customizations_file_() (which then walks several
   // std::vector/std::set growth paths) would abort() the
-  // panel - one of the CXX-throw aborts documented in
-  // [[project_crowpanel_cxx_throw_abort]]. 16 KB is way more
-  // than any legitimate customizations file (worst case on
-  // this user's HA: ~4 KB). A bad body (e.g. attacker
-  // uploading 1 MB of garbage) gets 413 instead of triggering
-  // a heap-OOM abort.
+  // panel. 16 KB is way more than any legitimate customizations
+  // file (worst case on this user's HA: ~4 KB). A bad body
+  // (e.g. attacker uploading 1 MB of garbage) gets 413 instead
+  // of triggering a heap-OOM abort.
   if (body.size() > 16 * 1024) {
     ESP_LOGW(TAG, "customizations POST body %u bytes > 16KB cap; rejecting",
              (unsigned)body.size());
@@ -5113,16 +4876,15 @@ void HaAutoPanel::handle_customizations_post_(AsyncWebServerRequest *request) {
     return;
   }
   this->apply_customizations_file_(body);
-  // v1.22v: defer the expensive refresh off the httpd task
-  // (so the request thread returns immediately). refresh_room_cards_()
+  // Defer the expensive refresh off the httpd task (so the
+  // request thread returns immediately). refresh_room_cards_()
   // calls lv_obj_del on every child of main_container_ and
-  // rebuilds - that's LVGL work that contends with the
-  // per-room poll and the state_changed callback for the
-  // LVGL mutex. Doing it on the httpd task is a
-  // priority-inversion risk: a high-priority task (e.g. the
-  // sdio_write task servicing the C6) gets blocked behind
-  // this httpd work. set_timeout(0, ...) runs it on the next
-  // loop() tick on loopTask where it belongs.
+  // rebuilds - that's LVGL work that contends with the per-room
+  // poll and the state_changed callback for the LVGL mutex.
+  // Doing it on the httpd task is a priority-inversion risk: a
+  // high-priority task (e.g. the sdio_write task servicing the
+  // C6) gets blocked behind this httpd work. set_timeout(0, ...)
+  // runs it on the next loop() tick on loopTask where it belongs.
   this->set_timeout(0, [this]() { this->refresh_room_cards_(); });
   request->send(200, "application/json", "{\"ok\":true}");
 }
@@ -5274,7 +5036,15 @@ void HaAutoPanel::handle_screenshot_(AsyncWebServerRequest *request) {
   // body right after the 66-byte header. The draw buffer is
   // already in PSRAM (the LVGL component allocates it there with
   // MALLOC_CAP_SPIRAM), so this is a PSRAM-to-PSRAM copy.
-  memcpy(body + 66, draw_buf->data, draw_buf->data_size);
+  // Clamp to width*height*2 in case the LVGL draw buffer is
+  // larger than the visible area (RGB888 mode, row stride
+  // padding, or any mismatch between active buffer size and
+  // display resolution would otherwise overflow `body`).
+  const size_t expected_pixels = (size_t)width * (size_t)height * 2u;
+  const size_t copy_bytes = draw_buf->data_size < expected_pixels
+                                ? draw_buf->data_size
+                                : expected_pixels;
+  memcpy(body + 66, draw_buf->data, copy_bytes);
 
   // Send the body. The project-level AsyncWebServerRequest wrapper
   // only exposes a 3-arg send() (code, type, body_str) that's
@@ -5292,6 +5062,9 @@ void HaAutoPanel::handle_screenshot_(AsyncWebServerRequest *request) {
   esp_err_t err = httpd_resp_send(req, (const char *)body, body_size);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "[screenshot] httpd_resp_send failed: %d", (int)err);
+    // httpd didn't take ownership on failure - free the buffer
+    // ourselves to avoid leaking the 1.2MB PSRAM allocation.
+    free(body);
   } else {
     ESP_LOGI(TAG, "[screenshot] sent %dx%d BMP (%u bytes)",
              width, height, (unsigned)body_size);
@@ -5346,17 +5119,13 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
   // heap if PSRAM is somehow unavailable (e.g. someone runs this
   // build on a board without PSRAM).
   //
-  // v1.22a: bypassed in favor of feeding the encoder the raw
-  // RGB565 data via JPEG_ENCODE_IN_FORMAT_RGB565. The encoder on
-  // P4 appears to apply a non-standard R/B reorder to the
-  // RGB888 path (the dark-teal #111827 background renders as
-  // brown in the JPG even though the BMP/PNG paths render it
-  // correctly), and a manual R/B swap "fixed" the background but
-  // rotated the room-card arc colors. The RGB565 path uses the
-  // encoder's native pixel format (the LVGL draw buffer IS
-  // RGB565) and avoids the byte-order ambiguity entirely. The
-  // draw buffer's data_size should equal width*height*2 (validated
-  // by handle_screenshot_).
+  // RGB565 path uses the encoder's native pixel format (the LVGL
+// draw buffer IS RGB565). The RGB888 path on P4 produces colors
+// that don't match the source framebuffer (background #111827
+// dark-teal renders as brown; manual R/B swap fixes the
+// background but rotates the arc colors). The draw buffer's
+// data_size should equal width*height*2 (validated by
+// handle_screenshot_).
   const size_t rgb_size = (size_t)width * (size_t)height * 2u;
   uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM);
   if (rgb == nullptr) {
@@ -5366,7 +5135,15 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
     request->send(500, "text/plain", "OOM allocating RGB565 buffer");
     return;
   }
-  memcpy(rgb, draw_buf->data, rgb_size);
+  // Clamp to width*height*2 in case the LVGL draw buffer is
+  // larger than the visible area (RGB888 mode, row stride
+  // padding, or any mismatch between active buffer size and
+  // display resolution would otherwise overflow `rgb`).
+  const size_t expected_pixels = (size_t)width * (size_t)height * 2u;
+  const size_t copy_bytes = draw_buf->data_size < expected_pixels
+                                ? draw_buf->data_size
+                                : expected_pixels;
+  memcpy(rgb, draw_buf->data, copy_bytes);
 
   // JPEG output buffer. The ESP-IDF JPEG driver requires the output
   // buffer to be allocated via jpeg_alloc_encoder_mem() (not a plain
@@ -5379,7 +5156,10 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
   // (heap_caps_malloc with MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
   // preferred, falls back to internal) and returns the actual size
   // allocated, which can be larger than the requested size.
-  const size_t jpg_req = 256 * 1024;
+  // 512 KB covers the worst-case 1024x600 high-entropy output
+  // (typical: 80-200 KB; complex screens with arcs/text can
+  // exceed 256 KB).
+  const size_t jpg_req = 512 * 1024;
   size_t jpg_size_actual = 0;
   jpeg_encode_memory_alloc_cfg_t mem_cfg = {};
   mem_cfg.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
@@ -5410,18 +5190,9 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
   cfg.height = (uint32_t)height;
   // Driver-level input format enum. The driver enum
   // (jpeg_enc_input_format_t) is what jpeg_encode_cfg_t::src_type
-  // expects; the HAL-level JPEG_ENC_SRC_RGB888 has the same numeric
-  // value but a different typedef and triggers a C++ narrowing error
-  // when used here.
-  //
-  // v1.22a: feed the encoder the raw RGB565 data via
-  // JPEG_ENCODE_IN_FORMAT_RGB565. The RGB888 path on P4 produces
-  // colors that don't match the source framebuffer (background
-  // #111827 dark-teal renders as brown in the JPG even though
-  // BMP/PNG render it correctly; manual R/B swap fixes the
-  // background but rotates the arc colors). The RGB565 path
-  // sidesteps the byte-order ambiguity by handing the encoder
-  // the same 16-bit pixel format the LVGL draw buffer is in.
+  // expects; the HAL-level JPEG_ENC_SRC_RGB888 has the same
+  // numeric value but a different typedef and triggers a C++
+  // narrowing error when used here.
   cfg.src_type = JPEG_ENCODE_IN_FORMAT_RGB565;
   cfg.sub_sample = JPEG_DOWN_SAMPLING_YUV422;  // 4:2:2 - good for UI
   cfg.image_quality = 80;
@@ -5523,14 +5294,22 @@ void HaAutoPanel::register_web_handler_() {
           request->send(405, "text/plain", "Method not allowed");
         }
       } else if (url == "/autopanel/screenshot.bmp") {
-        // GET only. Screenshot is a read-only operation.
-        if (request->method() == HTTP_GET) {
+        // GET only. Gated behind agent_debug_ - a screenshot
+        // exposes the full display (including the title bar with
+        // the home name and any customizations). Treat it like
+        // the /autopanel/test/* handlers: 404 when agent_debug
+        // is off.
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET) {
           parent_->handle_screenshot_(request);
         } else {
           request->send(405, "text/plain", "Method not allowed");
         }
       } else if (url == "/autopanel/screenshot.jpg") {
-        if (request->method() == HTTP_GET) {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET) {
 #if SOC_JPEG_ENCODE_SUPPORTED
           parent_->handle_screenshot_jpg_(request);
 #else
@@ -5683,12 +5462,11 @@ void HaAutoPanel::handle_test_cmd_(AsyncWebServerRequest *request) {
                   "C/S need coordinates - use /test/click or /test/scroll");
     return;
   }
-  // v1.25c7: defer the heavy work to the main loop. The httpd
-  // task's stack is 4KB (HTTPD_DEFAULT_CONFIG); the trigger_discovery
-  // / show_entity_detail_ paths recurse through flex_update enough to
-  // overflow it. process_command_ is idempotent (single-char
-  // dispatch) so deferring it costs only one frame of latency.
-  // The bft test waits 2s between commands so the defer is invisible.
+  // Defer the heavy work to the main loop. The httpd task's stack
+  // is 4KB (HTTPD_DEFAULT_CONFIG); the trigger_discovery /
+  // show_entity_detail_ paths recurse through flex_update enough
+  // to overflow it. process_command_ is idempotent so deferring
+  // costs only one frame of latency.
   char body[64];
   snprintf(body, sizeof(body), "cmd '%c' -> deferred\n", ch);
   request->send(200, "text/plain", body);
@@ -5721,22 +5499,16 @@ void HaAutoPanel::handle_test_state_(AsyncWebServerRequest *request) {
   body += std::string("panel_state=") + panel_state_name_(this->state_) + "\n";
   body += std::string("room_count=") + std::to_string(this->room_cards_.size()) + "\n";
   body += std::string("current_room_index=") + std::to_string(this->current_room_index_) + "\n";
-  // v1.20: build identity. The test harness can refuse to run
-  // if version is older than expected, and the user can
-  // grep the device log for "[version]" to confirm which
-  // commit is on the panel.
+  // Build identity. The test harness can refuse to run if
+  // version is older than expected, and the user can grep the
+  // device log for "[version]" to confirm which commit is on
+  // the panel.
   body += std::string("version=") + this->firmware_version_ + "\n";
-  // v1.17: echo the banner state. The test harness uses this as a
+  // Echo the banner state. The test harness uses this as a
   // sanity check after toggling the banner - "I just set on=1
   // and the state endpoint reports banner=1, so the round trip
-  // works." If the panel reboots (or the user pokes the on-param)
-  // the value resets to 0.
+  // works." If the panel reboots the value resets to 0.
   body += std::string("test_banner=") + (this->test_banner_active_ ? "1" : "0") + "\n";
-  // v1.11: edit_mode= and in_edit_session= were removed (no Edit
-  // button anymore). The Sort panel is the only entry point for
-  // room customization, so the test harness has no need to query
-  // for edit-mode state. If we ever bring back inline editing,
-  // add the lines back here.
   body += std::string("agent_debug=1\n");
   body += std::string("home_name=") + this->home_name_ + "\n";
   body += std::string("ha_api_url=") + this->ha_api_url_ + "\n";
@@ -6104,11 +5876,9 @@ void HaAutoPanel::show_sort_panel_() {
     // scrolling. Scrollbar is OFF for a cleaner look (the user
     // can scroll with a touch swipe).
     lv_obj_add_flag(this->sort_panel_, LV_OBJ_FLAG_SCROLLABLE);
-    // v1.15: scrollbar mode is now AUTO (was OFF). 15 rooms in
-    // the sort panel at 50-60px per row = 750-900px tall, which
-    // overflows the 600px screen. Without a scrollbar hint the
-    // user might think they can only see what's visible. AUTO
-    // fades in on drag, out on release.
+    // Scrollbar mode is AUTO. 15 rooms in the sort panel at
+    // 50-60px per row = 750-900px tall, which overflows the 600px
+    // screen. AUTO fades in on drag, out on release.
     lv_obj_set_scrollbar_mode(this->sort_panel_, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_remove_flag(this->sort_panel_, LV_OBJ_FLAG_CLICKABLE);
   }
@@ -6132,19 +5902,19 @@ void HaAutoPanel::show_sort_panel_() {
   }
   this->build_sort_panel_content_();
   lv_obj_remove_flag(this->sort_panel_, LV_OBJ_FLAG_HIDDEN);
-  // v1.19: un-hide the title-bar Save + Cancel buttons so the
-  // user has consistent apply/discard controls regardless of
-  // where they are in the room list. The Edit button stays
-  // visible too (so the user can also re-tap it to close the
-  // panel as a third path out).
+  // Un-hide the title-bar Save + Cancel buttons so the user has
+  // consistent apply/discard controls regardless of where they
+  // are in the room list. The Edit button stays visible too (so
+  // the user can also re-tap it to close the panel as a third
+  // path out).
   if (this->title_save_btn_ != nullptr) {
     lv_obj_remove_flag(this->title_save_btn_, LV_OBJ_FLAG_HIDDEN);
   }
   if (this->title_cancel_btn_ != nullptr) {
     lv_obj_remove_flag(this->title_cancel_btn_, LV_OBJ_FLAG_HIDDEN);
   }
-  // v1.20: also show the version label while the user is in
-  // a "what am I running?" frame of mind. The label lives
+  // Also show the version label while the user is in a
+  // "what am I running?" frame of mind. The label lives
   // bottom-left of the title bar; small text (14pt gray), so
   // it's not visually noisy but the user can read it on demand.
   if (this->title_version_label_ != nullptr) {
@@ -6158,8 +5928,8 @@ void HaAutoPanel::show_sort_panel_() {
 void HaAutoPanel::hide_sort_panel_() {
   if (this->sort_panel_ == nullptr) return;
   lv_obj_add_flag(this->sort_panel_, LV_OBJ_FLAG_HIDDEN);
-  // v1.19: re-hide the Save + Cancel buttons (they only make
-  // sense when the panel is open).
+  // Re-hide the Save + Cancel buttons (they only make sense
+  // when the panel is open).
   if (this->title_save_btn_ != nullptr) {
     lv_obj_add_flag(this->title_save_btn_, LV_OBJ_FLAG_HIDDEN);
   }
@@ -6798,8 +6568,8 @@ void HaAutoPanel::refresh_room_cards_() {
                     (row_count > 0 ? (row_count - 1) : 0) * this->card_gap_;
 
     lv_obj_t* row_container = lv_obj_create(this->main_container_);
-    // v1.22f: was card_width_ (square). Now card_height_ so the
-    // row is tall enough for the card's expanded height.
+    // Sized to the card's height (square cards; card_height_
+//    matches card_width_).
     lv_obj_set_size(row_container, row_width, this->card_height_);
     lv_obj_set_style_bg_opa(row_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row_container, 0, 0);
@@ -6825,8 +6595,6 @@ void HaAutoPanel::refresh_room_cards_() {
   }
   // Update the title bar so the room count / status reflects the new view
   this->update_title_bar_();
-  // v1.11: drop the (edit_mode=...) suffix - edit_mode_ was removed
-  // along with the Edit button.
   ESP_LOGI(TAG, "Room cards refreshed (%d visible)", (int) room_cards_.size());
 }
 
@@ -6949,18 +6717,22 @@ void HaAutoPanel::simulate_scroll_(int x1, int y1, int x2, int y2) {
   int32_t dy = (int32_t) y2 - (int32_t) y1;
   lv_obj_t *scrollable = obj;
   while (scrollable != nullptr) {
+    lv_coord_t before_x = lv_obj_get_scroll_x(scrollable);
+    lv_coord_t before_y = lv_obj_get_scroll_y(scrollable);
     lv_obj_scroll_by(scrollable, dx, dy, LV_ANIM_OFF);
-    // If the object's scroll offset actually changed, we found our
-    // scrollable. Otherwise keep walking up.
-    // lv_obj_scroll_by returns void; we just trust the first
-    // scrollable ancestor that says yes via the same call.
-    break;
+    // If the object's scroll offset actually changed, we found
+    // our scrollable. Otherwise walk up to the parent.
+    if (lv_obj_get_scroll_x(scrollable) != before_x ||
+        lv_obj_get_scroll_y(scrollable) != before_y) {
+      break;
+    }
+    scrollable = lv_obj_get_parent(scrollable);
   }
   ESP_LOGI(TAG, "[scroll] injected from (%d, %d) to (%d, %d) on obj=%p",
            x1, y1, x2, y2, (void *) obj);
 }
 
-// --- v1.22e data-driven sizing helpers ---
+// --- Data-driven sizing helpers ---
 // Internal: measure the rendered pixel width of `text` using
 // the given font. Uses a one-shot hidden label widget because
 // that's the portable LVGL 9 API - lv_txt_get_width() /
@@ -7002,23 +6774,19 @@ int HaAutoPanel::button_width_for_text_(const char* text, const lv_font_t* font,
 }
 
 const lv_font_t* HaAutoPanel::pick_room_name_font_(const char* name, int max_width_px) {
-  // v1.22s: auto-fit font picker for room names. DEFERRED
-  // to v1.22t+ due to the static-linkage block described
-  // in [[feedback_esphome_font_static_linkage]] - we
-  // cannot reference the font::Font* externs from a
-  // custom component.
+  // Auto-fit font picker for room names. Currently a no-op
+  // (returns nullptr) due to the static-linkage block
+  // (feedback_esphome_font_static_linkage) - we cannot
+  // reference the font::Font* externs from a custom component.
+  // create_room_card_() falls back to the LVGL default text
+  // font (set by `lvgl.text_font: font_xl` in the yaml) and
+  // long room names wrap to two lines via
+  // split_room_name_to_fit_().
   //
-  // For now the picker is a no-op: it returns nullptr and
-  // lets create_room_card_() fall back to the LVGL default
-  // text font (set by `lvgl.text_font: font_xl` in the
-  // yaml). Long room names still wrap to two lines via
-  // split_room_name_to_fit_(). This preserves the v1.22r
-  // visual behavior.
-  //
-  // The arguments (name, max_width_px) are unused right
-  // now but kept in the signature so the call site in
-  // create_room_card_() doesn't need to change when the
-  // picker is implemented for real.
+  // The arguments (name, max_width_px) are unused right now
+  // but kept in the signature so the call site in
+  // create_room_card_() doesn't need to change when the picker
+  // is implemented for real.
   (void)name;
   (void)max_width_px;
   return nullptr;

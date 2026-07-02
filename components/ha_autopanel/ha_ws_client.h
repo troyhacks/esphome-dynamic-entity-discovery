@@ -1,8 +1,5 @@
-// v1.24: ha_ws_client.h — raw WebSocket-to-Home-Assistant client
-// for state sync. Replaces the v1.22w esphome-native-API
-// subscribe_home_assistant_state path (which triggered PC
-// 0x480dxxxx abort ~300ms after Panel READY due to std::function
-// allocation under heap pressure).
+// ha_ws_client.h: raw WebSocket-to-Home-Assistant client
+// for state sync.
 //
 // HA WebSocket protocol: connect to ws://<ha>/api/websocket,
 // receive auth_required, send auth with access_token, receive
@@ -167,23 +164,10 @@ static inline char* psram_strdup_(size_t cap) {
   return p;
 }
 
-// Pre-allocated PSRAM pool for the 229KB get_states JSON parse.
-// Allocated once at HaWsClient::start(), reused for every
-// subsequent get_states result. ArduinoJson's deserializer
-// calls our allocate()/reallocate() to grow its internal pool;
-// since we just bump pos_ in a 1MB PSRAM buffer, no heap
-// lock is taken during the parse. The SDIO RX task on
-// core 0 can drain its wifi buffer without contending for
-// the heap. v1.24 fix for sdio_drv.c:1260 copy_payload assert.
-//
-// The user confirmed 32MB PSRAM is available, so 1MB for the
-// pool is cheap.
-//
-// v1.27 (Phase 4.7): HaWsPreallocPool and ChunkedJsonReader
-// are GONE. The 200 KB get_states parse is replaced by the
-// per-area render_template subscription (~50 KB per push),
-// which fits comfortably in the HaWsPsramAllocator's heap
-// path. No more pre-alloc pool, no more chunked reader.
+// The 200 KB get_states parse is replaced by the per-area
+// render_template subscription (~50 KB per push), which fits
+// comfortably in the HaWsPsramAllocator's heap path. No more
+// pre-alloc pool, no more chunked reader.
 
 class HaWsClient {
  public:
@@ -422,12 +406,8 @@ class HaWsClient {
                          int brightness, bool has_brightness);
   bool send_text_(const char* body, size_t body_len);
 
-  // v1.24: pre-allocated 1MB PSRAM pool for the ArduinoJson
-  // deserializer. Allocated once at start() and reused for
-  // every get_states response. Eliminates heap lock
-  // v1.27 (Phase 4.7): the 1 MB PSRAM pre-alloc pool is gone
-  // (the 200 KB get_states parse is replaced by a per-area
-  // render_template subscription). Free heap is ~1 MB larger
+  // The 200 KB get_states parse is replaced by a per-area
+  // render_template subscription. Free heap is ~1 MB larger
   // at idle and the SDIO RX task no longer contends with us
   // for the heap lock during a multi-second parse.
 };
@@ -540,12 +520,8 @@ inline void HaWsClient::start() {
   esp_websocket_register_events(this->client_, WEBSOCKET_EVENT_ANY,
                                 HaWsClient::ws_event_handler_, this);
 
-  // v1.24: pre-allocate the 1MB PSRAM pool for the
-  // ArduinoJson deserializer. Done here, in start(), so the
-  // v1.27 (Phase 4.7): psram_pool_.init() is gone (the
-  // 1 MB pre-alloc pool is deleted). The parse_task below
-  // uses HaWsPsramAllocator (heap-backed) for the
-  // render_template event payloads.
+  // The parse_task below uses HaWsPsramAllocator (heap-backed)
+  // for the render_template event payloads.
 
   // Create parse_task. It subscribes itself to the TWDT at the
   // top of parse_task_loop_().
@@ -801,6 +777,12 @@ inline void HaWsClient::on_ws_error_() {
 inline void HaWsClient::parse_task_trampoline_(void* arg) {
   HaWsClient* self = static_cast<HaWsClient*>(arg);
   if (self != nullptr) self->parse_task_loop_();
+  // Unsubscribe from the IDF TWDT before deleting the task.
+  // The task subscribed itself at the top of parse_task_loop_()
+  // (esp_task_wdt_add(NULL)); on some IDF versions leaving the
+  // subscription in place across vTaskDelete() trips a TWDT
+  // assert during shutdown. Symmetric to TwdtGuard in the .cpp.
+  esp_task_wdt_delete(NULL);
   vTaskDelete(nullptr);
 }
 

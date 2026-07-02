@@ -18,19 +18,16 @@
 #include "esp_http_server.h"  // for AsyncWebHandler / AsyncWebServerRequest
 #include "esphome/core/preferences.h"
 #include "esp_heap_caps.h"
-#include "freertos/task.h"   // v1.22v: uxTaskPriorityGet + eTaskGetState for stuck-task detector
-#include "esp_task.h"        // v1.22v: pcTaskGetHandle for the sdio_write task lookup
+#include "freertos/task.h"   // uxTaskPriorityGet + eTaskGetState for the task monitor
+#include "esp_task.h"        // pcTaskGetHandle for the task monitor
 
-// v1.24: raw WebSocket-to-Home-Assistant client. Replaces the
-// v1.22w esphome-native-API subscribe_home_assistant_state path
-// that triggered PC 0x480dxxxx abort ~300ms after Panel READY
-// due to std::function allocation under heap pressure. The
-// full definition is in ha_ws_client.h, which is included from
-// ha_autopanel.cpp (NOT this header) because the .h-inline
-// method bodies need HaAutoPanel to be complete. Forward-
-// declared here so unique_ptr<HaWsClient> ws_client_ can be
-// declared. ~HaAutoPanel() is also declared here and defined
-// in the .cpp where HaWsClient is complete (PIMPL idiom).
+// Raw WebSocket-to-Home-Assistant client. The full definition
+// is in ha_ws_client.h, which is included from ha_autopanel.cpp
+// (NOT this header) because the .h-inline method bodies need
+// HaAutoPanel to be complete. Forward-declared here so
+// unique_ptr<HaWsClient> ws_client_ can be declared.
+// ~HaAutoPanel() is also declared here and defined in the .cpp
+// where HaWsClient is complete (PIMPL idiom).
 namespace esphome::ha_autopanel {
 class HaWsClient;  // forward decl
 }
@@ -276,18 +273,21 @@ class StringArena {
   //
   // Note on the allocator: the deque's TEMPLATE allocator arg
   // is std::allocator<std::string>, NOT
-  // PsramStlAllocator<std::string>. libstdc++ has a known
-  // issue with stateful allocators and deque
-  // (bits/stl_deque.h's _Map_alloc_type rebind fails to
-  // construct with the stateful allocator's extra state
-  // - "too many initializers for _Map_alloc_type" error).
-  // The std::string PAYLOADS still go to PSRAM because the
-  // allocator on the std::string type itself is
-  // PsramStlAllocator<char> (inherited from the previous
-  // std::vector<std::string, PsramStlAllocator<std::string>>
-  // type - std::vector propagates the allocator to its
-  // elements). Only the deque's internal chunk-pointer
-  // array goes to internal RAM, which is a few KB max.
+// PsramStlAllocator<std::string>. libstdc++ has a known
+// issue with stateful allocators and deque
+// (bits/stl_deque.h's _Map_alloc_type rebind fails to
+// construct with the stateful allocator's extra state
+// - "too many initializers for _Map_alloc_type" error).
+// The std::string PAYLOADS therefore use std::allocator<char>
+// (the default); short strings (~22 chars or fewer) live in
+// the SSO buffer inside the std::string struct, and longer
+// strings (>22 chars) go to internal RAM via the default
+// malloc. This is acceptable for typical entity_ids / room
+// names / area_ids which all fit in SSO; very long names
+// (a description, an attribute value) would fragment the
+// internal heap. Only the deque's internal chunk-pointer
+// array goes to internal RAM regardless, which is a few
+// KB max.
   std::deque<std::string, std::allocator<std::string>> strings_;
 };
 
@@ -508,12 +508,12 @@ enum class UIBuildState {
 
 class HaAutoPanel : public Component {
  public:
-  // v1.24: declared here (defaulted in ha_autopanel.cpp) so
+  // Declared here (defaulted in ha_autopanel.cpp) so
   // unique_ptr<HaWsClient> ws_client_ is destructed where the
   // full HaWsClient type is visible (PIMPL idiom for
   // forward-declared unique_ptr members).
   ~HaAutoPanel();
-  // v1.24: HaWsClient (the raw WebSocket-to-HA client) needs
+  // HaWsClient (the raw WebSocket-to-HA client) needs
   // access to entities_by_area_, on_entity_state_changed_, and
   // on_entity_attribute_changed_, all of which are protected
   // below. Friend is the surgical way to expose them without
@@ -569,23 +569,18 @@ class HaAutoPanel : public Component {
   // false so a production build does not expose them. See
   // __init__.py for the full security rationale.
   void set_agent_debug(bool v) { this->agent_debug_ = v; }
-  // v1.22s: title bar time format. False = 12-hour "10:52 PM";
+  // Title bar time format. False = 12-hour "10:52 PM";
   // True = 24-hour "22:52". Wired into update_title_time_().
   void set_use_24h_time(bool v) { this->use_24h_time_ = v; }
-  // v1.22s: title bar time visibility. False hides the time
+  // Title bar time visibility. False hides the time
   // label entirely (kiosk / digital-frame mode); the right
   // cluster auto-collapses to just the DBG button. Wired in
   // create_title_bar_().
   void set_show_time(bool v) { this->show_time_ = v; }
-  // v1.22s: HA weather entity id for the title bar weather
+  // HA weather entity id for the title bar weather
   // label. Default "weather.home". Empty string disables
   // fetch_weather_() entirely.
   void set_weather_entity_id(const std::string& id) { this->weather_entity_id_ = id; }
-  // v1.24: subscribe_mode_ and maybe_poll_current_room_states_()
-  // removed. The WebSocket path subscribes to ALL state_changed
-  // events server-side (one subscription, no per-entity
-  // std::function allocations). The per-room and bulk polls are
-  // no longer needed.
 
  protected:
   std::string ha_api_url_;
@@ -610,21 +605,20 @@ class HaAutoPanel : public Component {
   // (square cards). cards_per_row is computed from screen_width and
   // card_gap. main_container_ height is computed from card count.
   int card_width_{250};
-  // v1.22r: card_height is the card's vertical extent. For
-  // the current 7" Crowpanel design card_height_ == card_width_
-  // (square cards). The arc_size_() formula uses min(w,h)
-  // so a future rectangular card (e.g. 4" 480x320) just
-  // works - the arc will be sized off the smaller
-  // dimension.
+  // card_height is the card's vertical extent. For the current
+  // 7" Crowpanel design card_height_ == card_width_ (square
+  // cards). The arc_size_() formula uses min(w,h) so a future
+  // rectangular card (e.g. 4" 480x320) just works - the arc
+  // will be sized off the smaller dimension.
   int card_height_{250};
-  // v1.22q: parametric arc size - 96% of the smaller card
-  // dimension with a 2% padding on each side. For 250x250
-  // that's 240. The 2% padding means the arc leaves a
-  // visible gap on all sides (the user's "breathing room"
-  // request). 96% chosen so the arc and button together
-  // fit a 250x250 card with the button pinned to the
-  // bottom (250 - 240 = 10px gap below the arc, plus the
-  // button is 32px tall with 8px bottom margin).
+  // Parametric arc size - 96% of the smaller card dimension
+  // with a 2% padding on each side. For 250x250 that's 240.
+  // The 2% padding means the arc leaves a visible gap on all
+  // sides (the user's "breathing room" request). 96% chosen so
+  // the arc and button together fit a 250x250 card with the
+  // button pinned to the bottom (250 - 240 = 10px gap below
+  // the arc, plus the button is 32px tall with 8px bottom
+  // margin).
   int arc_size_() const { return (std::min(this->card_width_, this->card_height_) * 96) / 100; }
   int card_gap_{12};
   int screen_width_{1024};
@@ -719,13 +713,12 @@ class HaAutoPanel : public Component {
   // lookup so we can call .count(e.entity_id) where e.entity_id is
   // a std::string_view without allocating a std::string first.
 
-  // v1.24: raw WebSocket-to-HA client. Constructed lazily in
+  // Raw WebSocket-to-HA client. Constructed lazily in
   // start_discovery_() after fetch_areas_() populates the
   // entity_id set; the WS client then opens, authenticates,
-  // fetches all current states via get_states, and subscribes
-  // to live state_changed events via subscribe_events. This
-  // REPLACES the v1.22w esphome-native-API subscribe path
-  // that was aborting at PC 0x480dxxxx.
+  // and subscribes to the clock + per-area aggregate render_template
+  // events (which deliver all state changes server-side, no
+  // per-entity std::function allocations).
   std::unique_ptr<HaWsClient> ws_client_;
 
   // v1.27: TemplateApi - one-shot render() and push subscribe()
@@ -765,38 +758,33 @@ class HaAutoPanel : public Component {
   lv_obj_t* title_right_cluster_{nullptr};
   lv_obj_t* title_status_dot_{nullptr};
   lv_obj_t* title_status_label_{nullptr};
-  // title_sort_btn_ (relabeled "Edit" in v1.19) is the only
-  // always-visible right-cluster button. It opens the
-  // sort_panel_ which handles both reorder and show/hide.
-  // title_save_btn_ + title_cancel_btn_ were added in v1.19
-  // and are HIDDEN by default. They show only when the
-  // sort_panel_ is open, so the user can apply or discard
-  // their changes via the title bar (previously these floated
-  // at the bottom of the panel).
+  // title_sort_btn_ (label "Edit") is the only always-visible
+  // right-cluster button on the grid. It opens the sort_panel_
+  // which handles both reorder and show/hide. title_save_btn_
+  // and title_cancel_btn_ are HIDDEN by default and only show
+  // when the sort_panel_ is open (so the user can apply or
+  // discard their changes via the title bar).
   lv_obj_t* title_sort_btn_{nullptr};  // label "Edit", always visible on the grid
   lv_obj_t* title_save_btn_{nullptr};  // hidden; shown on Edit page
   lv_obj_t* title_cancel_btn_{nullptr};  // hidden; shown on Edit page
   lv_obj_t* title_back_btn_{nullptr};  // shown only on the entity detail page
   lv_obj_t* title_room_label_{nullptr};  // room name in the center of the title bar (detail page only)
-  // v1.20: version label at the bottom-left of the title bar.
+  // Version label at the bottom-left of the title bar.
   // Shows the build version (git short hash + build time) so
   // we can verify which build is loaded. Default hidden; the
   // test harness's /autopanel/test/state endpoint reports
   // the same value as 'version=' so the harness can confirm
   // the firmware matches the expected build without flashing.
   lv_obj_t* title_version_label_{nullptr};
-  // v1.21: Reboot button in the title bar. Only created when
+  // Reboot button in the title bar. Only created when
   // agent_debug_ is true (so production builds don't have a
   // way for a user to trigger a soft reset). The Crowpanel
-  // is now battery-powered and the case makes the physical
+  // is battery-powered and the case makes the physical
   // reset button hard to reach, so a soft-reboot path on the
   // panel itself is needed for in-field recovery. The button
-  // is RED (destructive) and is hidden by default; show it
-  // alongside the AUTO-TEST banner when the harness enables
-  // agent_debug, OR keep it visible in the title bar all the
-  // time when agent_debug is on (so the user can reboot without
-  // first turning on the test harness). We default to the
-  // second behavior - always visible in agent_debug builds.
+  // is RED (destructive) and always visible in agent_debug
+  // builds (so the user can reboot without first turning on
+  // the test harness).
   lv_obj_t* title_reboot_btn_{nullptr};
   // The version string baked into the build. Set in the .cpp
   // from #define FIRMWARE_VERSION + the __DATE__ / __TIME__
@@ -817,13 +805,6 @@ class HaAutoPanel : public Component {
   // conversion; the panel just stamps the resulting string
   // into the time label. No device-side ISO-8601 parsing,
   // no unix epoch math, no localtime_r/tzset/TZ env vars.
-  // v1.22l: re-fetch /api/states periodically and apply any
-  // state changes to the entity model. Real-time sync
-  // (Fix #11). Reuses fetch_entities_() to read the JSON,
-  // then iterates and updates the in-memory entity records.
-  // The visual state (arc, ON/OFF) is repainted via
-  // update_room_card_visual_state_for_area_() for any room
-  // whose state changed.
   // HA zone.home friendly_name, fetched at runtime and shown in the
   // center of the title bar on the main grid page. Hidden on the
   // detail page (where title_room_label_ takes that spot) and during
@@ -831,7 +812,7 @@ class HaAutoPanel : public Component {
   // bar has something to show on the next boot before the network
   // call returns.
   lv_obj_t* title_home_label_{nullptr};
-  // v1.22r: weather label on the LEFT of the title bar. Text-only
+  // Weather label on the LEFT of the title bar. Text-only
   // (e.g. "Cloudy 3°C"). Populated by fetch_weather_() from the
   // HA weather entity (default: weather.home). Hidden until the
   // first fetch completes; if no weather entity is configured,
@@ -841,60 +822,56 @@ class HaAutoPanel : public Component {
   // Cached so the title bar has something to show on the next
   // boot before the network call returns.
   std::string weather_text_;
-  // v1.22s: HA weather entity id (yaml "weather_entity_id", default
+  // HA weather entity id (yaml "weather_entity_id", default
   // "weather.home"). Empty disables fetch_weather_().
   std::string weather_entity_id_{"weather.home"};
-  // v1.22s: wall-clock millis of the last successful weather fetch.
+  // Wall-clock millis of the last successful weather fetch.
   // Throttles the periodic refresh in loop(). Mirrors
   // last_home_fetch_ms_ for home_name_.
   uint32_t last_weather_fetch_ms_{0};
-  // v1.22s: 24h time format flag (yaml "use_24h_time", default
+  // 24h time format flag (yaml "use_24h_time", default
   // false = 12h "10:52 PM"). update_title_time_() reads this.
   bool use_24h_time_{false};
-  // v1.22s: title bar time visibility (yaml "show_time", default
+  // Title bar time visibility (yaml "show_time", default
   // true). create_title_bar_() reads this once to set the initial
   // HIDDEN flag; the tap-toggling click handler in the time label
   // is registered regardless so this flag is only the default
   // state, not a runtime override.
   bool show_time_{true};
-  // v1.22r: left cluster (the weather + future left-side widgets).
+  // Left cluster (the weather + future left-side widgets).
   // Anchored to the LEFT edge of the title bar with LV_ALIGN_LEFT_MID
   // + a small left padding (8px). Lives in a flex row so adding
   // more left-side widgets (e.g. a status icon next to the weather)
   // is a one-line change.
   lv_obj_t* title_left_cluster_{nullptr};
-  // v1.22r: state of the Edit/Reboot button toggle. The time
+  // State of the Edit/Reboot button toggle. The time
   // label is the tap target: tapping it shows/hides the Edit
   // and Reboot buttons (which are in the right cluster). Default
   // is hidden so the title bar stays tidy (user request: "the
   // edit and reboot buttons should be hidden").
   bool title_chrome_visible_{false};
-  // v1.22v: current room's area_id (or empty for grid view).
+  // Current room's area_id (or empty for grid view).
   // Set in show_entity_detail_(); cleared in show_room_grid_().
-  // Used as the fast-fail filter for state pushes in per_room
-  // mode, and as the room_id for the per-room poll Jinja
-  // template.
   std::string current_room_area_id_;
-  // v1.22v: per-room poll throttle + last success ms.
+  // Per-room poll throttle + last success ms (kept for backward
+  // compatibility; the actual poll code is no longer called -
+  // state sync is via the WS render_template subscription).
   uint32_t last_room_poll_ms_{0};
   static constexpr uint32_t ROOM_POLL_INTERVAL_MS = 3 * 1000;  // 3s
-  // v1.25c7: WLED-style task monitor state. Replaces the v1.22v
-  // sdio_write-specific stuck-task check. The monitor polls
-  // uxTaskGetSystemState() once per second, diffs against the
-  // previous snapshot, and logs only meaningful changes
-  // (state transitions to/from eBlocked, priority changes,
-  // stack HWM drain below 512). High-frequency Ready↔Running
-  // flips are filtered to DEBUG. enable_task_monitor_ defaults
-  // to true; enable_stuck_task_recovery_ keeps the v1.22v name
-  // but no longer auto-fires from the monitor (it's available
-  // for future use or for manual triggering).
+  // WLED-style task monitor state. Polls uxTaskGetSystemState()
+  // once per second, diffs against the previous snapshot, and
+  // logs only meaningful changes (state transitions to/from
+  // eBlocked, priority changes, stack HWM drain below 512).
+  // High-frequency Ready↔Running flips are filtered to DEBUG.
+  // enable_task_monitor_ defaults to true; enable_stuck_task_recovery_
+  // is kept for future use (no code path currently consumes it).
   bool enable_task_monitor_{true};
   bool enable_stuck_task_recovery_{false};
   uint32_t last_task_monitor_ms_{0};
-  // v1.25c7: per-task snapshot. std::string name would be
-  // simpler but adds heap allocation; the pcTaskName pointer
-  // is only safe to use while the task is alive, so we look
-  // it up fresh from TaskStatus_t each pass.
+  // Per-task snapshot. std::string name would be simpler but
+  // adds heap allocation; the pcTaskName pointer is only safe
+  // to use while the task is alive, so we look it up fresh from
+  // TaskStatus_t each pass.
   struct TaskSnapshot {
     eTaskState state{eBlocked};      // sentinel so first pass always logs
     UBaseType_t priority{0};
@@ -902,100 +879,66 @@ class HaAutoPanel : public Component {
     uint32_t blocked_since_ms{0};
     TaskSnapshot() = default;
   };
-  // v1.28: PSRAM-backed. ~16-20 entries (one per FreeRTOS
-  // task), written once per loop iteration.
+  // PSRAM-backed. ~16-20 entries (one per FreeRTOS task),
+  // written once per loop iteration.
   std::map<TaskHandle_t, TaskSnapshot, std::less<>,
            PsramStlAllocator<std::pair<const TaskHandle_t, TaskSnapshot>>>
       task_snapshots_;
-  // v1.22v: max recoveries per window before falling back to
-  // App.reboot(). 3 is enough to give the C6 a fair chance
-  // to re-init the SDIO link without looping forever.
+  // Max recoveries per window before falling back to App.reboot().
+  // 3 is enough to give the C6 a fair chance to re-init the
+  // SDIO link without looping forever.
   static constexpr uint8_t STUCK_RECOVERY_MAX_PER_WINDOW = 3;
-  // v1.22r: last time the user tapped the time label. Used to
-  // debounce rapid taps (so a finger drag across the title bar
-  // doesn't accidentally trigger multiple toggles). Set to
-  // millis() on each click; only toggle if >250ms since last.
+  // Last time the user tapped the time label. Used to debounce
+  // rapid taps (so a finger drag across the title bar doesn't
+  // accidentally trigger multiple toggles). Set to millis() on
+  // each click; only toggle if >250ms since last.
   uint32_t last_title_tap_ms_{0};
  public:
-  // v1.22v: per-room state poll. Gated on subscribe_mode_ != 0
-  // and !current_room_area_id_.empty() (i.e. only fires while
-  // the user is on a detail page). Uses HA's /api/template
-  // endpoint with a Jinja filter so the response is ~1-5 KB
-  // instead of 200 KB. Runs every ROOM_POLL_INTERVAL_MS
-  // (3s default) in loop(). See
-  // .claude/plans/greedy-discovering-koala.md.
-  // v1.22v: stuck-task recovery knob. When true, future code
-  // can call wedge_trigger_c6_reset_() to recover from a
-  // C6 wedge. v1.25c7: no longer auto-fired by the task
-  // monitor (the monitor is pure observability now). Kept
-  // as a callable for future use. Default OFF.
+  // Stuck-task recovery knob. When true, future code can call
+  // wedge_trigger_c6_reset_() to recover from a C6 wedge. The
+  // task monitor is pure observability and never auto-fires the
+  // reset. Kept as a callable for future use. Default OFF.
   void set_enable_stuck_task_recovery(bool v) {
     this->enable_stuck_task_recovery_ = v;
   }
-  // v1.25c7: task-monitor enable knob. Default true. When
-  // false, the monitor stops polling entirely (zero overhead).
+  // Task-monitor enable knob. Default true. When false, the
+  // monitor stops polling entirely (zero overhead).
   void set_enable_task_monitor(bool v) {
     this->enable_task_monitor_ = v;
   }
-  // v1.25c7: WLED-style task state monitor. Polls
-  // uxTaskGetSystemState() once per second, diffs against
-  // the previous snapshot, and logs only meaningful changes
-  // (state transitions to/from eBlocked, priority changes,
-  // stack HWM drain below 512). High-frequency Ready↔Running
-  // flips are filtered to DEBUG. This is the WLED-MM-P4
-  // pattern the user shared - it gives priority-inversion
-  // visibility (high-prio task in eBlocked while mid-prio
-  // task is eRunning) without the sdio_write "blocked for
-  // X ms" noise the v1.22v stuck-task check generated.
-  // Called from loop(), throttled to 1 Hz internally.
+  // WLED-style task state monitor. Polls uxTaskGetSystemState()
+  // once per second, diffs against the previous snapshot, and
+  // logs only meaningful changes (state transitions to/from
+  // eBlocked, priority changes, stack HWM drain below 512).
+  // High-frequency Ready↔Running flips are filtered to DEBUG.
+  // Gives priority-inversion visibility (high-prio task in
+  // eBlocked while mid-prio task is eRunning) without the
+  // sdio_write "blocked for X ms" noise an SDIO-only check
+  // would generate. Called from loop(), throttled to 1 Hz
+  // internally.
   void monitor_task_states_();
-  // v1.22y: C6 reset via GPIO32 (the esp32_hosted reset_pin).
-  // Re-introduces v1.22u's wedge_trigger_c6_reset_() that
-  // v1.22v removed on the theory that "the SDIO wedge is a
-  // symptom not cause". The per-room poll + httpd hardening
-  // in v1.22v address the cause but the wedge STILL happens
-  // (the sdio_rx_get_buffer assert at sdio_drv.c:896 fires
-  // when the host can't drain the SDIO ring buffer fast
-  // enough during a 200KB+ bulk /api/states transfer). The
-  // C6 reset is the cheapest software recovery: drive
-  // GPIO32 low for WEDGE_C6_RESET_LOW_MS (100ms), release,
-  // the C6 re-inits the SDIO link on its next boot.
-  // v1.25c7: no longer auto-called from monitor_task_states_();
-  // the monitor is pure observation. Kept as a callable
-  // for future use or manual recovery.
+  // C6 reset via GPIO32 (the esp32_hosted reset_pin). Drive
+  // GPIO32 low for WEDGE_C6_RESET_LOW_MS (100ms), release; the
+  // C6 re-inits the SDIO link on its next boot. Kept as a
+  // callable for future use; the task monitor does not
+  // auto-fire it.
   void wedge_trigger_c6_reset_();
   static constexpr uint32_t WEDGE_C6_RESET_LOW_MS = 100;
-  // 5s threshold + enable_stuck_task_recovery: true (which
-  // v1.22y added), the C6 reset fires on every boot, the
-  // C6 reboots, wedges again, and we end up in a 6-second
-  // boot loop that trips ESPHome's safe_mode detector. The
-  // real wedge (the one that would cause the sdio_rx_get_buffer
-  // assert at sdio_drv.c:896) is a sustained >30s block.
-  // Bumped to 30s so normal boot-time eBlocked is observed
-  // but doesn't trigger the recovery.
-  // v1.25c7: kept for reference. The sdio-specific check
-  // that used this threshold is gone (the new monitor doesn't
-  // auto-fire recovery). If a future code path wants to
-  // call wedge_trigger_c6_reset_() with the 30s semantic,
-  // this constant is the canonical threshold.
+  // Canonical "stuck-task" threshold (30s). The real wedge is a
+  // sustained >30s block (the sdio_rx_get_buffer assert at
+  // sdio_drv.c:896 fires after sustained failure to drain the
+  // ring buffer). Kept for reference; no code path currently
+  // consumes it - any future auto-recovery should use this
+  // value.
   static constexpr uint32_t STUCK_TASK_THRESHOLD_MS = 30 * 1000;
-  // (v1.22u removed: dedicated SDIO wedge detector task. The
-  // user correctly identified that the SDIO wedge is a
-  // SYMPTOM of a priority-inversion deadlock, not a root
-  // cause - see [[project_crowpanel_sdio_is_symptom]]. The
-  // detector task watched loopTask's heartbeat, but loopTask
-  // was never the wedged task (the httpd worker was). v1.22v
-  // fixes the cause (per-room poll + httpd hardening) instead
-  // of treating the symptom.)
  protected:
   // Local clock, populated by the SNTP time component (yaml id
   // `sntp_time`) and refreshed every loop() tick (~1Hz). Sits to
   // the right of the home name, just left of the Edit button.
   // Shows "--:--" until NTP sync succeeds.
   //
-  // v1.22r: the time label is now CLICKABLE. Tapping it
-  // toggles the Edit/Reboot button visibility (see
-  // title_chrome_visible_).
+  // The time label is CLICKABLE. Tapping it toggles the
+  // Edit/Reboot button visibility (see title_chrome_visible_).
   lv_obj_t* title_time_label_{nullptr};
   // "DBG" button in the title bar. Shown when the panel is in any
   // non-READY state (the user needs to diagnose AUTH_FAILED /
@@ -1044,12 +987,6 @@ class HaAutoPanel : public Component {
   // open. On Apply, this is what we persist to customizations_.
   // hidden_rooms. Cleared on close.
   psram_set<std::string> sort_local_hidden_;
-  // v1.11: edit_mode_, in_edit_session_, and edit_baseline_ were
-  // removed. The Sort panel is now the single customization entry
-  // point, so there is no need for a separate "Edit" toggle on the
-  // title bar. The X badge that used to appear on each room card
-  // in edit mode is gone too - the Sort panel's per-row hide
-  // checkbox is the only hide path now.
   // Number of rooms currently visible (for the status line)
   int visible_room_count_{0};
 
@@ -1079,12 +1016,12 @@ class HaAutoPanel : public Component {
 
   // Authorization probe state
   bool auth_probe_pending_{false};
-  // v1.24: trigger_auth_probe() sets this flag from the
-  // httpd worker; loop() consumes it. The deferred-trigger
-  // pattern avoids calling probe_authorization_() (which
-  // allocates a std::function for the response callback)
-  // from the httpd worker context where a throw would
-  // land in the worker and -fno-exceptions would abort().
+  // trigger_auth_probe() sets this flag from the httpd worker;
+  // loop() consumes it. The deferred-trigger pattern avoids
+  // calling probe_authorization_() (which allocates a
+  // std::function for the response callback) from the httpd
+  // worker context where a throw would land in the worker
+  // and -fno-exceptions would abort().
   bool pending_auth_probe_{false};
   uint32_t auth_probe_started_ms_{0};
 
@@ -1104,19 +1041,18 @@ class HaAutoPanel : public Component {
   // Throttle for the safety-net force-refresh (see loop()).
   uint32_t last_force_refresh_ms_{0};
   static constexpr uint32_t FORCE_REFRESH_INTERVAL_MS = 5000;
-  // v1.24: bumped from 5s -> 15s. On cold boot the HA native
-  // API encryption handshake + first service call can take
-  // >5s, causing the probe to time out and the panel to
-  // flip to NOT_AUTHORIZED until the user taps Retry.
-  // 15s gives the cold-boot path enough headroom while
-  // still catching genuine auth failures promptly.
+  // 15s: on cold boot the HA native API encryption handshake +
+  // first service call can take >5s, causing the probe to time
+  // out and the panel to flip to NOT_AUTHORIZED until the user
+  // taps Retry. 15s gives the cold-boot path enough headroom
+  // while still catching genuine auth failures promptly.
   static constexpr uint32_t AUTH_PROBE_TIMEOUT_MS = 15000;
   static constexpr uint32_t AUTH_PROBE_CALL_ID = 0xA1701ACE;  // unique probe id
-  // v1.24: how many times to auto-retry the probe before
-  // declaring NOT_AUTHORIZED. Each retry waits
-  // AUTH_PROBE_RETRY_DELAY_MS between attempts. 3 retries
-  // at 5s intervals = up to 15s of recovery time before
-  // the panel gives up and shows the NOT_AUTHORIZED screen.
+  // How many times to auto-retry the probe before declaring
+  // NOT_AUTHORIZED. Each retry waits AUTH_PROBE_RETRY_DELAY_MS
+  // between attempts. 3 retries at 5s intervals = up to 15s of
+  // recovery time before the panel gives up and shows the
+  // NOT_AUTHORIZED screen.
   static constexpr int AUTH_PROBE_MAX_RETRIES = 3;
   static constexpr uint32_t AUTH_PROBE_RETRY_DELAY_MS = 5000;
   int auth_probe_retries_left_{AUTH_PROBE_MAX_RETRIES};
@@ -1131,19 +1067,12 @@ class HaAutoPanel : public Component {
   // frequently changed.
   CustomizationConfig customizations_;
   std::string customizations_path_{"/storage/customizations.cfg"};
-  // v1.12: tracks which areas fetch_entities_() has already populated
-  // during a single bulk-fetch pass, so the bucket is cleared
-  // exactly once per area. The state-subscription push in
-  // on_entity_state_changed_() would otherwise append a duplicate
-  // copy of every entity. Reset at the start of each fetch pass
-  // (top of fetch_entities_()).
 
   // Web UI handler
   bool web_handler_registered_{false};
-  // v1.22l: set true after the first successful
-  // fetch_entities_() (bulk /api/states). Used to gate the
-  // periodic state poll - we don't want a poll racing with
-  // the initial discovery fetch.
+  // Set true after the first successful fetch_areas_() /
+  // fetch_room_aggregates_() pass. Used to gate downstream
+  // work that depends on entities_by_area_ being populated.
   bool entities_by_area_ready_{false};
   // AGENT_DEBUG opt-in. When true, /autopanel/test/* handlers are
   // registered and respond. Default false (set in the schema), so
@@ -1197,7 +1126,7 @@ class HaAutoPanel : public Component {
   void handle_test_scroll_(class AsyncWebServerRequest *request);
   void handle_test_cmd_(class AsyncWebServerRequest *request);
   void handle_test_state_(class AsyncWebServerRequest *request);
-  // v1.17: toggle a title-bar banner that says "AUTO-TEST" so the
+  // Toggle a title-bar banner that says "AUTO-TEST" so the
   // human (or any other user) can see at a glance that an automated
   // test harness is driving the panel. The test harness calls
   // /autopanel/test/banner?on=1 at the start of a run and
@@ -1268,25 +1197,32 @@ class HaAutoPanel : public Component {
   // [home] tag in the log lets the host harness verify the result.
   void fetch_home_name_();
   static constexpr uint32_t HOME_FETCH_INTERVAL_MS = 5 * 60 * 1000;  // 5 min
-  // v1.22s: GET <ha_api>/api/states/<weather_entity_id_> and render
+  // GET <ha_api>/api/states/<weather_entity_id_> and render
   // "Cloudy 3°C" into title_weather_label_. Throttled to one call
   // per WEATHER_FETCH_INTERVAL_MS. Silently no-ops on 404 (no
   // weather entity configured) so the label stays hidden rather
   // than spamming the log.
   void fetch_weather_();
   static constexpr uint32_t WEATHER_FETCH_INTERVAL_MS = 10 * 60 * 1000;  // 10 min
-  // v1.22u: SDIO wedge auto-recovery. The detector task (a
-  // free function) updates the WEDGE_DETECT_* state on the
-  // static instance pointer; the heartbeat is called from
-  // loop() once per iteration. See the long comment at
-  // v1.22u: SDIO wedge auto-recovery methods (declared
-  // public above so the file-scope wedge_detector_task can
-  // reach the atomic counter + backoff state).
   // Recompute x/y/grid_index for every entry in room_cards_ in current
   // vector order (top-to-bottom, left-to-right). Call after any
   // mutation (hide, restore, future bulk import) so the grid always
   // reflects the room_cards_ vector with no gaps.
   void repack_room_cards_();
+  // Rebuild the reverse map (entity_id -> area_id) from the current
+  // entities_by_area_. Called after fetch_areas_() and after any
+  // room/entity mutation so find_area_id_for_entity_() can answer
+  // in O(log N) instead of doing an O(N*M) scan on every state push.
+  void rebuild_entity_to_area_map_();
+  // PSRAM-backed reverse lookup for find_area_id_for_entity_().
+  // Updated by rebuild_entity_to_area_map_() (above). Keys are
+  // string_views into entity_arena(); values are std::strings
+  // because the outer entities_by_area_ map is std::string-keyed
+  // and heterogeneous lookup across two std::string_views wouldn't
+  // be portable.
+  std::map<std::string_view, std::string, std::less<>,
+           PsramStlAllocator<std::pair<const std::string_view, std::string>>>
+      entity_to_area_map_;
   bool read_customizations_file_();
   bool write_customizations_file_();
   void apply_customizations_file_(const std::string &body);
@@ -1338,44 +1274,32 @@ class HaAutoPanel : public Component {
   int compute_cards_per_row_() const;
   int get_card_x_(int col) const;
   int get_card_y_(int row) const;
-  // v1.22i: was card_width_ - 20 (230 for 250px card), which
-  // made the arc bottom edge reach the card bottom. The user
-  // wanted the ON/OFF button to fit inside the arc's bottom
-  // opening, not be clipped by it. (The active definition
-  // is at line 339 above - this is a stale comment block
-  // from v1.22f that got orphaned when arc_size_ was
-  // moved to its own area.)
   uint32_t get_room_color_(int index) const;
 
-  // v1.22e: data-driven button/label sizing. The previous code
-  // hand-tuned pixel widths (Reboot=70, Edit=60, time=70) and
-  // they clipped the text as soon as the label or font changed.
-  // lv_txt_get_width() measures the actual rendered width for
-  // a given font + text, so the widget is always the right size
-  // no matter the locale, label wording, or font swap.
-  //
-  // The signature is intentionally minimal: callers pass the
-  // font they're using and horizontal padding (the LVGL default
-  // pad is 0; we add 12-16px to make the touch target bigger
-  // than the text itself). 4px vertical pad keeps the label
-  // from touching the top/bottom edge of the button.
+  // Data-driven button/label sizing. Measures the actual rendered
+  // width for a given font + text so the widget is always the right
+  // size no matter the locale, label wording, or font swap. The
+  // signature is intentionally minimal: callers pass the font
+  // they're using and horizontal padding (the LVGL default pad is
+  // 0; we add 12-16px to make the touch target bigger than the
+  // text itself). 4px vertical pad keeps the label from touching
+  // the top/bottom edge of the button.
   static int button_width_for_text_(const char* text, const lv_font_t* font, int pad_x = 14);
-  // v1.22e: if a single-line room name overflows the arc width,
-  // split on the first space to find the longest balanced two-
-  // line split. Returns the original string when it fits on
-  // one line, or "Line1\nLine2" (LVGL escape for newline) when
-  // it doesn't. Output is written to `out` (caller-owned, must
-  // be at least 128 bytes for any reasonable room name).
+  // If a single-line room name overflows the arc width, split on
+  // the first space to find the longest balanced two-line split.
+  // Returns the original string when it fits on one line, or
+  // "Line1\nLine2" (LVGL escape for newline) when it doesn't.
+  // Output is written to `out` (caller-owned, must be at least
+  // 128 bytes for any reasonable room name).
   void split_room_name_to_fit_(const char* name, int max_width_px,
                                 const lv_font_t* font, char* out, size_t out_size) const;
-  // v1.22s: auto-fit room-name font picker. Returns the LARGEST
-  // font in the ladder {&font_xl, &font_lg, &font_md, &font_sm}
-  // whose single-line width for `name` fits within `max_width_px`.
-  // If none of the four single-line fonts fit, returns &font_sm
-  // (the smallest) and the caller should fall back to
-  // split_room_name_to_fit_() to wrap onto two lines. The
-  // ladder was planned in v1.22l (see comment at top of .cpp) but
-  // the picker itself was deferred to v1.22s.
+  // Auto-fit room-name font picker. Intended to return the LARGEST
+  // font in a ladder whose single-line width for `name` fits
+  // within `max_width_px`; the caller falls back to
+  // split_room_name_to_fit_() for two-line wraps. Currently a
+  // no-op (returns nullptr) - the static-linkage block on
+  // font::Font* externs prevents referencing the user's yaml
+  // fonts from a custom component.
   static const lv_font_t* pick_room_name_font_(const char* name, int max_width_px);
 
   // HA service call helper - uses native ESPHome API
@@ -1397,30 +1321,11 @@ class HaAutoPanel : public Component {
   uint8_t compute_room_brightness_pct_(const std::string& area_id) const;
 
   // Native API state subscription
-  // v1.22w: chunked subscription machinery. Replaces the
-  // single-shot 200+ std::function allocation burst in
-  // subscribe_to_all_entities_() with a state-machine that
-  // does at most SUBSCRIBE_CHUNK_PER_TICK callbacks per
-  // loop tick. The list is built once in
-  // build_pending_subs_list_() (called from start_discovery_()
-  // once we know entities_by_area_ is populated), then drained
-  // in chunks by process_chunked_subscription_() in loop().
-  // See the v1.22w comment block above pending_subs_ for the
-  // rationale (PC 0x480dbxxx abort path - the std::function
-  // throw that fires when the C6 is wedged and the heap
-  // can't hold 200+ callbacks in a row).
   // True if HA API has ever been connected since boot. The
   // loop() polls this to auto-trigger the auth probe on
   // first connect (replaces the YAML on_client_connected
   // lambdas, which allocated std::function each invocation).
   bool ha_connected_once_{false};
-  // True if subscription has been queued at least once since
-  // boot. The subscription depends on entities_by_area_ready_
-  // (i.e. discovery complete), so it's a SEPARATE one-shot
-  // from ha_connected_once_. Together they replace the
-  // YAML's auth-probe + subscription lambdas - the C++ side
-  // now self-triggers without going through the YAML
-  // std::function path.
   // Callbacks fired by the api server when HA pushes a state change
   // or attribute change. Take string_view because the const char*
   // overload of subscribe_home_assistant_state is zero-allocation
