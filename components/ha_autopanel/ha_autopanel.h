@@ -491,6 +491,21 @@ enum class PanelState {
   READY,           // rooms visible
 };
 
+// v1.30: state machine for incremental UI build. Was synchronous
+// (create_ui_from_room_cards_() built all 15 cards in one tight
+// loop), which exhausted internal SRAM via per-card LVGL flushes
+// -> SPI DMA buffer allocs -> fragmented heap -> post-burst
+// cascade failures (event loop queue, esp-tls sockets, more DMA
+// allocs all failed). Deferring one card per loop tick gives the
+// SPI driver time to free buffers between cards, and gives the
+// main loop time to service other subsystems (WiFi, esp-tls,
+// mDNS, http_request).
+enum class UIBuildState {
+  IDLE,            // not building
+  BUILDING_CARDS,  // create one card per loop tick
+  FINALIZING,      // sizing + completion log, then IDLE
+};
+
 class HaAutoPanel : public Component {
  public:
   // v1.24: declared here (defaulted in ha_autopanel.cpp) so
@@ -635,8 +650,8 @@ class HaAutoPanel : public Component {
   // template arguments). So the inner vector uses default
   // alloc (its strings are short enough for SSO anyway, so
   // no separate heap alloc).
-  std::map<std::string, std::vector<Entity>, std::less<>,
-           PsramStlAllocator<std::pair<const std::string, std::vector<Entity>>>>
+  std::map<std::string, psram_vector<Entity>, std::less<>,
+           PsramStlAllocator<std::pair<const std::string, psram_vector<Entity>>>>
       entities_by_area_;
   // v1.28: PSRAM-backed. ~15 entries, each ~80B.
   std::vector<RoomCard, PsramStlAllocator<RoomCard>> room_cards_;
@@ -1072,6 +1087,23 @@ class HaAutoPanel : public Component {
   // land in the worker and -fno-exceptions would abort().
   bool pending_auth_probe_{false};
   uint32_t auth_probe_started_ms_{0};
+
+  // v1.30: incremental UI build state. Spreads the 15-card widget
+  // creation across multiple loop ticks so the per-card LVGL flushes
+  // don't starve the SPI DMA buffer pool and fragment internal
+  // SRAM in one tight loop. See continue_ui_build_() in the .cpp.
+  UIBuildState ui_build_state_{UIBuildState::IDLE};
+  // Cached row metadata for the in-progress build.
+  int ui_build_cards_per_row_{0};
+  int ui_build_num_rows_{0};
+  int ui_build_current_row_{-1};       // -1 = no row started yet
+  int ui_build_current_card_in_row_{0};
+  int ui_build_current_row_count_{0};
+  int ui_build_current_row_width_{0};
+  lv_obj_t *ui_build_current_row_container_{nullptr};
+  // Throttle for the safety-net force-refresh (see loop()).
+  uint32_t last_force_refresh_ms_{0};
+  static constexpr uint32_t FORCE_REFRESH_INTERVAL_MS = 5000;
   // v1.24: bumped from 5s -> 15s. On cold boot the HA native
   // API encryption handshake + first service call can take
   // >5s, causing the probe to time out and the panel to
@@ -1281,10 +1313,28 @@ class HaAutoPanel : public Component {
   bool is_domain_included_(std::string_view domain) const;
   void start_discovery_();
   void create_ui_from_room_cards_();
+  // v1.30: incremental UI build. create_ui_from_room_cards_() now
+  // calls start_ui_build_() (does screen/title/container setup,
+  // computes row layout, transitions to BUILDING_CARDS) and returns.
+  // continue_ui_build_() is called once per loop() tick and creates
+  // exactly one card (or finalizes the container height). Spreading
+  // the work across ticks lets the SPI DMA buffer pool replenish
+  // between cards and lets other subsystems (WiFi, esp-tls, mDNS)
+  // run their tasks, which they couldn't during a single 75-widget
+  // burst that exhausted internal SRAM.
+  void start_ui_build_();
+  void continue_ui_build_();
+  // Safety-net force-refresh. If a single LVGL flush silently fails
+  // (DMA buffer alloc fail leaves the dirty rect unflushed), the
+  // display shows a stale frame. Every FORCE_REFRESH_INTERVAL_MS
+  // we invalidate the active screen so the next flush attempt
+  // re-pushes everything. With partial flush working most of the
+  // time, this is a 5-second backstop, not a per-tick hammer.
+  void force_refresh_if_due_();
   void create_room_card_(void* parent, const RoomCard& room);
   void show_room_grid_();
   void show_entity_detail_(int room_index);
-  void create_entity_control_(void* parent, const Entity& entity, int entity_index, int y_pos, uint32_t color);
+  void create_entity_control_(void* parent, const Entity& entity, uint32_t color);
   int compute_cards_per_row_() const;
   int get_card_x_(int col) const;
   int get_card_y_(int row) const;

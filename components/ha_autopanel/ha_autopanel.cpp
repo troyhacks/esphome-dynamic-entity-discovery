@@ -641,7 +641,7 @@ void HaAutoPanel::fetch_areas_() {
 
   ESP_LOGI(TAG, "Fetching areas from HA via template API...");
 
-  std::string url = this->ha_api_url_ + "/api/template";
+  psram_string url = psram_string(this->ha_api_url_) + "/api/template";
 
   // Build the Jinja template dynamically, applying exclude_areas, include_areas,
   // domains, and exclude_entities filters on the HA side. This dramatically
@@ -665,7 +665,7 @@ void HaAutoPanel::fetch_areas_() {
   // is a domain. We carefully escape the regex for JSON: each backslash
   // in the regex becomes two backslashes in the JSON body so JSON decoding
   // yields a single backslash.
-  std::string domain_regex;
+  psram_string domain_regex;
   for (size_t i = 0; i < this->entity_domains_.size(); i++) {
     if (i > 0) domain_regex += "|";
     domain_regex += this->entity_domains_[i];
@@ -681,7 +681,7 @@ void HaAutoPanel::fetch_areas_() {
   // When the user has not specified any domains, the regex would be
   // "^(?:)\." which never matches anything. Use ".*" instead so
   // the template returns ALL entity_ids in each area.
-  std::string domain_match_json;
+  psram_string domain_match_json;
   if (this->entity_domains_.empty()) {
     domain_match_json = ".*";
   } else {
@@ -691,24 +691,24 @@ void HaAutoPanel::fetch_areas_() {
   // Build include/exclude area lists (HA's "in" test works on string lists).
   // The whole body is a JSON string, so inner double quotes MUST be escaped
   // as \\\" so they survive JSON decoding intact.
-  std::string include_areas_list;
+  psram_string include_areas_list;
   for (size_t i = 0; i < this->include_areas_.size(); i++) {
     if (i > 0) include_areas_list += ", ";
     include_areas_list += "\\\"" + this->include_areas_[i] + "\\\"";
   }
-  std::string exclude_areas_list;
+  psram_string exclude_areas_list;
   for (size_t i = 0; i < this->exclude_areas_.size(); i++) {
     if (i > 0) exclude_areas_list += ", ";
     exclude_areas_list += "\\\"" + this->exclude_areas_[i] + "\\\"";
   }
-  std::string exclude_entities_list;
+  psram_string exclude_entities_list;
   for (size_t i = 0; i < this->exclude_entities_.size(); i++) {
     if (i > 0) exclude_entities_list += ", ";
     exclude_entities_list += "\\\"" + this->exclude_entities_[i] + "\\\"";
   }
 
   // Area gating condition
-  std::string area_gate;
+  psram_string area_gate;
   if (!this->include_all_) {
     if (this->include_areas_.empty()) {
       // include_all=false with no include_areas would exclude everything -
@@ -727,13 +727,13 @@ void HaAutoPanel::fetch_areas_() {
   // All inner double quotes are escaped with \\\" so the whole template
   // remains a valid JSON string. The domain_match_json already contains
   // JSON-escaped backslashes, so we use it as-is.
-  std::string entity_filter = "area_entities(a) | select(\\\"match\\\", \\\"" + domain_match_json + "\\\")";
+  psram_string entity_filter = "area_entities(a) | select(\\\"match\\\", \\\"" + domain_match_json + "\\\")";
   if (!this->exclude_entities_.empty()) {
     entity_filter += " | reject(\\\"in\\\", [" + exclude_entities_list + "])";
   }
   entity_filter += " | list";
 
-  std::string body =
+  psram_string body =
       "{\"template\": \"{% set ns = namespace(rooms=[]) %}"
       "{% for a in areas() %}" + area_gate +
       "{% set ents = " + entity_filter + " %}"
@@ -750,7 +750,11 @@ void HaAutoPanel::fetch_areas_() {
   HttpClient http(this->http_request_);
   auto auth = http.bearer_auth(this->ha_api_password_);
   auth.push_back({"Content-Type", "application/json"});
-  HttpResult result = http.post(url, body, auth);
+  // psram_string -> std::string. The std::string copy's char buffer
+  // is allocated via default malloc, which CONFIG_SPIRAM_USE_MALLOC=y
+  // routes to PSRAM. The std::string struct (32 bytes incl. SSO
+  // buffer) lives on this stack frame - tiny and unavoidable.
+  HttpResult result = http.post(std::string(url), std::string(body), auth);
   if (result.status == HttpStatus::AUTH_FAILED) {
     ESP_LOGE(TAG, "HA API auth failed - check your token");
     this->set_panel_state_(PanelState::AUTH_FAILED);
@@ -852,7 +856,7 @@ void HaAutoPanel::fetch_areas_() {
       // with minimal Entity stubs derived from the template's entity_ids
       // list. State and brightness are populated lazily by the
       // api.on_state subscription (see subscribe_to_all_entities_).
-      std::vector<Entity> &bucket = this->entities_by_area_[a.area_id];
+      std::vector<Entity, PsramStlAllocator<Entity>> &bucket = this->entities_by_area_[a.area_id];
       bucket.reserve(a.entity_ids.size());
       for (const auto &eid : a.entity_ids) {
         Entity e;
@@ -1554,6 +1558,18 @@ void HaAutoPanel::repack_room_cards_() {
 }
 
 void HaAutoPanel::create_ui_from_room_cards_() {
+  // v1.30: refactored. The old version did screen + title +
+  // container + 15-card creation + sizing all in one tight loop.
+  // 75 widget creates in ~500ms exhausted internal SRAM via
+  // per-card LVGL flushes -> SPI DMA buffer alloc failures ->
+  // event loop queue / esp-tls / HTTP all failing post-burst.
+  // Now: this function does only the setup work and returns,
+  // transitioning state to BUILDING_CARDS. continue_ui_build_()
+  // (called once per loop() tick) creates one card per call.
+  this->start_ui_build_();
+}
+
+void HaAutoPanel::start_ui_build_() {
   ESP_LOGI(TAG, "Creating dynamic UI for %d room cards", (int)room_cards_.size());
 
   // Force the active screen's background to dark BEFORE any other widget
@@ -1658,27 +1674,76 @@ void HaAutoPanel::create_ui_from_room_cards_() {
   // LV_ALIGN_TOP_MID on the row gives us centering for free, no
   // arithmetic. The sub-container also gives us a clean parent for
   // drag-to-reorder and future per-row animations.
+  //
+  // v1.30: row creation is deferred to continue_ui_build_().
+  // start_ui_build_() computes the layout, caches it in members,
+  // and transitions ui_build_state_ to BUILDING_CARDS. The actual
+  // per-card widget creates run one card per loop() tick so the
+  // SPI DMA buffer pool has time to replenish between cards.
   int cards_per_row = this->compute_cards_per_row_();
   int num_rows = (int)((room_cards_.size() + cards_per_row - 1) / cards_per_row);
   if (num_rows < 1) num_rows = 1;
+  this->ui_build_cards_per_row_ = cards_per_row;
+  this->ui_build_num_rows_ = num_rows;
+  this->ui_build_current_row_ = -1;       // sentinel: lazy-create first row
+  this->ui_build_current_card_in_row_ = 0;
+  this->ui_build_current_row_count_ = 0;
+  this->ui_build_current_row_width_ = 0;
+  this->ui_build_current_row_container_ = nullptr;
 
-  for (int row = 0; row < num_rows; row++) {
-    int row_count = (row < num_rows - 1)
-                        ? cards_per_row
-                        : (int) room_cards_.size() - row * cards_per_row;
+  // Sync the visible_room_count_ for the title-bar/status line.
+  this->visible_room_count_ = (int)room_cards_.size();
+
+  // Transition to BUILDING_CARDS. The first call to continue_ui_build_()
+  // will lazily create row 0's container.
+  this->ui_build_state_ = UIBuildState::BUILDING_CARDS;
+}
+
+void HaAutoPanel::continue_ui_build_() {
+  if (this->ui_build_state_ != UIBuildState::BUILDING_CARDS) {
+    return;
+  }
+
+  // Lazily initialize for row 0 on first call.
+  if (this->ui_build_current_row_ == -1) {
+    this->ui_build_current_row_ = 0;
+  }
+
+  // End-of-build: all rows done. Size the container + log + transition.
+  if (this->ui_build_current_row_ >= this->ui_build_num_rows_) {
+    int actual_bottom = this->start_y_ +
+                        (this->ui_build_num_rows_ - 1) * (this->card_height_ + this->card_gap_) +
+                        this->card_height_;
+    int total_height = actual_bottom > this->screen_height_ ? actual_bottom : this->screen_height_;
+    if (this->main_container_ != nullptr) {
+      lv_obj_set_style_height(this->main_container_, total_height, LV_PART_MAIN);
+    }
+    ESP_LOGI(TAG, "UI creation complete: %d cards in %d rows, page height=%d (screen=%d, last card bottom=%d)",
+             (int) room_cards_.size(), this->ui_build_num_rows_, total_height,
+             this->screen_height_, actual_bottom);
+    this->ui_build_state_ = UIBuildState::IDLE;
+    this->ui_build_current_row_container_ = nullptr;
+    return;
+  }
+
+  // When starting a new row (current_card_in_row_ == 0), create its
+  // container. The rest of the row's cards (if any) reuse the
+  // container via cached ui_build_current_row_container_.
+  if (this->ui_build_current_card_in_row_ == 0) {
+    int row = this->ui_build_current_row_;
+    int row_count = (row < this->ui_build_num_rows_ - 1)
+                        ? this->ui_build_cards_per_row_
+                        : (int) room_cards_.size() - row * this->ui_build_cards_per_row_;
     if (row_count <= 0) row_count = 1;
     int row_width = row_count * this->card_width_ +
                     (row_count > 0 ? (row_count - 1) : 0) * this->card_gap_;
+    this->ui_build_current_row_count_ = row_count;
+    this->ui_build_current_row_width_ = row_width;
 
     // Per-row flex container. LVGL's flex layout places the cards
     // left-to-right inside; the row itself is centered horizontally
-    // on main_container_ via LV_ALIGN_TOP_MID. No absolute x
-    // positions anywhere - if the screen narrows or cards grow, the
-    // row reflows automatically. Flex is now enabled (LV_USE_FLEX=1
-    // in the user's lvgl config).
+    // on main_container_ via LV_ALIGN_TOP_MID.
     lv_obj_t* row_container = lv_obj_create(this->main_container_);
-    // v1.22f: was card_width_ (square). Now card_height_ so the
-    // row is tall enough for the card's expanded height.
     lv_obj_set_size(row_container, row_width, this->card_height_);
     lv_obj_set_style_bg_opa(row_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row_container, 0, 0);
@@ -1689,59 +1754,48 @@ void HaAutoPanel::create_ui_from_room_cards_() {
     lv_obj_remove_flag(row_container, LV_OBJ_FLAG_CLICKABLE);
     int row_y = this->start_y_ + row * (this->card_height_ + this->card_gap_);
     lv_obj_align(row_container, LV_ALIGN_TOP_MID, 0, row_y);
-
-    // Add this row's cards. The flex layout handles the per-card x
-    // within the row; room.x / room.y are still tracked (0, 0) for
-    // any code that reads them (drag-to-reorder, animations) but
-    // they're not the source of truth for placement anymore.
-    //
-    // STACK YIELD: calling lv_task_handler() once per row gives LVGL
-    // a chance to run its event loop, which drains any queued timer
-    // or layout work and returns the call stack to a safe depth. The
-    // crash we hit on 15 rooms (v1.7 build) was a "Stack protection
-    // fault" in tlsf_realloc, deep inside the flex_update path - the
-    // 4KB-ish main-task stack had no breathing room when 90+ widgets
-    // were created back-to-back with no yields. Yelding every 4 cards
-    // (= one row) keeps the stack depth under control without
-    // slowing first-paint noticeably.
-    for (int c = 0; c < row_count; c++) {
-      int card_index = row * cards_per_row + c;
-      if (card_index >= (int) room_cards_.size()) break;
-      room_cards_[card_index].x = 0;
-      room_cards_[card_index].y = 0;
-      create_room_card_(row_container, room_cards_[card_index]);
-      // Yield every card. Cheap (~few ms), prevents the stack from
-      // growing past its allocated region even on a board with many
-      // areas. The first card of a row already gets a yield via the
-      // row boundary; yielding again on every card is a deliberate
-      // belt-and-suspenders for large room counts.
-      lv_task_handler();
-    }
+    this->ui_build_current_row_container_ = row_container;
   }
 
-  // Sync the visible_room_count_ for the title-bar/status line. After
-  // filter_and_build_room_cards_ has run (hidden rooms removed, room_order
-  // applied), room_cards_.size() is the authoritative count of visible rooms.
-  this->visible_room_count_ = (int)room_cards_.size();
+  // Create one card per call (per loop() tick). Flex handles per-card x.
+  int card_index = this->ui_build_current_row_ * this->ui_build_cards_per_row_ +
+                   this->ui_build_current_card_in_row_;
+  if (card_index < (int) room_cards_.size()) {
+    room_cards_[card_index].x = 0;
+    room_cards_[card_index].y = 0;
+    create_room_card_(this->ui_build_current_row_container_,
+                      room_cards_[card_index]);
+  }
+  this->ui_build_current_card_in_row_++;
 
-  // Size the main container to fit all rendered cards, with no extra
-  // blank space. Cards are square (width == height == card_width_), so
-  // the height per row is just card_width_. If the content fits within
-  // screen_height_ we use screen_height_ so the page fills the screen;
-  // otherwise the container grows and LVGL scrolls.
-  // Size the page to exactly the bottom of the last card. Previously this
-  // added a full card_gap_ + 20px padding, which left dead scrollable space
-  // below the last row (especially noticeable when the page is taller than
-  // the screen, since the user could scroll past the cards into emptiness).
-  int actual_bottom = this->start_y_ + (num_rows - 1) * (this->card_height_ + this->card_gap_) + this->card_height_;
-  // But still expand to fill the screen if content is shorter, so the dark
-  // background of main_container_ covers the full display (otherwise the
-  // bottom of the screen would show the default screen background).
-  int total_height = actual_bottom > this->screen_height_ ? actual_bottom : this->screen_height_;
-  lv_obj_set_style_height(this->main_container_, total_height, LV_PART_MAIN);
+  // If this was the last card in the row, advance to next row.
+  // The next tick will lazily create the new row's container.
+  if (this->ui_build_current_card_in_row_ >= this->ui_build_current_row_count_) {
+    this->ui_build_current_row_++;
+    this->ui_build_current_card_in_row_ = 0;
+    this->ui_build_current_row_container_ = nullptr;
+  }
+}
 
-  ESP_LOGI(TAG, "UI creation complete: %d cards in %d rows, page height=%d (screen=%d, last card bottom=%d)",
-           (int) room_cards_.size(), num_rows, total_height, this->screen_height_, actual_bottom);
+void HaAutoPanel::force_refresh_if_due_() {
+  // Safety-net force-refresh. If a single LVGL flush silently
+  // fails (DMA buffer alloc fail leaves the dirty rect unflushed),
+  // the display shows a stale frame. Every
+  // FORCE_REFRESH_INTERVAL_MS we invalidate the active screen so
+  // the next flush attempt re-pushes everything. With partial
+  // flush working most of the time, this is a 5-second backstop,
+  // not a per-tick hammer. Cheap (one lv_obj_invalidate call).
+  uint32_t now = millis();
+  if (now - this->last_force_refresh_ms_ < FORCE_REFRESH_INTERVAL_MS) {
+    return;
+  }
+  this->last_force_refresh_ms_ = now;
+  if (this->state_ == PanelState::READY) {
+    lv_obj_t* screen = lv_scr_act();
+    if (screen != nullptr) {
+      lv_obj_invalidate(screen);
+    }
+  }
 }
 
 void HaAutoPanel::create_title_bar_(lv_obj_t* parent) {
@@ -2749,7 +2803,23 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
   // shows the scrollbar during scroll then fades it. (See the
   // matching comment on the main_container_ for the rationale.)
   lv_obj_set_scrollbar_mode(this->detail_container_, LV_SCROLLBAR_MODE_AUTO);
-  lv_obj_set_style_pad_all(this->detail_container_, 0, 0);  // No padding
+  // v1.30: flex-column layout for the entity list. Each control
+  // is added as a flex child; the row above set_size(0, 0)
+  // called pad_all which we'll override with explicit row-only
+  // padding below. Flex reflows the remaining children upward
+  // when one is lv_obj_del'd (the v1.30 "delete entity" fix -
+  // used to be: full page rebuild + scroll snap-to-top).
+  lv_obj_set_flex_flow(this->detail_container_, LV_FLEX_FLOW_COLUMN);
+  // Left/top/bottom padding (16px on left aligns controls with
+  // the title bar's content; 16px top leaves breathing room below
+  // the title bar; 16px bottom lets the last item not be flush).
+  // No right padding - controls set their own width via LV_PCT(100).
+  lv_obj_set_style_pad_top(this->detail_container_, 16, 0);
+  lv_obj_set_style_pad_bottom(this->detail_container_, 16, 0);
+  lv_obj_set_style_pad_left(this->detail_container_, 16, 0);
+  lv_obj_set_style_pad_right(this->detail_container_, 0, 0);
+  // 8px gap between consecutive control rows.
+  lv_obj_set_style_pad_row(this->detail_container_, 8, 0);
   lv_obj_set_style_border_width(this->detail_container_, 0, 0);  // No border
 
   // The room name (centered in the title bar area). Set the bar above
@@ -2793,31 +2863,30 @@ void HaAutoPanel::show_entity_detail_(int room_index) {
                  (this->screen_width_ - (int)lv_obj_get_self_width(this->title_room_label_)) / 2);
   }
 
-  // Entity list - start below title bar. v1.18: bumped from y=50
-  // to y=70 so the first entity isn't right at the title bar's
-  // bottom edge. The title bar ends at y=36 and has a 1px
-  // bottom border; starting at y=50 left the first row's top
-  // edge only 13px from the bar. y=70 gives a 34px gap, which
-  // is the same as the room card's start_y_ (the cards start 40
-  // below the top of main_container_, which sits at y=0 - so the
-  // cards effectively have 40px top padding in the grid view).
-  // Standardizing the detail page to ~40px top padding makes the
-  // two pages feel visually consistent.
-  int y_offset = 70;
+  // v1.30: entity list (flex column, no absolute y_pos). The detail
+  // container is set up above as LV_FLEX_FLOW_COLUMN, so children
+  // stack vertically with pad_row=8 between them and 16px outer
+  // padding. create_entity_control_ no longer takes y_pos /
+  // entity_index - LVGL positions each control automatically.
+  // lv_obj_del() on a single control (the v1.30 hide flow) lets
+  // LVGL reflow the remaining controls upward.
   for (size_t i = 0; i < room.entities.size(); i++) {
     if (this->is_entity_hidden_(room.entities[i].entity_id)) {
       continue;
     }
-    create_entity_control_(this->detail_container_, room.entities[i], (int)i, y_offset, room.color);
-    y_offset += 80;
+    create_entity_control_(this->detail_container_, room.entities[i], room.color);
   }
 
-  // Expand container height to fit all entities for scrolling
-  int total_content_height = y_offset + 20;  // Add some padding at bottom
-  if (total_content_height > 600) {
-    lv_obj_set_style_height(this->detail_container_, total_content_height, LV_PART_MAIN);
-    ESP_LOGI(TAG, "Expanded detail container to %d px for %d entities", total_content_height, (int)room.entities.size());
-  }
+  // v1.30: container height = flex content (LV_SIZE_CONTENT).
+  // Previously: total_content_height = 16 + room.entities.size() * 78,
+  // which counted hidden entities (each ~78px) -> the container was
+  // ~80px+ taller than the actual visible content, leaving a big
+  // dead band of the dark container bg below the last visible entity.
+  // With flex-column + LV_SIZE_CONTENT, the container is exactly as
+  // tall as the sum of (visible children + gaps + padding). Hidden
+  // entities contribute zero to the height because they're not
+  // children of the container at all (filtered above).
+  lv_obj_set_height(this->detail_container_, LV_SIZE_CONTENT);
 
   // Make sure the detail page opens scrolled to the top. The container is
   // newly created so it should already be at 0, but be explicit in case LVGL
@@ -3074,7 +3143,7 @@ void HaAutoPanel::update_media_banner_() {
   }
 }
 
-void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int entity_index, int y_pos, uint32_t color) {
+void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uint32_t color) {
   if (this->is_entity_hidden_(entity.entity_id)) {
     ESP_LOGI(TAG, "Skipping hidden entity: %.*s",
              (int) entity.entity_id.size(), entity.entity_id.data());
@@ -3082,8 +3151,12 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
   }
 
   lv_obj_t* control = lv_obj_create((lv_obj_t*) parent);
-  lv_obj_set_pos(control, 32, y_pos);
-  lv_obj_set_size(control, 960, 70);
+  // v1.30: flex layout - the parent detail_container_ is
+  // LV_FLEX_FLOW_COLUMN, so this control is a flex child. We
+  // set width to 100% of the container and a fixed 70px height.
+  // No absolute position - LVGL handles the row.
+  lv_obj_set_width(control, LV_PCT(100));
+  lv_obj_set_height(control, 70);
   lv_obj_set_style_bg_color(control, lv_color_hex(0x1a1a2e), 0);
   lv_obj_set_style_radius(control, 8, 0);
   lv_obj_set_style_border_width(control, 1, 0);
@@ -3369,6 +3442,12 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
 
   std::string* eid_copy = new std::string(entity.entity_id.data(), entity.entity_id.size());
   lv_obj_set_user_data(hide_btn, eid_copy);
+  // Store the control widget pointer in user_data so the click handler
+  // can lv_obj_del(control) on hide (v1.30: replaces the full-page
+  // rebuild that used to scroll back to top). The detail_container_
+  // is LV_FLEX_FLOW_COLUMN, so the remaining controls reflow upward
+  // automatically when this one is deleted.
+  lv_obj_set_user_data(control, hide_btn);  // unused, just keeps GC reachable
   lv_obj_add_event_cb(hide_btn, [](lv_event_t* event) {
     lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(event);
     std::string* p = (std::string*)lv_obj_get_user_data(btn);
@@ -3376,9 +3455,30 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, int
     ESP_LOGI(TAG, "Hide entity: %s", p->c_str());
     s_instance->customizations_.hidden_entities.insert(std::string(p->data(), p->size()));
     s_instance->write_customizations_file_();
-    if (s_instance->current_room_index_ >= 0 &&
-        s_instance->current_room_index_ < (int) s_instance->room_cards_.size()) {
-      s_instance->show_entity_detail_(s_instance->current_room_index_);
+    // v1.30: targeted delete instead of show_entity_detail_() rebuild.
+    // The hide_btn is a child of the control widget; lv_obj_get_parent
+    // walks up to find it. lv_obj_del() removes the control, and
+    // detail_container_'s flex column layout reflows the remaining
+    // controls upward. No full-page rebuild -> no scroll snap to top.
+    lv_obj_t* control = lv_obj_get_parent(btn);
+    if (control != nullptr) {
+      // Clear user_data on the control so the LV_EVENT_DELETE handler
+      // (which deletes the entity_id std::string) doesn't try to
+      // re-del an already-deleted pointer.
+      lv_obj_set_user_data(btn, nullptr);
+      lv_obj_del(control);
+    }
+    // If the deleted item was the last (or near-last) visible item
+    // and the user was scrolled down, the new content height may
+    // be less than the current scroll offset -> blank area below
+    // the last item. Clamp the scroll to the top in that case.
+    if (s_instance->detail_container_ != nullptr) {
+      lv_obj_update_layout(s_instance->detail_container_);
+      lv_coord_t content_h = lv_obj_get_self_height(s_instance->detail_container_);
+      lv_coord_t visible_h = lv_obj_get_height(s_instance->detail_container_);
+      if (content_h < visible_h) {
+        lv_obj_scroll_to(s_instance->detail_container_, 0, 0, LV_ANIM_OFF);
+      }
     }
   }, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_event_cb(hide_btn, [](lv_event_t* event) {
@@ -4331,6 +4431,18 @@ void HaAutoPanel::on_auth_probe_response_(bool success, const char* error) {
 }
 
 void HaAutoPanel::loop() {
+  // v1.30: incremental UI build. Runs first (before auth probes
+  // and WS drains) so card creation gets a clean main-loop tick
+  // to itself. Each tick creates exactly one card -> one LVGL
+  // flush -> one SPI DMA buffer alloc. The pool replenishes
+  // between cards.
+  this->continue_ui_build_();
+
+  // v1.30: safety-net force-refresh. If a flush ever silently
+  // fails, the display freezes on a stale frame; every 5s we
+  // invalidate the screen to force a re-flush. Cheap.
+  this->force_refresh_if_due_();
+
   // v1.22u removed: SDIO wedge detector heartbeat. The
   // detector task is gone; the heartbeat is no longer
   // needed. v1.22v instead polls the actual stuck-task
