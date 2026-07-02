@@ -7,6 +7,7 @@
 #include <memory>
 #include <map>
 #include <set>
+#include <utility>
 #include <functional>
 #include "esphome/core/component.h"
 #include "esphome/components/lvgl/lvgl_proxy.h"
@@ -345,6 +346,17 @@ struct Entity {
   uint8_t brightness{0};    // 0-255, valid only when state == "on" and has_brightness
   bool has_brightness{false};
   bool is_hue_group{false};
+  // Set by the room-card click / arc-drag handlers when they
+  // optimistically write a new state. While true,
+  // sync_entities_from_aggregates_() skips this entity so the
+  // render_template aggregate push (which may have been
+  // generated BEFORE HA processed the user's turn_off/toggle)
+  // can't overwrite the optimistic "off" and cause a flicker
+  // back to the old "on" state for a frame. Cleared in
+  // on_entity_state_changed_() when the matching state event
+  // arrives, and also by a 10s timeout in loop() so an HA
+  // outage doesn't leave the entity stuck-out-of-sync forever.
+  bool pending_optimistic_update{false};
 };
 
 // Room card data for UI
@@ -1122,6 +1134,12 @@ class HaAutoPanel : public Component {
   // the /autopanel/test/click and /autopanel/test/scroll HTTP
   // handlers when agent_debug_ is true.
   void simulate_click_(int x, int y);
+  // Same as simulate_click_ but returns the hit-tested widget
+  // (nullptr when no widget is at the coord). Used by the test
+  // harness's /test/click handler so the HTTP response can
+  // report "missed - no widget at (x, y)" instead of silently
+  // 200-OK on a coordinate that hit empty space.
+  lv_obj_t* simulate_click_with_hitscan_(int x, int y);
   void simulate_scroll_(int x1, int y1, int x2, int y2);
   // Process a single-character command the same way the serial
   // command parser does. Extracted so the web API can trigger the
@@ -1151,6 +1169,77 @@ class HaAutoPanel : public Component {
   bool test_banner_active_{false};
   // The actual label widget. Created in create_title_bar_().
   lv_obj_t* title_test_banner_{nullptr};
+
+  // Over-the-air log capture. The C++ side writes every log line
+  // (after ESP_LOG formatting) into a small ring buffer that the
+  // /autopanel/test/logs endpoint serves on demand. The buffer is
+  // intentionally small (4 KB ≈ ~40 lines) to keep RAM cost near
+  // zero; it's only meant for "what just happened before this
+  // crash" forensics, not for tailing a long session. The serial
+  // log (when a cable is attached) remains the source of truth.
+  void log_buffer_append_(const std::string& line);
+  std::string log_buffer_dump_(size_t max_lines, const std::string& tag) const;
+  // Static ESPHome log callback. Fires on every ESP_LOG line
+  // from any task; writes the formatted line into the ring
+  // buffer. Required to be static (raw function pointer) per
+  // logger::add_log_callback's signature.
+  static void on_log_callback_(void* instance, uint8_t level,
+                               const char* tag, const char* message,
+                               size_t message_len);
+  // Idempotent registration of the log callback. Called from
+  // loop() on each tick until the logger component is ready
+  // (logger::global_logger != nullptr). Becomes a no-op after
+  // the first successful registration.
+  void maybe_register_log_callback_();
+  mutable std::mutex log_buffer_mu_;
+  std::string log_buffer_;  // newline-separated ring of recent log lines
+  // Logger component isn't fully initialized when our setup()
+  // runs (it's a separate component that registers after us),
+  // so we defer the add_log_callback call until the first
+  // loop() tick when logger::global_logger is guaranteed
+  // non-null. Set true once the callback is registered.
+  bool log_callback_registered_{false};
+  // Diagnostic counters so the test harness can see whether
+  // the logger callback is actually being invoked (the log
+  // buffer itself is empty until the first callback fires, so
+  // we need a separate "we tried N times" signal).
+  uint32_t log_callback_attempts_{0};
+  uint32_t log_callback_fires_{0};
+  // Number of loop ticks where logger::global_logger was
+  // STILL null when we tried to register. If this stays 0 the
+  // logger was non-null on the first poll (good); if it grows
+  // we know the logger component initialized late.
+  uint32_t log_callback_global_logger_null_{0};
+
+  // Heap stats endpoint (GET /autopanel/test/heap). Returns one
+  // line per stat (free_internal_kb=, largest_internal_kb=,
+  // free_psram_kb=, largest_psram_kb=). Cheap to add and very
+  // useful for catching leaks (e.g. the JPEG OOM bug would have
+  // shown largest_psram_kb dropping to a few KB before the
+  // screenshot endpoint started 500-ing).
+  void handle_test_heap_(class AsyncWebServerRequest *request);
+
+  // Entities dump endpoint (GET /autopanel/test/entities).
+  // Returns JSON { area_id: [ {entity_id, name, friendly_name,
+  // state, brightness, domain}, ... ] } - a flattened view of
+  // entities_by_area_ with friendly_name resolved. Lets the test
+  // harness verify display content without parsing screenshots.
+  void handle_test_entities_(class AsyncWebServerRequest *request);
+
+  // Aggregate dump endpoint (GET /autopanel/test/aggregate).
+  // Returns JSON { area_id: {name, on_count, max_pct, entities: {
+  // entity_id: {state, brightness} } } - the most recent
+  // room_aggregates_ snapshot. Useful for verifying the
+  // render_template subscription is alive and in sync.
+  void handle_test_aggregate_(class AsyncWebServerRequest *request);
+
+  // Over-the-air service-call dispatch (POST /autopanel/test/service).
+  // Mirrors what the room-card button click handlers do (calls
+  // the panel's own call_ha_service_ path) but lets the test
+  // harness trigger the same code path without a real tap. Useful
+  // for race-condition reproduction - we can flood the path with
+  // calls and watch what the panel state does.
+  void handle_test_service_(class AsyncWebServerRequest *request);
 
   // LittleFS helpers
   bool mount_storage_();
@@ -1234,6 +1323,35 @@ class HaAutoPanel : public Component {
   std::map<std::string_view, std::string, std::less<>,
            PsramStlAllocator<std::pair<const std::string_view, std::string>>>
       entity_to_area_map_;
+  // Tracks when each entity was optimistically updated, so
+  // sync_entities_from_aggregates_() can skip the entity until
+  // the matching state_changed event lands (or a 10 s timeout
+  // expires, whichever comes first). A small vector of pairs
+  // (rather than std::unordered_map) because libstdc++'s
+  // unordered_map internal allocator types don't match our
+  // PsramStlAllocator's ctor signature (same issue as std::deque).
+  // Bounded to a few entries (the user only toggles 1-2 at a
+  // time), so the linear scan in expire_pending_optimistic_
+  // updates_() is fine. entity_id is a string_view into the
+  // entity_arena, so no copy.
+  std::vector<std::pair<std::string_view, uint32_t>>
+      optimistic_update_pending_at_;
+  // Clear the pending flag for any entity whose timestamp is
+  // older than the timeout. Called from loop() each tick.
+  void expire_pending_optimistic_updates_();
+  static constexpr uint32_t OPTIMISTIC_UPDATE_TIMEOUT_MS = 10000;
+  // Pending scroll request deferred from /test/scroll. The
+  // httpd handler just sets these and returns 202; loop()
+  // picks them up and does the actual lv_indev_search_obj +
+  // lv_obj_scroll_by walk. Doing the LVGL work in the httpd
+  // task corrupts the newlib FILE struct (Guru Meditation:
+  // Breakpoint in __ssprint_r at vfprintf.c:268 after the
+  // walk-up loop returns).
+  bool pending_scroll_{false};
+  int pending_scroll_x1_{0};
+  int pending_scroll_y1_{0};
+  int pending_scroll_x2_{0};
+  int pending_scroll_y2_{0};
   bool read_customizations_file_();
   bool write_customizations_file_();
   void apply_customizations_file_(const std::string &body);

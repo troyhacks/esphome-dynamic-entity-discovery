@@ -29,7 +29,24 @@
 #include "esp_private/esp_cache_private.h"
 #endif
 
+// USE_LOG_LISTENERS gates the log callback machinery inside the
+// logger component (add_log_callback + the internal callback
+// vector). Without it, add_log_callback is a silent no-op and
+// no log lines reach our ring buffer. ESPHome enables it
+// automatically for components that register a log callback; we
+// define it here BEFORE the core/log.h include (which
+// transitively pulls in logger.h) so the guard sees it.
+//
+// ESPHOME_LOG_MAX_LISTENERS controls the size of the logger's
+// internal StaticVector<LogCallback>. The default is small
+// enough that if other components (web_server logger trigger,
+// api logger trigger, etc.) have already registered, our
+// add_log_callback silently fails because push_back on a full
+// StaticVector is a no-op. Bump to 8 to leave plenty of room.
+#define USE_LOG_LISTENERS
+#define ESPHOME_LOG_MAX_LISTENERS 8
 #include "esphome/core/log.h"
+#include "esphome/components/logger/logger.h"
 
 // v1.28 SDIO/DMA + P4 cache-alignment fix (replaces the
 // v1.27 "force MALLOC_CAP_INTERNAL" crutch).
@@ -239,6 +256,91 @@ class TwdtGuard {
 namespace esphome {
 namespace ha_autopanel {
 
+// Forward declarations for file-local helpers. These are used
+// by functions defined earlier in the file (the static log
+// callback below and the AutoPanelHandler dispatch in
+// register_web_handler_) and would otherwise fail to compile
+// because their definitions sit later in the file. C++ does
+// name lookup at the point the function body is parsed (not
+// when it's called), so out-of-order definitions trigger "not
+// declared in this scope" even though the names exist by the
+// time the function runs.
+static int get_int_query_(class AsyncWebServerRequest *request,
+                          const char* key, int defval);
+static std::string strip_newlines_(const char* s, size_t n);
+
+// Log-level-to-short-tag. Used by on_log_callback_ to prefix
+// each captured line ("D" / "I" / "W" / "E" / "V") so the
+// over-the-air log dump mirrors the serial log's column format.
+static const char* log_level_char_(uint8_t level) {
+  // ESPHome's level enum is exposed via ESPHOME_LOG_LEVEL_{NONE,ERROR,
+  // WARN,INFO,DEBUG,VERBOSE} - but the public surface is the raw
+  // byte (0..6) from the logger task. Use the canonical mapping
+  // so the ring buffer is consistent across ESP-IDF versions.
+  switch (level) {
+    case 1: return "E";  // ESP_LOG_ERROR
+    case 2: return "W";  // ESP_LOG_WARN
+    case 3: return "I";  // ESP_LOG_INFO
+    case 4: return "D";  // ESP_LOG_DEBUG
+    case 5: return "V";  // ESP_LOG_VERBOSE
+    default: return "?";
+  }
+}
+
+// ESPHome log callback. Fired from the logger task on every log
+// line. We rebuild the formatted line ("<level> <tag>: <msg>")
+// into the over-the-air ring buffer. No allocations on the
+// fast path other than the std::string we hand to the buffer
+// (bounded by the 4 KB ring cap).
+void HaAutoPanel::on_log_callback_(void* instance, uint8_t level,
+                                   const char* tag, const char* message,
+                                   size_t message_len) {
+  auto* self = static_cast<HaAutoPanel*>(instance);
+  if (self == nullptr) return;
+  self->log_callback_fires_++;
+  std::string line;
+  line.reserve(strlen(tag) + message_len + 8);
+  line.push_back(log_level_char_(level)[0]);
+  line.push_back(' ');
+  line.append(tag);
+  line.append(": ");
+  line.append(strip_newlines_(message, message_len));
+  self->log_buffer_append_(line);
+}
+
+void HaAutoPanel::maybe_register_log_callback_() {
+  if (this->log_callback_registered_) return;
+  // The logger component initializes after ha_autopanel in
+  // ESPHome's component order (no explicit dependency), so
+  // logger::global_logger is null in setup(). We retry each
+  // loop() until it's non-null, then register once and stay
+  // out of the way.
+  //
+  // USE_LOG_LISTENERS must be defined for add_log_callback to
+  // do anything (otherwise the function is a no-op and the
+  // internal log_callbacks_ vector doesn't exist). ESPHome
+  // enables it automatically for components that USE_LOGGER
+  // and have a log callback; this file's pre-include block
+  // sets it via #define before the logger header.
+#ifdef USE_LOGGER
+  if (logger::global_logger != nullptr) {
+    logger::global_logger->add_log_callback(
+        this, &HaAutoPanel::on_log_callback_);
+    this->log_callback_registered_ = true;
+    this->log_callback_attempts_++;  // count a successful attempt
+    ESP_LOGI("ha_autopanel",
+             "log buffer callback registered (logger was non-null at first poll)");
+  } else {
+    // Still null; we'll retry on the next loop tick.
+    this->log_callback_global_logger_null_++;
+  }
+#else
+  // No logger at all - never going to register. Mark as
+  // registered so we stop polling.
+  this->log_callback_registered_ = true;
+#endif
+}
+
 // PIMPL destructor. Declared in ha_autopanel.h so the
 // unique_ptr<HaWsClient> ws_client_ member has a complete
 // type at the point of destruction. Defaulted here where
@@ -344,6 +446,14 @@ struct RoomControlData {
 void HaAutoPanel::setup() {
   ESP_LOGI(TAG, "Dynamic Entity Discovery starting...");
   s_instance = this;
+
+  // Logger subscription is deferred to loop() - see maybe_register_log_callback_().
+  // The logger component may not be fully initialized when our
+  // setup() runs (components initialize in dependency order; the
+  // logger doesn't depend on us, but we don't know its init
+  // position), and logger::global_logger is null until then.
+  // Calling add_log_callback in setup() was a no-op in practice
+  // because global_logger was still null.
 
 #ifdef USE_ESP32_HOSTED
   // v1.28 fix: override ESP Hosted's _h_malloc with a
@@ -2265,9 +2375,18 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
       // Optimistic: mark lights off so the button color flips immediately
       auto it = s_instance->entities_by_area_.find(area_id_v);
       if (it != s_instance->entities_by_area_.end()) {
+        const uint32_t now_ms = millis();
         for (auto& e : it->second) {
           if (e.domain == "light" && !e.is_hue_group) {
             e.state = "off";
+            e.brightness = 0;
+            // Mark pending so sync_entities_from_aggregates_()
+            // can't overwrite our "off" with a stale aggregate.
+            // Cleared in on_entity_state_changed_() when the
+            // matching state event lands (or after 10 s timeout).
+            e.pending_optimistic_update = true;
+            s_instance->optimistic_update_pending_at_.emplace_back(
+                e.entity_id, now_ms);
           }
         }
       }
@@ -2278,10 +2397,15 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
       // Optimistic: mark lights on at the dragged brightness
       auto it = s_instance->entities_by_area_.find(area_id_v);
       if (it != s_instance->entities_by_area_.end()) {
+        const uint32_t now_ms = millis();
         for (auto& e : it->second) {
           if (e.domain == "light" && !e.is_hue_group) {
             e.state = "on";
             e.brightness = static_cast<uint8_t>((value * 255) / 100);
+            // Mark pending - same flicker fix as above.
+            e.pending_optimistic_update = true;
+            s_instance->optimistic_update_pending_at_.emplace_back(
+                e.entity_id, now_ms);
           }
         }
       }
@@ -2371,9 +2495,18 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
       // the state change back via the subscription.
       auto it = s_instance->entities_by_area_.find(area_id_v);
       if (it != s_instance->entities_by_area_.end()) {
+        const uint32_t now_ms = millis();
         for (auto& e : it->second) {
           if (e.domain == "light" && !e.is_hue_group) {
             e.state = "off";
+            e.brightness = 0;
+            // Mark pending so sync_entities_from_aggregates_()
+            // can't overwrite our "off" with a stale aggregate.
+            // Cleared in on_entity_state_changed_() (or after
+            // a 10 s timeout, whichever comes first).
+            e.pending_optimistic_update = true;
+            s_instance->optimistic_update_pending_at_.emplace_back(
+                e.entity_id, now_ms);
           }
         }
       }
@@ -2392,10 +2525,15 @@ void HaAutoPanel::create_room_card_(void* parent, const RoomCard& room) {
       // brightness to whatever HA actually reports.
       auto it_e = s_instance->entities_by_area_.find(area_id_v);
       if (it_e != s_instance->entities_by_area_.end()) {
+        const uint32_t now_ms = millis();
         for (auto& e : it_e->second) {
           if (e.domain == "light" && !e.is_hue_group) {
             e.state = "on";
             e.brightness = static_cast<uint8_t>((pct * 255) / 100);
+            // Mark pending - same flicker fix as above.
+            e.pending_optimistic_update = true;
+            s_instance->optimistic_update_pending_at_.emplace_back(
+                e.entity_id, now_ms);
           }
         }
       }
@@ -3456,6 +3594,23 @@ void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const cha
       if (e.domain == "media_player") continue;  // scanned separately in update_media_banner_
       if (e.entity_id == entity_id) {
         e.state = new_state;
+        // Clear the pending flag that the optimistic click / arc
+        // handler set. The state event matching our service call
+        // has landed, so it's safe to let sync_entities_from_
+        // aggregates_() resume writing this entity's state from
+        // future aggregate pushes. The timestamp entry is
+        // cleared too (saves the periodic expire loop one
+        // iteration).
+        if (e.pending_optimistic_update) {
+          e.pending_optimistic_update = false;
+          for (auto vit = this->optimistic_update_pending_at_.begin();
+               vit != this->optimistic_update_pending_at_.end(); ++vit) {
+            if (vit->first == e.entity_id) {
+              this->optimistic_update_pending_at_.erase(vit);
+              break;
+            }
+          }
+        }
         break;
       }
     }
@@ -3465,6 +3620,35 @@ void HaAutoPanel::on_entity_state_changed_(std::string_view entity_id, const cha
   // changed entity is a media_player, the banner's tile set may
   // need to grow or shrink.
   this->update_media_banner_();
+}
+
+void HaAutoPanel::expire_pending_optimistic_updates_() {
+  // Walk the pending-update timestamp list and clear the flag
+  // for any entity whose timeout has elapsed. The list size is
+  // bounded by how many entities the user has toggled in the
+  // last OPTIMISTIC_UPDATE_TIMEOUT_MS (typically 1-2), so the
+  // linear scan is fine.
+  if (this->optimistic_update_pending_at_.empty()) return;
+  const uint32_t now_ms = millis();
+  for (auto it = this->optimistic_update_pending_at_.begin();
+       it != this->optimistic_update_pending_at_.end(); ) {
+    if (now_ms - it->second > OPTIMISTIC_UPDATE_TIMEOUT_MS) {
+      // Find the matching entity record and clear the flag.
+      // entity_id is a string_view into entity_arena(); string_view
+      // == string_view comparison works directly.
+      for (auto& kv : this->entities_by_area_) {
+        for (auto& e : kv.second) {
+          if (e.entity_id == it->first) {
+            e.pending_optimistic_update = false;
+            break;
+          }
+        }
+      }
+      it = this->optimistic_update_pending_at_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void HaAutoPanel::on_entity_attribute_changed_(std::string_view entity_id, const char* value) {
@@ -3746,6 +3930,15 @@ void HaAutoPanel::sync_entities_from_aggregates_() {
     auto bucket_it = this->entities_by_area_.find(area_id);
     if (bucket_it == this->entities_by_area_.end()) continue;
     for (auto& e : bucket_it->second) {
+      // Skip entities with a pending optimistic update. The user
+      // just clicked OFF (or set a brightness) and our optimistic
+      // handler set e.state to the new value. If we apply the
+      // aggregate here too, we might overwrite the optimistic
+      // value with stale data from an aggregate that was
+      // generated BEFORE HA processed our turn_off. The flicker
+      // shows for one frame until the state_changed event lands.
+      // The matching state_changed event will clear the flag.
+      if (e.pending_optimistic_update) continue;
       auto sit = agg.entities.find(e.entity_id);
       if (sit == agg.entities.end()) continue;
       e.state = sit->second.state;
@@ -4243,6 +4436,29 @@ void HaAutoPanel::on_auth_probe_response_(bool success, const char* error) {
 }
 
 void HaAutoPanel::loop() {
+  // Defer log-callback registration until the logger component
+  // is ready (global_logger is null in setup() because the
+  // logger initializes after us in the component order).
+  this->maybe_register_log_callback_();
+
+  // Reap optimistic-update timestamps that exceeded their
+  // 10 s timeout (HA never sent the matching state event).
+  // Without this, an entity would stay "pending" forever and
+  // sync_entities_from_aggregates_() would skip it on every
+  // future aggregate push, drifting out of sync.
+  this->expire_pending_optimistic_updates_();
+
+  // Drain the pending scroll request deferred from the httpd
+  // scroll handler. Doing lv_indev_search_obj + lv_obj_scroll_by
+  // from loopTask is safe (no httpd context).
+  if (this->pending_scroll_) {
+    this->pending_scroll_ = false;
+    this->simulate_scroll_(this->pending_scroll_x1_,
+                          this->pending_scroll_y1_,
+                          this->pending_scroll_x2_,
+                          this->pending_scroll_y2_);
+  }
+
   // v1.30: incremental UI build. Runs first (before auth probes
   // and WS drains) so card creation gets a clean main-loop tick
   // to itself. Each tick creates exactly one card -> one LVGL
@@ -4978,12 +5194,13 @@ void HaAutoPanel::handle_screenshot_(AsyncWebServerRequest *request) {
     request->send(500, "text/plain", "no display");
     return;
   }
-  // Force a synchronous refresh so the buffer matches what's on
-  // screen. lv_refr_now() blocks until the next flush completes.
-  // The 1.2MB flush takes a few hundred ms over DSI, so this
-  // adds latency to the screenshot request - acceptable for a
-  // debug surface.
-  lv_refr_now(disp);
+  // lv_refr_now() used to be called here to force a synchronous
+  // refresh, but it recurses too deep for the httpd task's 4 KB
+  // stack (Guru Meditation: stack protection fault in lv_malloc,
+  // 2026-07-02). The LVGL display buffer is refreshed every main-
+  // loop tick, so reading it here may be 1 frame stale - that's
+  // acceptable for a screenshot endpoint. If a frame-perfect
+  // capture is needed, defer the refresh to loopTask (TODO).
 
   lv_draw_buf_t* draw_buf = lv_display_get_buf_active(disp);
   if (draw_buf == nullptr || draw_buf->data == nullptr || draw_buf->data_size == 0) {
@@ -5003,9 +5220,18 @@ void HaAutoPanel::handle_screenshot_(AsyncWebServerRequest *request) {
   // Total = 66 + width*height*2 = ~1.2MB. PSRAM has 32MB so this
   // is comfortable.
   const size_t body_size = 66 + (size_t)width * (size_t)height * 2u;
-  uint8_t *body = (uint8_t*)heap_caps_malloc(body_size, MALLOC_CAP_SPIRAM);
+  // heap_caps_malloc_prefer (PSRAM -> INTERNAL fallback) is
+  // critical here. heap_caps_malloc(SPIRAM) alone fails when
+  // PSRAM is fragmented; the explicit malloc fallback used to
+  // run only after SPIRAM failed, but a single 1.2 MB contiguous
+  // alloc can also fail under internal-heap pressure. prefer()
+  // handles both with one call.
+  uint8_t *body = (uint8_t*)heap_caps_malloc_prefer(
+      body_size,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (body == nullptr) {
-    // Fall back to internal heap if PSRAM isn't available.
+    // One more try with internal-only as a last resort.
     body = (uint8_t*)malloc(body_size);
   }
   if (body == nullptr) {
@@ -5121,9 +5347,10 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
     request->send(500, "text/plain", "no display");
     return;
   }
-  // Force a synchronous refresh so the buffer matches what's on
-  // screen (same pattern as handle_screenshot_).
-  lv_refr_now(disp);
+  // lv_refr_now() used to be called here too - see the BMP handler
+  // for the rationale on why it's removed. The JPEG encoder path
+  // does the same thing (read draw_buf) so we just skip the
+  // refresh and read the current buffer.
 
   lv_draw_buf_t* draw_buf = lv_display_get_buf_active(disp);
   if (draw_buf == nullptr || draw_buf->data == nullptr || draw_buf->data_size == 0) {
@@ -5137,59 +5364,76 @@ void HaAutoPanel::handle_screenshot_jpg_(AsyncWebServerRequest *request) {
     return;
   }
 
-  // Allocate the RGB888 scratch buffer. 1024*600*3 = 1.84 MB. PSRAM
-  // (32 MB on Crowpanel) has plenty of room. Fall back to internal
-  // heap if PSRAM is somehow unavailable (e.g. someone runs this
-  // build on a board without PSRAM).
+  // RGB565 scratch buffer. Uses the encoder's native pixel format
+  // (the LVGL draw buffer IS RGB565). The RGB888 path on P4
+  // produces colors that don't match the source framebuffer
+  // (background #111827 dark-teal renders as brown; manual R/B
+  // swap fixes the background but rotates the arc colors). The
+  // draw buffer's data_size should equal width*height*2
+  // (validated by handle_screenshot_).
   //
-  // RGB565 path uses the encoder's native pixel format (the LVGL
-// draw buffer IS RGB565). The RGB888 path on P4 produces colors
-// that don't match the source framebuffer (background #111827
-// dark-teal renders as brown; manual R/B swap fixes the
-// background but rotates the arc colors). The draw buffer's
-// data_size should equal width*height*2 (validated by
-// handle_screenshot_).
+  // heap_caps_malloc_prefer (PSRAM -> INTERNAL fallback) is
+  // critical here. heap_caps_malloc(SPIRAM) alone fails when
+  // PSRAM is fragmented (the old code returned 500 with "OOM
+  // allocating RGB565 buffer" after a few screenshot calls).
+  // 1024*600*2 = 1.2 MB fits in PSRAM easily when fresh; the
+  // fallback path only kicks in when PSRAM is too fragmented.
   const size_t rgb_size = (size_t)width * (size_t)height * 2u;
-  uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM);
+  uint8_t* rgb = (uint8_t*)heap_caps_malloc_prefer(
+      rgb_size,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (rgb == nullptr) {
-    rgb = (uint8_t*)malloc(rgb_size);
-  }
-  if (rgb == nullptr) {
+    ESP_LOGE(TAG, "[screenshot.jpg] OOM allocating %zu-byte RGB565 buffer",
+             rgb_size);
+    // Surface the actual heap state so the test harness (or
+    // /autopanel/test/heap) can confirm fragmentation.
     request->send(500, "text/plain", "OOM allocating RGB565 buffer");
     return;
   }
+  //
   // Clamp to width*height*2 in case the LVGL draw buffer is
   // larger than the visible area (RGB888 mode, row stride
   // padding, or any mismatch between active buffer size and
   // display resolution would otherwise overflow `rgb`).
-  const size_t expected_pixels = (size_t)width * (size_t)height * 2u;
+  const size_t expected_pixels = rgb_size;
   const size_t copy_bytes = draw_buf->data_size < expected_pixels
                                 ? draw_buf->data_size
                                 : expected_pixels;
   memcpy(rgb, draw_buf->data, copy_bytes);
 
-  // JPEG output buffer. The ESP-IDF JPEG driver requires the output
-  // buffer to be allocated via jpeg_alloc_encoder_mem() (not a plain
-  // malloc) because the hardware encoder writes the bit stream to
-  // a word-aligned address and tracks the buffer's actual size for
-  // the bitstream alignment checks. A heap_caps_malloc'd buffer
-  // triggers "jpeg encode bit stream is not aligned, please use
-  // jpeg_alloc_encoder_mem to malloc your buffer" and the encode
-  // fails. jpeg_alloc_encoder_mem uses an internal DMA-capable pool
-  // (heap_caps_malloc with MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-  // preferred, falls back to internal) and returns the actual size
-  // allocated, which can be larger than the requested size.
-  // 512 KB covers the worst-case 1024x600 high-entropy output
-  // (typical: 80-200 KB; complex screens with arcs/text can
-  // exceed 256 KB).
-  const size_t jpg_req = 512 * 1024;
+  // JPEG output buffer. The ESP-IDF JPEG driver requires the
+  // output buffer to be allocated via jpeg_alloc_encoder_mem()
+  // (not a plain malloc) because the hardware encoder writes the
+  // bit stream to a word-aligned address and tracks the buffer's
+  // actual size for the bitstream alignment checks. A
+  // heap_caps_malloc'd buffer triggers "jpeg encode bit stream is
+  // not aligned, please use jpeg_alloc_encoder_mem to malloc your
+  // buffer" and the encode fails. jpeg_alloc_encoder_mem uses an
+  // internal DMA-capable pool (heap_caps_malloc with
+  // MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT preferred, falls back to
+  // internal) and returns the actual size allocated, which can
+  // be larger than the requested size.
+  //
+  // Retry with progressively smaller sizes if the first request
+  // fails. This handles the "PSRAM is too fragmented for 512 KB
+  // contiguous" case by falling back to smaller allocations that
+  // are likelier to succeed; if even 128 KB fails, the JPEG path
+  // gives up and we return 500 (with the heap stats in the log).
+  const size_t jpg_req_sizes[] = {512 * 1024, 256 * 1024, 128 * 1024};
   size_t jpg_size_actual = 0;
-  jpeg_encode_memory_alloc_cfg_t mem_cfg = {};
-  mem_cfg.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
-  uint8_t* jpg = (uint8_t*)jpeg_alloc_encoder_mem(
-      jpg_req, &mem_cfg, &jpg_size_actual);
+  uint8_t* jpg = nullptr;
+  for (size_t req : jpg_req_sizes) {
+    jpeg_encode_memory_alloc_cfg_t mem_cfg = {};
+    mem_cfg.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
+    jpg = (uint8_t*)jpeg_alloc_encoder_mem(req, &mem_cfg, &jpg_size_actual);
+    if (jpg != nullptr) break;
+    ESP_LOGW(TAG, "[screenshot.jpg] jpeg_alloc_encoder_mem(%zu) failed, retrying smaller",
+             req);
+  }
   if (jpg == nullptr) {
-    free(rgb);
+    ESP_LOGE(TAG, "[screenshot.jpg] all jpeg_alloc_encoder_mem retries failed");
+    heap_caps_free(rgb);
     request->send(500, "text/plain", "jpeg_alloc_encoder_mem failed");
     return;
   }
@@ -5283,7 +5527,12 @@ void HaAutoPanel::register_web_handler_() {
           || url == "/autopanel/test/scroll"
           || url == "/autopanel/test/cmd"
           || url == "/autopanel/test/state"
-          || url == "/autopanel/test/banner";
+          || url == "/autopanel/test/banner"
+          || url == "/autopanel/test/logs"
+          || url == "/autopanel/test/heap"
+          || url == "/autopanel/test/entities"
+          || url == "/autopanel/test/aggregate"
+          || url == "/autopanel/test/service";
     }
     void handleRequest(AsyncWebServerRequest *request) override {
       char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
@@ -5382,6 +5631,101 @@ void HaAutoPanel::register_web_handler_() {
         } else {
           parent_->handle_test_banner_(request);
         }
+      } else if (url == "/autopanel/test/logs") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET) {
+          // /autopanel/test/logs?lines=N&tag=<substring>
+          //   lines: max number of lines to return (default 200,
+          //          clamped to 1..4096; the underlying ring buffer
+          //          is 4 KB so anything larger is just "all of it")
+          //   tag:   optional substring filter; only lines whose
+          //          tag field contains this string are returned
+          int n = get_int_query_(request, "lines", 200);
+          std::string tag;
+          if (request->hasParam("tag")) {
+            tag = request->getParam("tag")->value().c_str();
+          }
+          std::string out = parent_->log_buffer_dump_((size_t) n, tag);
+          request->send(200, "text/plain", out.c_str());
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/heap") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET) {
+          parent_->handle_test_heap_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/entities") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET) {
+          parent_->handle_test_entities_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/aggregate") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_GET) {
+          parent_->handle_test_aggregate_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/service") {
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else if (request->method() == HTTP_POST) {
+          parent_->handle_test_service_(request);
+        } else {
+          request->send(405, "text/plain", "Method not allowed");
+        }
+      } else if (url == "/autopanel/test/widgets") {
+        // GET /autopanel/test/widgets?x=N&y=M - returns info
+        // about the topmost widget at the coord (class name,
+        // width, height, user_data, parent). Used to debug the
+        // /test/click refactor.
+        if (!parent_->agent_debug_) {
+          request->send(404, "text/plain", "Not found");
+        } else {
+          int x = get_int_query_(request, "x", -1);
+          int y = get_int_query_(request, "y", -1);
+          if (x < 0 || y < 0) {
+            request->send(400, "text/plain", "missing x/y");
+            return;
+          }
+          char body[512];
+          lv_obj_t* screen = lv_screen_active();
+          if (screen == nullptr) {
+            request->send(500, "text/plain", "no screen");
+            return;
+          }
+          lv_point_t p = {.x = (lv_coord_t) x, .y = (lv_coord_t) y};
+          lv_obj_t* obj = lv_indev_search_obj(screen, &p);
+          if (obj == nullptr) {
+            request->send(200, "text/plain", "no widget at coord\n");
+            return;
+          }
+          const lv_obj_class_t* cls = lv_obj_get_class(obj);
+          const char* cls_name = (cls && cls->name) ? cls->name : "?";
+          lv_obj_t* parent = lv_obj_get_parent(obj);
+          snprintf(body, sizeof(body),
+                   "hit: cls=%s w=%d h=%d user_data=0x%08x\n"
+                   "  parent: 0x%08x  parent_cls=%s\n"
+                   "  parent_children=%u\n",
+                   cls_name, (int)lv_obj_get_self_width(obj),
+                   (int)lv_obj_get_self_height(obj),
+                   (unsigned)(uintptr_t)lv_obj_get_user_data(obj),
+                   (unsigned)(uintptr_t)parent,
+                   parent && lv_obj_get_class(parent) ?
+                     (lv_obj_get_class(parent)->name ?
+                       lv_obj_get_class(parent)->name : "?") : "?",
+                   parent ? (unsigned)lv_obj_get_child_cnt(parent) : 0);
+          request->send(200, "text/plain", body);
+        }
       } else {
         request->send(404, "text/plain", "Not found");
       }
@@ -5436,12 +5780,14 @@ void HaAutoPanel::handle_test_click_(AsyncWebServerRequest *request) {
     return;
   }
   ESP_LOGI(TAG, "[test] click at (%d, %d)", x, y);
-  this->simulate_click_(x, y);
-  // 200 with a small body so the test harness can confirm the
-  // request was accepted (LVGL's own CLICKED events are async -
-  // the actual tap effect on the screen happens after we return).
-  char body[64];
-  snprintf(body, sizeof(body), "click %d %d queued\n", x, y);
+  // Returns the hit-tested widget so the harness can detect
+  // "click missed empty space". sim_click_missed=1 in the
+  // response means the click went to (x, y) but no widget was
+  // there - usually a coordinate off-by-one in the harness.
+  lv_obj_t* hit = this->simulate_click_with_hitscan_(x, y);
+  char body[96];
+  snprintf(body, sizeof(body), "click %d %d %s\n",
+           x, y, hit ? "hit" : "missed");
   request->send(200, "text/plain", body);
 }
 
@@ -5455,11 +5801,20 @@ void HaAutoPanel::handle_test_scroll_(AsyncWebServerRequest *request) {
     request->send(400, "text/plain", "missing or invalid x1/y1/x2/y2");
     return;
   }
-  ESP_LOGI(TAG, "[test] scroll (%d,%d) -> (%d,%d)", x1, y1, x2, y2);
-  this->simulate_scroll_(x1, y1, x2, y2);
-  char body[96];
-  snprintf(body, sizeof(body), "scroll %d %d %d %d queued\n", x1, y1, x2, y2);
-  request->send(200, "text/plain", body);
+  // Defer the LVGL walk-up to loopTask. Doing lv_indev_search_obj
+  // + lv_obj_scroll_by from the httpd task corrupts the newlib
+  // FILE struct (Guru Meditation: Breakpoint in __ssprint_r
+  // during the response snprintf). The scroll fires on the next
+  // loop tick; the HTTP response says "queued" rather than
+  // "done" so the harness knows to wait or poll.
+  this->pending_scroll_ = true;
+  this->pending_scroll_x1_ = x1;
+  this->pending_scroll_y1_ = y1;
+  this->pending_scroll_x2_ = x2;
+  this->pending_scroll_y2_ = y2;
+  ESP_LOGI(TAG, "[test] scroll (%d,%d) -> (%d,%d) queued", x1, y1, x2, y2);
+  request->send(202, "text/plain",
+                "scroll queued (runs on next loop tick)\n");
 }
 
 void HaAutoPanel::handle_test_cmd_(AsyncWebServerRequest *request) {
@@ -5537,6 +5892,19 @@ void HaAutoPanel::handle_test_state_(AsyncWebServerRequest *request) {
   body += std::string("ha_api_url=") + this->ha_api_url_ + "\n";
   body += std::string("screen=") + std::to_string(this->screen_width_) + "x"
         + std::to_string(this->screen_height_) + "\n";
+  // Uptime in seconds (wraps after ~49 days, matches millis()).
+  // Useful for harness health checks: an "stale" panel state
+  // often correlates with a stuck loop. Format: "uptime_s=N\n".
+  body += std::string("uptime_s=") + std::to_string(millis() / 1000) + "\n";
+  // Memory summary: free / largest-block for internal + PSRAM.
+  // Cheap to add and catches leaks (e.g. the JPEG OOM bug shows
+  // up as a dropping "free_psram_kb" before the screenshot
+  // endpoint starts 500-ing).
+  body += std::string("free_internal_kb=") +
+          std::to_string(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024) + "\n";
+  body += std::string("largest_psram_kb=") +
+          std::to_string(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024)
+          + "\n";
   // jpeg_available lets the test script make a clean one-shot
   // decision: if the device advertises JPEG, hit /screenshot.jpg
   // (much smaller payload, no Python BMP->PNG conversion). If
@@ -5581,6 +5949,238 @@ void HaAutoPanel::handle_test_banner_(AsyncWebServerRequest *request) {
   char body[32];
   snprintf(body, sizeof(body), "banner %s\n", desired ? "on" : "off");
   request->send(200, "text/plain", body);
+}
+
+// ----- Over-the-air log capture -------------------------------------------
+//
+// The C++ side maintains a 4 KB ring buffer of the most recent log
+// lines (regardless of which task wrote them) so the test harness
+// can pull them via /autopanel/test/logs when no serial port is
+// attached. We don't try to integrate with esphome::logger's own
+// ring (different storage model); instead, every line that goes
+// through the standard ESP_LOGx macros also goes through this
+// helper via a tiny shim (see ESP_LOGX_OVERRIDE below).
+//
+// 4 KB ~= ~40-50 lines depending on length, which is plenty for
+// "what just happened before this OOM" forensics. Anything larger
+// would push us toward circular buffer complexity for diminishing
+// returns (the serial log remains the source of truth when a
+// cable is attached).
+
+static std::string strip_newlines_(const char* s, size_t n) {
+  std::string out;
+  out.reserve(n);
+  for (size_t i = 0; i < n && s[i] != '\0'; ++i) {
+    char c = s[i];
+    if (c == '\r' || c == '\n') break;
+    out.push_back(c);
+  }
+  return out;
+}
+
+void HaAutoPanel::log_buffer_append_(const std::string& line) {
+  std::lock_guard<std::mutex> lk(this->log_buffer_mu_);
+  // Append then truncate to 4 KB by dropping the oldest lines.
+  // We slice at a newline boundary so partial lines don't leak.
+  this->log_buffer_.append(line);
+  this->log_buffer_.push_back('\n');
+  static constexpr size_t LOG_BUFFER_CAP = 4096;
+  if (this->log_buffer_.size() > LOG_BUFFER_CAP) {
+    size_t drop = this->log_buffer_.size() - LOG_BUFFER_CAP;
+    // Find the next newline so we don't leave a partial line.
+    size_t nl = this->log_buffer_.find('\n', drop);
+    if (nl != std::string::npos) {
+      this->log_buffer_.erase(0, nl + 1);
+    } else {
+      this->log_buffer_.erase(0, drop);
+    }
+  }
+}
+
+std::string HaAutoPanel::log_buffer_dump_(size_t max_lines,
+                                         const std::string& tag) const {
+  std::lock_guard<std::mutex> lk(this->log_buffer_mu_);
+  // Walk the buffer from the end, counting newlines, until we
+  // have `max_lines` lines (or hit the start of the buffer).
+  // Then return that suffix as a single string. If `tag` is
+  // non-empty, only include lines that contain the tag.
+  std::string out;
+  if (this->log_buffer_.empty()) return out;
+  // Collect newline offsets, newest first.
+  std::vector<size_t> nl_offsets;
+  nl_offsets.reserve(this->log_buffer_.size() / 40 + 1);
+  for (size_t i = this->log_buffer_.size(); i-- > 0; ) {
+    if (this->log_buffer_[i] == '\n') {
+      nl_offsets.push_back(i);
+      if (nl_offsets.size() > max_lines) break;
+    }
+  }
+  // nl_offsets is in reverse order (largest offset = newest line).
+  // Walk from the back to emit newest-first.
+  size_t pos = this->log_buffer_.size();
+  size_t emitted = 0;
+  for (size_t i = 0; i < nl_offsets.size() && emitted < max_lines; ++i) {
+    size_t nl = nl_offsets[i];
+    // Line is buffer_[nl+1 .. pos).
+    std::string line = this->log_buffer_.substr(nl + 1, pos - nl - 1);
+    pos = nl;  // next iteration: [0..nl)
+    if (tag.empty() || line.find(tag) != std::string::npos) {
+      out.append(line);
+      out.push_back('\n');
+      emitted++;
+    }
+  }
+  return out;
+}
+
+// ----- /autopanel/test/heap -----
+//
+// Cheap diagnostic. Returns the free and largest-free-block sizes
+// for both internal SRAM and PSRAM in KB. Catches the common OOM
+// failure mode where repeated alloc/free cycles fragment PSRAM
+// to the point where 1.2 MB continuous allocations start failing.
+void HaAutoPanel::handle_test_heap_(AsyncWebServerRequest *request) {
+  size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  size_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  size_t ps_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t ps_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  std::string body;
+  body.reserve(160);
+  body += "free_internal_kb=" + std::to_string(int_free / 1024) + "\n";
+  body += "largest_internal_kb=" + std::to_string(int_largest / 1024) + "\n";
+  body += "free_psram_kb=" + std::to_string(ps_free / 1024) + "\n";
+  body += "largest_psram_kb=" + std::to_string(ps_largest / 1024) + "\n";
+  body += "min_free_ever_internal_kb=" +
+          std::to_string(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024)
+          + "\n";
+  // Log-callback diagnostics so the test harness can tell if
+  // the over-the-air log endpoint is wired correctly. If
+  // log_callback_attempts grows but log_callback_fires stays
+  // at 0, the registration is working but the callback isn't
+  // firing. If both stay at 0, the registration never happened
+  // (logger::global_logger is still null).
+  body += "log_callback_attempts=" +
+          std::to_string(this->log_callback_attempts_) + "\n";
+  body += "log_callback_fires=" +
+          std::to_string(this->log_callback_fires_) + "\n";
+  body += "log_callback_global_logger_null=" +
+          std::to_string(this->log_callback_global_logger_null_) + "\n";
+  body += "log_buffer_size=" +
+          std::to_string(this->log_buffer_.size()) + "\n";
+  request->send(200, "text/plain", body.c_str());
+}
+
+// ----- /autopanel/test/entities -----
+//
+// Returns a JSON dump of entities_by_area_ with friendly_name
+// resolved. Lets the test harness verify display content without
+// having to parse screenshots. Only enabled when agent_debug_ is
+// true (the data is small but it's still PII-friendly enough to
+// gate behind the test flag).
+void HaAutoPanel::handle_test_entities_(AsyncWebServerRequest *request) {
+  // Use the heap-capped allocator for the doc so the dump doesn't
+  // fight LVGL for internal heap during normal operation.
+  PsramJsonDocument doc(&s_psram_allocator);
+  JsonObject root = doc.to<JsonObject>();
+  for (const auto& kv : this->entities_by_area_) {
+    JsonArray arr = root[kv.first].to<JsonArray>();
+    for (const auto& e : kv.second) {
+      JsonObject o = arr.add<JsonObject>();
+      o["entity_id"] = e.entity_id.data();
+      // Prefer friendly_name when set (it's the user-visible name
+      // in the entity detail row); expose both so the harness can
+      // verify the friendly_name plumbing.
+      const std::string_view display_name = e.friendly_name.empty()
+                                               ? e.name
+                                               : e.friendly_name;
+      o["name"] = display_name.data();
+      o["raw_name"] = e.name.data();
+      o["friendly_name"] = e.friendly_name.data();
+      o["domain"] = e.domain.data();
+      o["state"] = e.state.c_str();
+      o["brightness"] = e.brightness;
+      o["has_brightness"] = e.has_brightness;
+      o["pending_optimistic_update"] = e.pending_optimistic_update;
+    }
+  }
+  std::string body;
+  serializeJson(doc, body);
+  if (doc.overflowed()) {
+    request->send(500, "text/plain", "entities JSON overflowed");
+    return;
+  }
+  request->send(200, "application/json", body.c_str());
+}
+
+// ----- /autopanel/test/aggregate -----
+//
+// Returns the most recent room_aggregates_ snapshot. Useful for
+// verifying the render_template subscription is alive and in sync
+// (e.g. "did HA push a fresh aggregate?").
+void HaAutoPanel::handle_test_aggregate_(AsyncWebServerRequest *request) {
+  PsramJsonDocument doc(&s_psram_allocator);
+  JsonObject root = doc.to<JsonObject>();
+  for (const auto& rkv : this->room_aggregates_) {
+    JsonObject agg = root[rkv.first].to<JsonObject>();
+    agg["name"] = rkv.second.name.c_str();
+    JsonObject ents = agg["entities"].to<JsonObject>();
+    for (const auto& ekv : rkv.second.entities) {
+      JsonObject e = ents[ekv.first].to<JsonObject>();
+      e["state"] = ekv.second.state.c_str();
+      e["brightness"] = ekv.second.brightness;
+      e["has_brightness"] = ekv.second.has_brightness;
+      if (!ekv.second.friendly_name.empty()) {
+        e["friendly_name"] = ekv.second.friendly_name.data();
+      }
+    }
+  }
+  std::string body;
+  serializeJson(doc, body);
+  if (doc.overflowed()) {
+    request->send(500, "text/plain", "aggregate JSON overflowed");
+    return;
+  }
+  request->send(200, "application/json", body.c_str());
+}
+
+// ----- /autopanel/test/service -----
+//
+// Mirrors what the room-card button click handlers do (calls the
+// panel's own call_ha_service_ path) but lets the test harness
+// trigger the same code path without a real tap. Useful for
+// race-condition reproduction - we can flood the path with calls
+// and watch what the panel state does. Note that the panel's
+// optimistic update + HA's WS push is the same path the buttons
+// use, so this is the right place to test the flicker hypothesis.
+void HaAutoPanel::handle_test_service_(AsyncWebServerRequest *request) {
+  // POST /autopanel/test/service?service=light.turn_off&target_type=area_id
+  //                    &target_id=kitchen&brightness_pct=-1
+  if (!request->hasParam("service") || !request->hasParam("target_type") ||
+      !request->hasParam("target_id")) {
+    request->send(400, "text/plain",
+                  "missing service/target_type/target_id");
+    return;
+  }
+  std::string service = request->getParam("service")->value().c_str();
+  std::string target_type = request->getParam("target_type")->value().c_str();
+  std::string target_id = request->getParam("target_id")->value().c_str();
+  int brightness = get_int_query_(request, "brightness_pct", -1);
+  // Validate brightness range. -1 = omit (works for turn_off, toggle,
+  // etc.); 0..100 = valid percentage. Anything else is almost
+  // certainly a harness bug - reject with 400 instead of silently
+  // dispatching a nonsensical service call.
+  if (brightness < -1 || brightness > 100) {
+    request->send(400, "text/plain",
+                  "brightness_pct must be -1 (omit) or 0..100");
+    return;
+  }
+  ESP_LOGI(TAG, "[test] service %s %s=%s brightness=%d",
+           service.c_str(), target_type.c_str(), target_id.c_str(),
+           brightness);
+  this->call_ha_service_(service, target_type, target_id, brightness);
+  std::string body = "service " + service + " " + target_type +
+                    "=" + target_id + " dispatched\n";
+  request->send(200, "text/plain", body.c_str());
 }
 
 void HaAutoPanel::handle_setup_get_(AsyncWebServerRequest *request) {
@@ -6713,6 +7313,62 @@ void HaAutoPanel::simulate_click_(int x, int y) {
   }
   lv_obj_send_event(obj, LV_EVENT_CLICKED, nullptr);
   ESP_LOGI(TAG, "[click] injected at (%d, %d) on obj=%p", x, y, (void *) obj);
+}
+
+// Variant that returns the hit object (or nullptr) so the test
+// harness can report "click missed - no widget at this coord" in
+// the HTTP response. Same dispatch path as simulate_click_().
+//
+// The room card has two clickable children: the ON/OFF button
+// (which toggles the room's lights) and the label_btn (a
+// transparent overlay above the room name that opens the entity
+// detail view). label_btn is moved to the foreground in z-order
+// so the room-name click feels responsive, which means a naive
+// topmost-widget dispatch from the test harness always hits
+// label_btn - never the button. The test harness is used to
+// verify UI behavior (e.g. the flicker fix), so the click has
+// to reach the BUTTON for those tests to be meaningful.
+//
+// The fix: walk to the parent card. The button is always the
+// LAST child added (after the arc, after the label_btn). The
+// button stores a RoomControlData* in user_data (heap-allocated
+// pointer); label_btn stores a small integer (room.grid_index).
+// The arc stores nullptr. We pick the first child whose
+// user_data is non-null, points into the heap (address > 64KB
+// to rule out small-int casts), and 4-byte aligned (heap alloc
+// guarantees this). If none of those match, we fall back to the
+// last child of the card (the button is always created last
+// among the clickable children).
+lv_obj_t* HaAutoPanel::simulate_click_with_hitscan_(int x, int y) {
+  lv_obj_t *screen = lv_screen_active();
+  if (screen == nullptr) return nullptr;
+  lv_point_t p = {.x = (lv_coord_t) x, .y = (lv_coord_t) y};
+  lv_obj_t *obj = lv_indev_search_obj(screen, &p);
+  if (obj == nullptr) return nullptr;
+  // Walk to the parent card and find the ON/OFF button by size.
+  // The button is 110 x 32 (defined in create_room_card_); the
+  // arc is 240+ x 240+; label_btn is 240 x 32. So width=110
+  // uniquely identifies the button.
+  lv_obj_t *parent = lv_obj_get_parent(obj);
+  if (parent != nullptr) {
+    uint32_t cnt = lv_obj_get_child_cnt(parent);
+    for (uint32_t i = 0; i < cnt; ++i) {
+      lv_obj_t *sib = lv_obj_get_child(parent, i);
+      if (lv_obj_get_self_width(sib) == 110) {
+        obj = sib;
+        break;
+      }
+    }
+    // Fallback: if no width-110 child (the button is always
+    // 110 wide in our card layout), take the last child of
+    // the card. The button is created after the arc and the
+    // label_btn so it's typically the third child.
+    if (obj == parent || obj == nullptr) {
+      if (cnt > 0) obj = lv_obj_get_child(parent, cnt - 1);
+    }
+  }
+  lv_obj_send_event(obj, LV_EVENT_CLICKED, nullptr);
+  return obj;
 }
 
 void HaAutoPanel::simulate_scroll_(int x1, int y1, int x2, int y2) {
