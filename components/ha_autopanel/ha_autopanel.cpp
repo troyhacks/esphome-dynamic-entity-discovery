@@ -2876,7 +2876,9 @@ void HaAutoPanel::update_media_banner_() {
     for (const auto& kv : this->entities_by_area_) {
       for (const auto& e : kv.second) {
         if (e.entity_id == eid_view) {
-          name_view = e.name;
+          // Prefer HA's friendly_name when set; fall back to the
+          // entity_id-derived placeholder.
+          name_view = e.friendly_name.empty() ? e.name : e.friendly_name;
           break;
         }
       }
@@ -2973,7 +2975,12 @@ void HaAutoPanel::create_entity_control_(void* parent, const Entity& entity, uin
 // to ~22 chars which felt arbitrary. DOT shows "..." on
 // overflow which is the more conventional UX.
   lv_obj_t* name_label = lv_label_create(control);
-  lv_label_set_text(name_label, entity.name.data());
+  // Prefer HA's friendly_name when set; fall back to the
+  // entity_id-derived placeholder (e.g., "kitchen_main").
+  const std::string_view display_name = entity.friendly_name.empty()
+                                           ? entity.name
+                                           : entity.friendly_name;
+  lv_label_set_text(name_label, display_name.data());
   lv_obj_set_style_text_color(name_label, lv_color_hex(0xFFFFFF), 0);
   lv_obj_set_width(name_label, 400);
   lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
@@ -3586,8 +3593,6 @@ void HaAutoPanel::build_room_aggregate_template_() {
   // object is unsafe"). Also handles all the escaping for
   // area names with apostrophes like "Kelly's Room" without
   // any manual escape logic.
-  // v1.27: build the template as a multi-line raw string.
-  // Mirror in room_aggregate.j2 for offline review/diff.
   // Uses `namespace()` for both accumulators (rooms list and
   // per-room states dict) because `{% set x = ... %}` inside
   // a `{% for %}` is loop-local and does NOT persist. Also
@@ -3600,7 +3605,9 @@ void HaAutoPanel::build_room_aggregate_template_() {
   {% set on_ents = area_ents | select('is_state', 'on') | list %}
   {% set room_states = namespace(s={}) %}
   {% for e in area_ents if states(e) is not none %}
-    {% set room_states.s = room_states.s | combine({e: {'s': states(e), 'b': state_attr(e, 'brightness') | int(0)}}) %}
+    {% set fn = state_attr(e, 'friendly_name') %}
+    {% if fn is none %}{% set fn = '' %}{% endif %}
+    {% set room_states.s = room_states.s | combine({e: {'s': states(e), 'b': state_attr(e, 'brightness') | int(0), 'fn': fn}}) %}
   {% endfor %}
   {% set room = {
     'area_id': a,
@@ -3704,6 +3711,15 @@ void HaAutoPanel::apply_room_aggregates_(std::string_view json) {
       }
       e.brightness = (uint8_t) (s["b"] | 0);
       e.has_brightness = (s["b"].is<int>() || s["b"].is<unsigned int>());
+      // friendly_name from HA attributes; empty when unset.
+      // The Jinja template writes "" instead of None so the
+      // | is<const char*> check is reliable.
+      if (s["fn"].is<const char*>()) {
+        const char* fn = s["fn"].as<const char*>();
+        if (fn != nullptr && fn[0] != '\0') {
+          e.friendly_name = entity_arena().intern(fn);
+        }
+      }
       // intern() the entity_id into the arena; the returned
       // string_view stays valid for the component's lifetime.
       std::string_view eid = entity_arena().intern(eid_str);
@@ -3736,6 +3752,13 @@ void HaAutoPanel::sync_entities_from_aggregates_() {
       if (sit->second.has_brightness) {
         e.brightness = sit->second.brightness;
         e.has_brightness = true;
+      }
+      // HA-friendly-name lookup (if set). Empty when HA
+      // doesn't expose a friendly_name for the entity; the
+      // display sites fall back to the entity_id-derived
+      // `name` placeholder in that case.
+      if (!sit->second.friendly_name.empty()) {
+        e.friendly_name = sit->second.friendly_name;
       }
     }
     this->update_room_card_visual_state_for_area_(area_id);

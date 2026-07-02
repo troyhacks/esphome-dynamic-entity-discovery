@@ -321,6 +321,12 @@ struct Entity {
   std::string_view domain;
   std::string_view area_id;
   std::string_view icon;
+  // HA's friendly_name from the entity attributes. Populated
+  // from the per-area aggregate template (state_attr's
+  // friendly_name); empty when HA doesn't expose one.
+  // Display sites prefer this over `name` (which is the
+  // entity_id-derived placeholder) when it's non-empty.
+  std::string_view friendly_name;
   // v1.28: psram_string. The state field is the only one that
   // mutates at runtime (HA pushes state changes via the WS
   // subscription; aggregate push updates also write here).
@@ -394,12 +400,17 @@ struct RoomAggregate {
   psram_string name;
   // Per-entity state snapshot. Populated from the
   // aggregate's "states" map. The Entry holds a copy of
-  // the state string (it's mutable at runtime) and the
-  // raw brightness 0-255.
+  // the state string (it's mutable at runtime), the raw
+  // brightness 0-255, and the friendly_name string (set
+  // once at discovery, intern'd into entity_arena()).
   struct Entry {
     psram_string state;
     uint8_t brightness{0};
     bool has_brightness{false};
+    // friendly_name from HA's entity attributes; empty when
+    // unset. Intern'd into entity_arena() so the view stays
+    // valid for the component's lifetime.
+    std::string_view friendly_name;
   };
   // string_view into entity_arena() intern'd entity_ids.
   // std::less<> (transparent) enables heterogeneous lookup
